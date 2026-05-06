@@ -1,0 +1,24 @@
+diff --git a/src/sched.rs b/src/sched.rs
+index 1111111..2222222 100644
+--- a/src/sched.rs
++++ b/src/sched.rs
+@@ -42,7 +42,11 @@ impl Scheduler {
+     pub fn run(&mut self, t: Task) {
+         let lock = self.lock.lock();
+-        if t.state == State::Run {
+-            spawn(t);
+-        }
++        match t.state {
++            State::Run  => spawn(t),
++            State::Wait => self.queue.push(t),
++            _ => {}
++        }
+     }
+diff --git a/README.md b/README.md
+index aaaaaaa..bbbbbbb 100644
+--- a/README.md
++++ b/README.md
+@@ -1,3 +1,3 @@
+ # pprr
+-A PR review tool.
++A keyboard-driven PR review tool.
