@@ -30,6 +30,16 @@ impl MergeMethod {
             MergeMethod::Rebase => 'R',
         }
     }
+
+    /// Cycle to the next/previous method in display order, wrapping around.
+    pub fn cycle(self, delta: i32) -> Self {
+        const ORDER: [MergeMethod; 3] =
+            [MergeMethod::Merge, MergeMethod::Squash, MergeMethod::Rebase];
+        let idx = ORDER.iter().position(|m| *m == self).unwrap_or(0) as i32;
+        let n = ORDER.len() as i32;
+        let new_idx = ((idx + delta) % n + n) % n;
+        ORDER[new_idx as usize]
+    }
 }
 
 pub fn from_letter(c: char) -> Option<MergeMethod> {
@@ -73,7 +83,7 @@ pub fn render(f: &mut Frame, area: Rect, st: &MergeModalState) {
     }
     lines.push(Line::from(""));
     lines.push(Line::styled(
-        "   ↵ confirm     letter to pick     Esc cancel".to_string(),
+        "   ↵ confirm    ↑/↓ select    M/S/R    Esc cancel".to_string(),
         Style::default().fg(OVERLAY1),
     ));
 
@@ -108,5 +118,14 @@ mod tests {
         assert_eq!(MergeMethod::Merge.cli_flag(), "merge");
         assert_eq!(MergeMethod::Squash.cli_flag(), "squash");
         assert_eq!(MergeMethod::Rebase.cli_flag(), "rebase");
+    }
+
+    #[test]
+    fn cycle_wraps_in_both_directions() {
+        assert_eq!(MergeMethod::Merge.cycle(1), MergeMethod::Squash);
+        assert_eq!(MergeMethod::Squash.cycle(1), MergeMethod::Rebase);
+        assert_eq!(MergeMethod::Rebase.cycle(1), MergeMethod::Merge);
+        assert_eq!(MergeMethod::Merge.cycle(-1), MergeMethod::Rebase);
+        assert_eq!(MergeMethod::Rebase.cycle(-1), MergeMethod::Squash);
     }
 }

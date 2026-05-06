@@ -592,6 +592,18 @@ fn handle_merge_modal(app: &mut App, st: &mut AppState, ev: crossterm::event::Ke
             st.list.status = format!("merging #{num} ({method})…");
             close_merge_modal(st);
         }
+        KeyCode::Up | KeyCode::BackTab => {
+            modal.selected = modal.selected.cycle(-1);
+        }
+        KeyCode::Down | KeyCode::Tab => {
+            modal.selected = modal.selected.cycle(1);
+        }
+        KeyCode::Char('j') => {
+            modal.selected = modal.selected.cycle(1);
+        }
+        KeyCode::Char('k') => {
+            modal.selected = modal.selected.cycle(-1);
+        }
         KeyCode::Char(c) => {
             if let Some(method) = crate::view::merge_modal::from_letter(c) {
                 modal.selected = method;
