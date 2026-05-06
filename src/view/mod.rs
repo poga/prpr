@@ -1,3 +1,4 @@
+pub mod commits_modal;
 pub mod file_picker;
 pub mod help;
 pub mod merge_modal;
