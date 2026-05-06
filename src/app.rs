@@ -365,42 +365,12 @@ fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) 
         Action::ListClearFilter => {
             st.list.search = None;
         }
-        Action::CursorDown => {
-            if let Some(r) = st.review.as_mut() {
-                r.cursor_line = r.cursor_line.saturating_add(1);
-                r.scroll = r.scroll.saturating_add(1);
-            }
-        }
-        Action::CursorUp => {
-            if let Some(r) = st.review.as_mut() {
-                r.cursor_line = r.cursor_line.saturating_sub(1);
-                r.scroll = r.scroll.saturating_sub(1);
-            }
-        }
-        Action::HalfPageDown => {
-            if let Some(r) = st.review.as_mut() {
-                r.scroll = r.scroll.saturating_add(10);
-                r.cursor_line = r.cursor_line.saturating_add(10);
-            }
-        }
-        Action::HalfPageUp => {
-            if let Some(r) = st.review.as_mut() {
-                r.scroll = r.scroll.saturating_sub(10);
-                r.cursor_line = r.cursor_line.saturating_sub(10);
-            }
-        }
-        Action::PageDown => {
-            if let Some(r) = st.review.as_mut() {
-                r.scroll = r.scroll.saturating_add(20);
-                r.cursor_line = r.cursor_line.saturating_add(20);
-            }
-        }
-        Action::PageUp => {
-            if let Some(r) = st.review.as_mut() {
-                r.scroll = r.scroll.saturating_sub(20);
-                r.cursor_line = r.cursor_line.saturating_sub(20);
-            }
-        }
+        Action::CursorDown => move_review(app, st, 1),
+        Action::CursorUp => move_review(app, st, -1),
+        Action::HalfPageDown => move_review(app, st, 10),
+        Action::HalfPageUp => move_review(app, st, -10),
+        Action::PageDown => move_review(app, st, 20),
+        Action::PageUp => move_review(app, st, -20),
         Action::Top => {
             if let Some(r) = st.review.as_mut() {
                 r.scroll = 0;
@@ -408,8 +378,12 @@ fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) 
             }
         }
         Action::Bottom => {
-            if let Some(r) = st.review.as_mut() {
-                r.scroll = u16::MAX / 2;
+            if let Some((num, r)) = st.current_pr.zip(st.review.as_mut())
+                && let Some(pkg) = app.cache.get(num)
+                && let Some(file) = pkg.files.get(r.file_index)
+            {
+                r.scroll = max_scroll(file.lines.len());
+                r.cursor_line = max_cursor_line(file);
             }
         }
         Action::NextFile => cycle_file(app, st, 1),
@@ -474,6 +448,43 @@ fn open_merge(st: &mut AppState) {
     }
 }
 
+/// We don't know the precise body height from inside `handle_key`, so we use
+/// a conservative fudge so the last lines stay visible after End / Bottom.
+const APPROX_BODY_HEIGHT: usize = 15;
+
+fn max_scroll(total_lines: usize) -> u16 {
+    total_lines
+        .saturating_sub(APPROX_BODY_HEIGHT)
+        .min(u16::MAX as usize) as u16
+}
+
+fn max_cursor_line(file: &crate::data::diff::FileDiff) -> usize {
+    file.lines
+        .iter()
+        .filter(|l| !l.is_hunk_header)
+        .count()
+        .saturating_sub(1)
+}
+
+/// Move the review cursor + scroll by `delta` lines, clamping at both ends so
+/// scrolling can't blank out the buffer.
+fn move_review(app: &App, st: &mut AppState, delta: i32) {
+    let Some(num) = st.current_pr else { return };
+    let Some(pkg) = app.cache.get(num) else {
+        return;
+    };
+    let Some(r) = st.review.as_mut() else { return };
+    let Some(file) = pkg.files.get(r.file_index) else {
+        return;
+    };
+    let max_scr = max_scroll(file.lines.len()) as i64;
+    let max_cur = max_cursor_line(file) as i64;
+    let new_scroll = (r.scroll as i64 + delta as i64).clamp(0, max_scr);
+    let new_cursor = (r.cursor_line as i64 + delta as i64).clamp(0, max_cur);
+    r.scroll = new_scroll as u16;
+    r.cursor_line = new_cursor as usize;
+}
+
 fn cycle_file(app: &App, st: &mut AppState, delta: i32) {
     let Some(num) = st.current_pr else { return };
     let Some(pkg) = app.cache.get(num) else {
@@ -491,7 +502,7 @@ fn cycle_file(app: &App, st: &mut AppState, delta: i32) {
     }
 }
 
-fn handle_mouse(_app: &mut App, st: &mut AppState, ev: crossterm::event::MouseEvent) {
+fn handle_mouse(app: &mut App, st: &mut AppState, ev: crossterm::event::MouseEvent) {
     match mouse_dispatch(ev) {
         MouseAction::Scroll(d) => {
             if st.focused == FocusedView::List {
@@ -501,12 +512,8 @@ fn handle_mouse(_app: &mut App, st: &mut AppState, ev: crossterm::event::MouseEv
                 } else {
                     st.list.selected = st.list.selected.saturating_sub((-d) as usize);
                 }
-            } else if let Some(r) = st.review.as_mut() {
-                if d > 0 {
-                    r.scroll = r.scroll.saturating_add(d as u16);
-                } else {
-                    r.scroll = r.scroll.saturating_sub((-d) as u16);
-                }
+            } else {
+                move_review(app, st, d as i32);
             }
         }
         MouseAction::ClickAt { col: _, row } => {
