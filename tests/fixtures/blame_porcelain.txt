@@ -1,0 +1,42 @@
+a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0 42 42 1
+author Alice
+author-mail <alice@example.com>
+author-time 1714000000
+author-tz +0000
+committer Alice
+committer-mail <alice@example.com>
+committer-time 1714000000
+committer-tz +0000
+summary init structure
+filename src/sched.rs
+	    pub fn run(&mut self, t: Task) {
+a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0 43 43
+	        let lock = self.lock.lock();
+d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3 45 45 1
+author Alice
+author-mail <alice@example.com>
+author-time 1714000300
+author-tz +0000
+committer Alice
+committer-mail <alice@example.com>
+committer-time 1714000300
+committer-tz +0000
+summary enum dispatch
+previous 0000000000000000000000000000000000000000 src/sched.rs
+filename src/sched.rs
+	        match t.state {
+789abcdef0123456789abcdef0123456789abcde 46 46 2
+author Alice
+author-mail <alice@example.com>
+author-time 1714000900
+author-tz +0000
+committer Alice
+committer-mail <alice@example.com>
+committer-time 1714000900
+committer-tz +0000
+summary add Wait variant
+previous d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3 src/sched.rs
+filename src/sched.rs
+	            State::Run  => spawn(t),
+789abcdef0123456789abcdef0123456789abcde 47 47
+	            State::Wait => self.queue.push(t),

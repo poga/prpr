@@ -1,3 +1,4 @@
+pub mod blame;
 pub mod cache;
 pub mod diff;
 pub mod gh;
