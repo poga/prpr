@@ -177,9 +177,28 @@ fn draw(f: &mut ratatui::Frame, app: &App, st: &AppState) {
     if let Some(m) = &st.merge {
         crate::view::merge_modal::render(f, area, m);
     }
+    if st.focused == FocusedView::HelpOverlay {
+        crate::view::help::render(f, area);
+    }
 }
 
 fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) {
+    if st.focused == FocusedView::HelpOverlay {
+        match ev.code {
+            crossterm::event::KeyCode::Char('?')
+            | crossterm::event::KeyCode::Esc
+            | crossterm::event::KeyCode::Char('q') => {
+                st.focused = if st.review.is_some() {
+                    FocusedView::Review
+                } else {
+                    FocusedView::List
+                };
+            }
+            _ => {}
+        }
+        return;
+    }
+
     if st.focused == FocusedView::List
         && st.pending_g
         && ev.code == crossterm::event::KeyCode::Char('g')
