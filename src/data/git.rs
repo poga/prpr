@@ -14,6 +14,10 @@ pub trait GitClient: Send + Sync {
     fn fetch_pr(&self, repo_root: &Path, number: u32) -> Result<()>;
     /// Run `git blame --porcelain <commit> -- <file>`. Returns raw stdout.
     fn blame(&self, repo_root: &Path, commit: &str, file: &str) -> Result<String>;
+    /// Run `git log --reverse -p <base>..<head> -- <file>` with a SHA marker
+    /// per commit. Used to attribute deleted lines to the PR commit that
+    /// removed them. Returns raw stdout.
+    fn log_patches(&self, repo_root: &Path, base: &str, head: &str, file: &str) -> Result<String>;
 }
 
 pub struct GitCli;
@@ -69,6 +73,22 @@ impl GitClient for GitCli {
         let s = String::from_utf8(out.stdout)?;
         Ok(s)
     }
+
+    fn log_patches(&self, repo_root: &Path, base: &str, head: &str, file: &str) -> Result<String> {
+        let range = format!("{base}..{head}");
+        let out = run(Command::new("git").current_dir(repo_root).args([
+            "log",
+            "--reverse",
+            "--no-color",
+            "--pretty=format:prpr-commit %H",
+            "-p",
+            &range,
+            "--",
+            file,
+        ]))?;
+        let s = String::from_utf8(out.stdout)?;
+        Ok(s)
+    }
 }
 
 #[cfg(test)]
@@ -81,6 +101,9 @@ pub(crate) mod fakes {
         pub root: PathBuf,
         pub has_gh: bool,
         pub blames: HashMap<(String, String), String>,
+        /// Keyed by (base, head, file) → log_patches output. Missing keys
+        /// resolve to empty (no PR-commit deletions for that file).
+        pub log_patches: HashMap<(String, String, String), String>,
     }
 
     impl FakeGit {
@@ -89,6 +112,7 @@ pub(crate) mod fakes {
                 root: root.into(),
                 has_gh: true,
                 blames: HashMap::new(),
+                log_patches: HashMap::new(),
             }
         }
     }
@@ -108,6 +132,13 @@ pub(crate) mod fakes {
                 .get(&(c.into(), f.into()))
                 .cloned()
                 .ok_or_else(|| anyhow!("no fake blame for {c} {f}"))
+        }
+        fn log_patches(&self, _root: &Path, base: &str, head: &str, file: &str) -> Result<String> {
+            Ok(self
+                .log_patches
+                .get(&(base.into(), head.into(), file.into()))
+                .cloned()
+                .unwrap_or_default())
         }
     }
 }

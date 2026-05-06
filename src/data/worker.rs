@@ -22,6 +22,7 @@ use crate::data::cache::PrPackage;
 use crate::data::diff::parse_diff;
 use crate::data::gh::GhClient;
 use crate::data::git::GitClient;
+use crate::data::log_patches::parse_deletions;
 use crate::data::pr::Pr;
 use crate::render::attribution::attribute_file;
 
@@ -153,11 +154,21 @@ pub fn build_package(
             .blame(repo_root, &detail.head_ref_oid, &f.path)
             .map(|s| parse_blame(&s))
             .unwrap_or_else(|_| Blame { line_shas: vec![] });
-        let base = git
-            .blame(repo_root, &detail.base_ref_oid, &f.path)
-            .map(|s| parse_blame(&s))
-            .unwrap_or_else(|_| Blame { line_shas: vec![] });
-        let lc = attribute_file(&commits, window_size, &head, &base);
+        // Walk the PR commits' patches to find which commit's diff
+        // contained each removed line. Deleted lines used to be blamed
+        // against the base commit, which always resolved to pre-PR
+        // commits (i.e., gray) — never the PR commit that actually did
+        // the deletion.
+        let log_out = git
+            .log_patches(
+                repo_root,
+                &detail.base_ref_oid,
+                &detail.head_ref_oid,
+                &f.path,
+            )
+            .unwrap_or_default();
+        let deletes = parse_deletions(&log_out);
+        let lc = attribute_file(&commits, window_size, &head, &deletes);
         colors.insert(f.path.clone(), lc);
     }
 

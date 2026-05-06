@@ -12,7 +12,7 @@ use crate::data::cache::PrPackage;
 use crate::data::diff::FileDiff;
 use crate::render::attribution::LineColors;
 use crate::render::color::assign_commit_colors;
-use crate::render::diff::render_line;
+use crate::render::diff::{ext_of, render_line};
 use crate::render::style::*;
 
 #[derive(Debug, Default)]
@@ -130,6 +130,7 @@ fn render_diff_body(f: &mut Frame, area: Rect, pkg: &PrPackage, st: &PrReviewSta
 
 fn body_lines<'a>(file: &'a FileDiff, colors: &'a HashMap<String, LineColors>) -> Vec<Line<'a>> {
     let lookup = colors.get(&file.path);
+    let ext = ext_of(&file.path);
     file.lines
         .iter()
         .map(|l| {
@@ -138,12 +139,16 @@ fn body_lines<'a>(file: &'a FileDiff, colors: &'a HashMap<String, LineColors>) -
                     .and_then(|lc| lc.head.get(n.saturating_sub(1) as usize).copied())
                     .flatten()
             });
-            let base = l.old_lineno.and_then(|n| {
-                lookup
-                    .and_then(|lc| lc.base.get(n.saturating_sub(1) as usize).copied())
-                    .flatten()
-            });
-            render_line(l, head, base)
+            // Delete lines are looked up by text content — the same line
+            // text might appear at different positions in different commits,
+            // but `git log -p` records exactly which PR commit's patch
+            // removed each unique text. See data::log_patches.
+            let base = if l.op == crate::data::diff::DiffOp::Delete {
+                lookup.and_then(|lc| lc.delete.get(&l.text).copied())
+            } else {
+                None
+            };
+            render_line(l, head, base, ext)
         })
         .collect()
 }

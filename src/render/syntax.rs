@@ -1,0 +1,91 @@
+//! Syntax highlighting for diff bodies.
+//!
+//! Uses `syntect`'s bundled `base16-mocha.dark` theme — the closest fit to
+//! Catppuccin Mocha among the defaults. The `SyntaxSet` and `Theme` are
+//! loaded lazily on first call and cached for the rest of the process.
+
+use std::sync::OnceLock;
+
+use ratatui::style::{Color, Style};
+use ratatui::text::Span;
+use syntect::easy::HighlightLines;
+use syntect::highlighting::{Theme, ThemeSet};
+use syntect::parsing::SyntaxSet;
+
+fn syntax_set() -> &'static SyntaxSet {
+    static S: OnceLock<SyntaxSet> = OnceLock::new();
+    S.get_or_init(SyntaxSet::load_defaults_newlines)
+}
+
+fn theme() -> &'static Theme {
+    static T: OnceLock<Theme> = OnceLock::new();
+    T.get_or_init(|| {
+        let ts = ThemeSet::load_defaults();
+        ts.themes
+            .get("base16-mocha.dark")
+            .cloned()
+            .unwrap_or_else(|| ts.themes.values().next().unwrap().clone())
+    })
+}
+
+/// Highlight one line of code. Returns owned Spans (each `Span<'static>`)
+/// suitable for assembling a `Line<'static>`. If the language can't be
+/// determined or syntect errors out, returns a single un-styled span — the
+/// caller falls back to its default color.
+pub fn highlight_line(text: &str, ext: &str) -> Vec<Span<'static>> {
+    if text.is_empty() {
+        return vec![Span::raw(String::new())];
+    }
+    let ss = syntax_set();
+    let theme = theme();
+    let syntax = ss
+        .find_syntax_by_extension(ext)
+        .unwrap_or_else(|| ss.find_syntax_plain_text());
+    let mut h = HighlightLines::new(syntax, theme);
+    // syntect's parser expects a trailing newline.
+    let with_nl = format!("{text}\n");
+    let regions = match h.highlight_line(&with_nl, ss) {
+        Ok(r) => r,
+        Err(_) => return vec![Span::raw(text.to_string())],
+    };
+    regions
+        .into_iter()
+        .filter_map(|(style, frag)| {
+            let frag = frag.trim_end_matches('\n');
+            if frag.is_empty() {
+                return None;
+            }
+            let fg = Color::Rgb(style.foreground.r, style.foreground.g, style.foreground.b);
+            Some(Span::styled(frag.to_string(), Style::default().fg(fg)))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rust_keyword_gets_a_distinct_color() {
+        let spans = highlight_line("fn main() { 42 }", "rs");
+        // At minimum, syntect should produce more than one span for tokenized code.
+        assert!(spans.len() > 1, "got {} spans: {:?}", spans.len(), spans);
+        // All spans together must reproduce the original text.
+        let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(joined, "fn main() { 42 }");
+    }
+
+    #[test]
+    fn unknown_extension_returns_plain_text_spans() {
+        let spans = highlight_line("hello world", "xyznotalanguage");
+        let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(joined, "hello world");
+    }
+
+    #[test]
+    fn empty_input_returns_one_empty_span() {
+        let spans = highlight_line("", "rs");
+        assert_eq!(spans.len(), 1);
+        assert!(spans[0].content.is_empty());
+    }
+}
