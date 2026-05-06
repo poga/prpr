@@ -1,7 +1,5 @@
 //! End-to-end commit attribution: produces the line→color map a renderer needs.
 
-use std::collections::HashMap;
-
 use ratatui::style::Color;
 
 use crate::data::blame::Blame;
