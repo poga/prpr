@@ -85,7 +85,7 @@ fn render_rows(f: &mut Frame, area: Rect, st: &PrListState, now: DateTime<Utc>) 
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(visible.len() + 1);
     lines.push(divider(area.width as usize));
     for (i, pr) in visible.iter().enumerate() {
-        lines.push(row_for(pr, i == st.selected, now));
+        lines.push(row_for(pr, i == st.selected, now, area.width));
     }
     f.render_widget(Paragraph::new(lines), area);
 }
@@ -131,7 +131,7 @@ fn divider(w: usize) -> Line<'static> {
     ))
 }
 
-fn row_for(pr: &Pr, selected: bool, now: DateTime<Utc>) -> Line<'static> {
+fn row_for(pr: &Pr, selected: bool, now: DateTime<Utc>, area_width: u16) -> Line<'static> {
     let row_bg = if selected {
         Style::default().bg(SURFACE0)
     } else {
@@ -158,12 +158,25 @@ fn row_for(pr: &Pr, selected: bool, now: DateTime<Utc>) -> Line<'static> {
         _ => Span::styled("·", Style::default().fg(COMMIT_PALETTE[1])),
     };
 
-    let label = pr
+    let pr_num = format!(" #{} ", pr.number);
+    let label_str = pr
         .labels
         .first()
-        .map(|l| format!("[{}]", l.name))
-        .unwrap_or_default();
+        .map(|l| format!("  [{}]  ", l.name))
+        .unwrap_or_else(|| "  ".to_string());
+    let author_str = format!("{} ", pr.author.login);
     let age = humanize_age(pr.created_at, now);
+
+    // Layout widths. Title takes whatever's left after the fixed-width
+    // glyphs and the variable-width right side, so a wide terminal shows
+    // long titles in full and a narrow terminal truncates with "…".
+    // Fixed left = "  " + state + " " + ci + " " + review = 7 cells.
+    let left_cols = 7 + pr_num.chars().count();
+    let right_cols = label_str.chars().count() + author_str.chars().count() + age.chars().count();
+    let title_budget = (area_width as usize)
+        .saturating_sub(left_cols)
+        .saturating_sub(right_cols)
+        .max(8);
 
     Line::from(vec![
         Span::styled("  ", row_bg),
@@ -172,13 +185,10 @@ fn row_for(pr: &Pr, selected: bool, now: DateTime<Utc>) -> Line<'static> {
         ci_glyph,
         Span::styled(" ", row_bg),
         review_glyph,
-        Span::styled(format!(" #{} ", pr.number), row_bg.fg(COMMIT_PALETTE[1])),
-        Span::styled(truncate(&pr.title, 36), row_bg.fg(TEXT)),
-        Span::styled(format!("  {}  ", label), row_bg.fg(COMMIT_PALETTE[4])),
-        Span::styled(
-            format!("{} ", pr.author.login),
-            row_bg.fg(COMMIT_PALETTE[0]),
-        ),
+        Span::styled(pr_num, row_bg.fg(COMMIT_PALETTE[1])),
+        Span::styled(truncate(&pr.title, title_budget), row_bg.fg(TEXT)),
+        Span::styled(label_str, row_bg.fg(COMMIT_PALETTE[4])),
+        Span::styled(author_str, row_bg.fg(COMMIT_PALETTE[0])),
         Span::styled(age, row_bg.fg(OVERLAY0)),
     ])
 }
