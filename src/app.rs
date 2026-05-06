@@ -388,7 +388,6 @@ fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) 
                     file_index: 0,
                     cursor_line: 0,
                     scroll: 0,
-                    show_commit_strip: app.config.show_commit_strip,
                     show_sha_margin: app.config.show_sha_margin,
                     status: "loading…".into(),
                 });
@@ -462,11 +461,6 @@ fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) 
             }
         }
         Action::Merge => open_merge(st),
-        Action::ToggleCommitStrip => {
-            if let Some(r) = st.review.as_mut() {
-                r.show_commit_strip = !r.show_commit_strip;
-            }
-        }
         Action::ToggleShaMargin => {
             if let Some(r) = st.review.as_mut() {
                 r.show_sha_margin = !r.show_sha_margin;

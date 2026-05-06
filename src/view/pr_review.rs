@@ -5,13 +5,12 @@ use std::collections::HashMap;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
-use ratatui::text::{Line, Span};
+use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
 
 use crate::data::cache::PrPackage;
 use crate::data::diff::FileDiff;
 use crate::render::attribution::LineColors;
-use crate::render::color::assign_commit_colors;
 use crate::render::diff::{ext_of, render_line};
 use crate::render::style::*;
 
@@ -20,31 +19,25 @@ pub struct PrReviewState {
     pub file_index: usize,
     pub cursor_line: usize,
     pub scroll: u16,
-    pub show_commit_strip: bool,
     pub show_sha_margin: bool,
     pub status: String,
 }
 
 pub fn render(f: &mut Frame, area: Rect, pkg: &PrPackage, st: &PrReviewState) {
-    let strip_h = if st.show_commit_strip { 3 } else { 0 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),       // header
-            Constraint::Length(strip_h), // commit strip (0 if hidden)
-            Constraint::Length(2),       // file bar (title + divider)
-            Constraint::Min(1),          // diff body
-            Constraint::Length(3),       // status (cursor + 2 hint rows)
+            Constraint::Length(1), // header
+            Constraint::Length(2), // file bar (title + divider)
+            Constraint::Min(1),    // diff body
+            Constraint::Length(3), // status (cursor + 2 hint rows)
         ])
         .split(area);
 
     render_header(f, chunks[0], pkg);
-    if st.show_commit_strip {
-        render_commit_strip(f, chunks[1], pkg);
-    }
-    render_file_bar(f, chunks[2], pkg, st);
-    render_diff_body(f, chunks[3], pkg, st);
-    render_status(f, chunks[4], pkg, st);
+    render_file_bar(f, chunks[1], pkg, st);
+    render_diff_body(f, chunks[2], pkg, st);
+    render_status(f, chunks[3], pkg, st);
 }
 
 fn render_header(f: &mut Frame, area: Rect, pkg: &PrPackage) {
@@ -55,31 +48,6 @@ fn render_header(f: &mut Frame, area: Rect, pkg: &PrPackage) {
     );
     f.render_widget(
         Paragraph::new(header).style(Style::default().fg(TEXT)),
-        area,
-    );
-}
-
-fn render_commit_strip(f: &mut Frame, area: Rect, pkg: &PrPackage) {
-    let commits: Vec<String> = pkg.detail.commits.iter().map(|c| c.oid.clone()).collect();
-    let palette = assign_commit_colors(&commits, 7);
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    spans.push(Span::raw("  commits  "));
-    for c in &pkg.detail.commits {
-        let color = palette.get(&c.oid).copied().unwrap_or(OLDER_COMMIT);
-        spans.push(Span::styled("█ ", Style::default().fg(color)));
-        spans.push(Span::styled(
-            short_sha(&c.oid),
-            Style::default().fg(SUBTEXT0),
-        ));
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(
-            truncate(&c.message_headline, 18),
-            Style::default().fg(TEXT),
-        ));
-        spans.push(Span::raw("   "));
-    }
-    f.render_widget(
-        Paragraph::new(Line::from(spans)).wrap(ratatui::widgets::Wrap { trim: true }),
         area,
     );
 }
@@ -190,24 +158,11 @@ fn render_status(f: &mut Frame, area: Rect, pkg: &PrPackage, st: &PrReviewState)
     );
     f.render_widget(
         Paragraph::new(
-            "  Tab/↵ next file   Shift-Tab prev   f files   m merge   c strip   s sha   ? help   q back",
+            "  Tab/↵ next file   Shift-Tab prev   f files   c commits   m merge   s sha   ? help   q back",
         )
         .style(Style::default().fg(OVERLAY0)),
         chunks[2],
     );
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let cut: String = s.chars().take(max - 1).collect();
-        format!("{}…", cut)
-    }
-}
-
-fn short_sha(s: &str) -> String {
-    s.chars().take(6).collect()
 }
 
 #[cfg(test)]
@@ -240,10 +195,7 @@ mod tests {
     #[test]
     fn renders_pr_number_in_header() {
         let pkg = fixture_pkg();
-        let st = PrReviewState {
-            show_commit_strip: false,
-            ..Default::default()
-        };
+        let st = PrReviewState::default();
         let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
         term.draw(|f| {
             let area = f.area();
@@ -257,6 +209,27 @@ mod tests {
     }
 
     #[test]
+    fn renders_no_commit_strip() {
+        let pkg = fixture_pkg();
+        let st = PrReviewState::default();
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| {
+            let area = f.area();
+            render(f, area, &pkg, &st);
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        // No row should render the old "commits  " label.
+        for y in 0..buf.area.height {
+            let row = buffer_line(buf, y);
+            assert!(
+                !row.starts_with("  commits  "),
+                "row {y} unexpectedly rendered the commit strip: {row:?}",
+            );
+        }
+    }
+
+    #[test]
     fn binary_file_renders_placeholder() {
         let mut pkg = fixture_pkg();
         pkg.files = vec![FileDiff {
@@ -264,10 +237,7 @@ mod tests {
             lines: vec![],
             binary: true,
         }];
-        let st = PrReviewState {
-            show_commit_strip: false,
-            ..Default::default()
-        };
+        let st = PrReviewState::default();
         let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
         term.draw(|f| {
             let area = f.area();

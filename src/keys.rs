@@ -34,7 +34,6 @@ pub enum Action {
     OpenFilePicker,
     OpenCommitsModal,
     Merge,
-    ToggleCommitStrip,
     ToggleShaMargin,
     BackToList,
 
@@ -100,10 +99,9 @@ fn review(ev: KeyEvent) -> Action {
         KeyCode::Char('g') => Action::Top,
         KeyCode::Tab | KeyCode::Enter => Action::NextFile,
         KeyCode::BackTab => Action::PrevFile,
-        KeyCode::Char('C') => Action::OpenCommitsModal,
         KeyCode::Char('f') => Action::OpenFilePicker,
         KeyCode::Char('m') => Action::Merge,
-        KeyCode::Char('c') => Action::ToggleCommitStrip,
+        KeyCode::Char('c') => Action::OpenCommitsModal,
         KeyCode::Char('s') => Action::ToggleShaMargin,
         _ => Action::Nothing,
     }
@@ -221,9 +219,9 @@ mod tests {
     }
 
     #[test]
-    fn review_capital_c_opens_commits_modal() {
+    fn review_c_opens_commits_modal() {
         assert_eq!(
-            dispatch(FocusedView::Review, k('C')),
+            dispatch(FocusedView::Review, k('c')),
             Action::OpenCommitsModal,
         );
     }
