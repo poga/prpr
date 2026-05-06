@@ -227,6 +227,7 @@ mod tests {
             detail,
             files,
             colors: HashMap::new(),
+            commit_stats: HashMap::new(),
         }
     }
 

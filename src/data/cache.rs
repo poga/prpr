@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use crate::data::diff::FileDiff;
 use crate::data::pr::{Pr, PrDetail};
-use crate::render::attribution::LineColors;
+use crate::render::attribution::{CommitStats, LineColors};
 
 #[derive(Debug, Clone)]
 pub struct PrPackage {
@@ -14,6 +14,9 @@ pub struct PrPackage {
     pub files: Vec<FileDiff>,
     /// Indexed by file path.
     pub colors: HashMap<String, LineColors>,
+    /// Per-commit-OID add/delete counts, summed across all files. One
+    /// entry per PR commit, even commits that touched no files.
+    pub commit_stats: HashMap<String, CommitStats>,
 }
 
 #[derive(Default)]
@@ -64,6 +67,7 @@ mod tests {
             detail,
             files: vec![],
             colors: HashMap::new(),
+            commit_stats: HashMap::new(),
         }
     }
 
