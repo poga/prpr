@@ -29,7 +29,7 @@ use crate::data::git::GitClient;
 use crate::data::worker::{Request, Response, Worker};
 use crate::keys::{Action, FocusedView, MouseAction, dispatch, mouse_dispatch};
 use crate::view::file_picker::FilePickerState;
-use crate::view::merge_modal::{MergeMethod, MergeModalState};
+use crate::view::merge_modal::{MergeMethod, MergeModalState, MergingState};
 use crate::view::pr_list::PrListState;
 use crate::view::pr_review::PrReviewState;
 
@@ -68,6 +68,7 @@ pub struct AppState {
     pub current_pr: Option<u32>,
     pub picker: Option<FilePickerState>,
     pub merge: Option<MergeModalState>,
+    pub merging: Option<MergingState>,
     pub pending_g: bool,
     pub running: bool,
 }
@@ -90,6 +91,7 @@ impl AppState {
             current_pr: None,
             picker: None,
             merge: None,
+            merging: None,
             pending_g: false,
             running: true,
         }
@@ -209,6 +211,7 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
             st.review = None;
             st.current_pr = None;
             st.merge = None;
+            st.merging = None;
             st.picker = None;
             st.list.status = format!("merged #{number}");
             st.list.loading = true;
@@ -218,6 +221,7 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
             number,
             result: Err(e),
         } => {
+            st.merging = None;
             st.list.status = format!("merge #{number} failed: {e}");
         }
     }
@@ -255,6 +259,9 @@ fn draw(f: &mut ratatui::Frame, app: &App, st: &AppState) {
     if let Some(m) = &st.merge {
         crate::view::merge_modal::render(f, area, m);
     }
+    if let Some(m) = &st.merging {
+        crate::view::merge_modal::render_progress(f, area, m);
+    }
     if st.focused == FocusedView::HelpOverlay {
         crate::view::help::render(f, area);
     }
@@ -268,6 +275,22 @@ fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) 
         ev.kind,
         crossterm::event::KeyEventKind::Press | crossterm::event::KeyEventKind::Repeat
     ) {
+        return;
+    }
+
+    // While a merge is in flight, the worker is busy and we don't want
+    // the user to stack further actions on top of it. The progress
+    // overlay still redraws each tick so the spinner stays animated.
+    // Ctrl-C is the one escape hatch — if the subprocess hangs, the
+    // user must still be able to quit.
+    if st.merging.is_some() {
+        if ev.code == crossterm::event::KeyCode::Char('c')
+            && ev
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL)
+        {
+            st.running = false;
+        }
         return;
     }
 
@@ -513,6 +536,9 @@ fn cycle_file(app: &App, st: &mut AppState, delta: i32) {
 }
 
 fn handle_mouse(app: &mut App, st: &mut AppState, ev: crossterm::event::MouseEvent) {
+    if st.merging.is_some() {
+        return;
+    }
     match mouse_dispatch(ev) {
         MouseAction::Scroll(d) => {
             if st.focused == FocusedView::List {
@@ -593,13 +619,16 @@ fn handle_merge_modal(app: &mut App, st: &mut AppState, ev: crossterm::event::Ke
             close_merge_modal(st);
         }
         KeyCode::Enter => {
-            let method = modal.selected.cli_flag().to_string();
+            let method = modal.selected;
             let num = modal.pr_number;
             app.request(Request::Merge {
                 number: num,
-                method: method.clone(),
+                method: method.cli_flag().to_string(),
             });
-            st.list.status = format!("merging #{num} ({method})…");
+            st.merging = Some(MergingState {
+                pr_number: num,
+                method,
+            });
             close_merge_modal(st);
         }
         KeyCode::Up | KeyCode::BackTab => {

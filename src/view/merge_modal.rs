@@ -58,6 +58,15 @@ pub struct MergeModalState {
     pub selected: MergeMethod,
 }
 
+/// Set while a `gh pr merge` subprocess is in flight. Drives the
+/// "merging…" overlay so the user always has visible feedback while
+/// they wait, regardless of which view they triggered the merge from.
+#[derive(Debug)]
+pub struct MergingState {
+    pub pr_number: u32,
+    pub method: MergeMethod,
+}
+
 pub fn render(f: &mut Frame, area: Rect, st: &MergeModalState) {
     let modal = centered(area, 56, 9);
     f.render_widget(Clear, modal);
@@ -101,10 +110,42 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
     Rect::new(x, y, w.min(area.width), h.min(area.height))
 }
 
+pub fn render_progress(f: &mut Frame, area: Rect, st: &MergingState) {
+    let modal = centered(area, 40, 5);
+    f.render_widget(Clear, modal);
+    let method = match st.method {
+        MergeMethod::Merge => "merge",
+        MergeMethod::Squash => "squash",
+        MergeMethod::Rebase => "rebase",
+    };
+    let body = format!(
+        "  {} merging #{} ({})…",
+        crate::render::spinner::glyph(),
+        st.pr_number,
+        method,
+    );
+    let lines = vec![
+        Line::from(""),
+        Line::styled(body, Style::default().fg(TEXT)),
+        Line::from(""),
+        Line::styled(
+            "   please wait".to_string(),
+            Style::default().fg(OVERLAY1),
+        ),
+    ];
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(SURFACE2))
+        .title(" Merging ");
+    f.render_widget(Paragraph::new(lines).block(block), modal);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     #[test]
     fn letter_mapping_round_trip() {
@@ -127,5 +168,34 @@ mod tests {
         assert_eq!(MergeMethod::Rebase.cycle(1), MergeMethod::Merge);
         assert_eq!(MergeMethod::Merge.cycle(-1), MergeMethod::Rebase);
         assert_eq!(MergeMethod::Rebase.cycle(-1), MergeMethod::Squash);
+    }
+
+    fn buffer_text(buf: &ratatui::buffer::Buffer) -> String {
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn progress_overlay_shows_pr_number_and_merging_text() {
+        let st = MergingState {
+            pr_number: 482,
+            method: MergeMethod::Squash,
+        };
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| {
+            let area = f.area();
+            render_progress(f, area, &st)
+        })
+        .unwrap();
+        let text = buffer_text(term.backend().buffer());
+        assert!(text.contains("#482"), "buffer was: {:?}", text);
+        assert!(text.contains("merging"), "buffer was: {:?}", text);
+        assert!(text.contains("squash"), "buffer was: {:?}", text);
     }
 }
