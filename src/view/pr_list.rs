@@ -59,7 +59,7 @@ fn render_header(f: &mut Frame, area: Rect, st: &PrListState) {
     let visible = st.visible_prs();
     let count = visible.iter().filter(|p| p.state == PrState::Open).count();
     let header = format!(
-        "  pprr · {} · {} · {} open                                   filter: {}",
+        "  prpr · {} · {} · {} open                                   filter: {}",
         st.repo_name,
         st.branch,
         count,
@@ -218,7 +218,7 @@ mod tests {
         let json = include_str!("../../tests/fixtures/pr_list.json");
         let prs: Vec<Pr> = serde_json::from_str(json).unwrap();
         PrListState {
-            repo_name: "pprr".into(),
+            repo_name: "prpr".into(),
             branch: "main".into(),
             prs,
             selected: 0,
@@ -241,7 +241,7 @@ mod tests {
         .unwrap();
         let buf = term.backend().buffer();
         let line0 = buffer_line(buf, 0);
-        assert!(line0.contains("pprr"));
+        assert!(line0.contains("prpr"));
         assert!(line0.contains("2 open"));
     }
 

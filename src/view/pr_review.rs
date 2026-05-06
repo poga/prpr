@@ -50,7 +50,7 @@ pub fn render(f: &mut Frame, area: Rect, pkg: &PrPackage, st: &PrReviewState) {
 fn render_header(f: &mut Frame, area: Rect, pkg: &PrPackage) {
     let d = &pkg.detail;
     let header = format!(
-        "  pprr · #{} {} · {} · {} ← {}",
+        "  prpr · #{} {} · {} · {} ← {}",
         d.number, d.title, d.author.login, d.base_ref_name, d.head_ref_name,
     );
     f.render_widget(

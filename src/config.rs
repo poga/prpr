@@ -66,7 +66,7 @@ struct RawUi {
 /// Locate the config file path. Returns `None` if no XDG config dir is
 /// resolvable (very rare).
 pub fn config_path() -> Option<PathBuf> {
-    directories::ProjectDirs::from("", "", "pprr").map(|d| d.config_dir().join("config.toml"))
+    directories::ProjectDirs::from("", "", "prpr").map(|d| d.config_dir().join("config.toml"))
 }
 
 /// Load the config from `config_path()`, merging with defaults. If the file

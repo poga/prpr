@@ -51,7 +51,7 @@ impl GitClient for GitCli {
     }
 
     fn fetch_pr(&self, repo_root: &Path, number: u32) -> Result<()> {
-        let refspec = format!("+refs/pull/{number}/head:refs/pprr/pr-{number}");
+        let refspec = format!("+refs/pull/{number}/head:refs/prpr/pr-{number}");
         run(Command::new("git")
             .current_dir(repo_root)
             .args(["fetch", "--quiet", "origin", &refspec]))?;

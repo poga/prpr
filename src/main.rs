@@ -3,13 +3,13 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 
-use pprr::app::{App, AppState, install_panic_hook, restore_terminal, run, setup_terminal};
-use pprr::config;
-use pprr::data::gh::{GhCli, GhClient};
-use pprr::data::git::{GitCli, GitClient};
+use prpr::app::{App, AppState, install_panic_hook, restore_terminal, run, setup_terminal};
+use prpr::config;
+use prpr::data::gh::{GhCli, GhClient};
+use prpr::data::git::{GitCli, GitClient};
 
 #[derive(Debug, Parser)]
-#[command(name = "pprr", version, about = "TUI PR review")]
+#[command(name = "prpr", version, about = "TUI PR review")]
 struct Cli {
     /// Override window_size from the config file.
     #[arg(long)]
@@ -22,7 +22,7 @@ struct Cli {
 fn main() {
     if let Err(e) = real_main() {
         let _ = restore_terminal();
-        eprintln!("pprr: {e:?}");
+        eprintln!("prpr: {e:?}");
         std::process::exit(1);
     }
 }
@@ -38,13 +38,13 @@ fn real_main() -> Result<()> {
     }
 
     if !is_tty() {
-        return Err(anyhow!("pprr requires a TTY"));
+        return Err(anyhow!("prpr requires a TTY"));
     }
     if std::env::var("COLORTERM")
         .map(|v| !(v == "truecolor" || v == "24bit"))
         .unwrap_or(true)
     {
-        eprintln!("pprr: COLORTERM is not 'truecolor' — colors may render incorrectly");
+        eprintln!("prpr: COLORTERM is not 'truecolor' — colors may render incorrectly");
     }
 
     let gh: Arc<dyn GhClient> = Arc::new(GhCli);

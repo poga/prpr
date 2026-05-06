@@ -1,4 +1,4 @@
-# pprr
+# prpr
 
 A keyboard-driven TUI for reviewing GitHub PRs, with per-commit color
 attribution in the diff.
@@ -20,7 +20,7 @@ cargo install --path .
 From inside a clone of any GitHub-hosted repo:
 
 ```bash
-pprr
+prpr
 ```
 
 ## Keys

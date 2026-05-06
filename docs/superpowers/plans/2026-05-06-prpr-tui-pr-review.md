@@ -1,4 +1,4 @@
-# pprr Implementation Plan
+# prpr Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -8,13 +8,13 @@
 
 **Tech Stack:** Rust, `ratatui`, `crossterm`, `serde_json`, `anyhow`, `thiserror`, `directories`, `toml`, `unicode-width`, `chrono`, `clap`. `gh` and `git` CLIs at runtime.
 
-**Reference spec:** `docs/superpowers/specs/2026-05-06-pprr-tui-pr-review-design.md`
+**Reference spec:** `docs/superpowers/specs/2026-05-06-prpr-tui-pr-review-design.md`
 
 ---
 
 ## Conventions used in this plan
 
-- All paths are relative to the repo root (`/Users/poga/projects/pprr`).
+- All paths are relative to the repo root (`/Users/poga/projects/prpr`).
 - Commits use Conventional Commits (`feat:`, `test:`, `refactor:`, `chore:`, `docs:`, `fix:`).
 - Every task ends with `cargo test` passing and a commit. Don't merge tasks.
 - The plan introduces traits where the spec calls for mocking (`GhClient`, `GitClient`). Tests substitute fakes; the binary uses the subprocess implementations.
@@ -34,8 +34,8 @@
 - [ ] **Step 1: Initialize the Cargo crate**
 
 ```bash
-cd /Users/poga/projects/pprr
-cargo init --bin --name pprr
+cd /Users/poga/projects/prpr
+cargo init --bin --name prpr
 ```
 
 This creates `Cargo.toml` and `src/main.rs` with a default `println!`.
@@ -91,7 +91,7 @@ Note: `Cargo.lock` *should* be checked in for binaries normally. We're keeping i
 
 ```rust
 fn main() {
-    println!("pprr v{}", env!("CARGO_PKG_VERSION"));
+    println!("prpr v{}", env!("CARGO_PKG_VERSION"));
 }
 ```
 
@@ -104,7 +104,7 @@ cargo build
 cargo run --quiet
 ```
 
-Expected output: `pprr v0.1.0`
+Expected output: `prpr v0.1.0`
 
 - [ ] **Step 8: Commit**
 
@@ -191,8 +191,8 @@ Files: `src/app.rs`, `src/keys.rs`, `src/config.rs`, `src/data/pr.rs`, `src/data
 
 ```rust
 fn main() {
-    println!("pprr v{}", env!("CARGO_PKG_VERSION"));
-    let _ = pprr::config::default_window_size();
+    println!("prpr v{}", env!("CARGO_PKG_VERSION"));
+    let _ = prpr::config::default_window_size();
 }
 ```
 
@@ -777,7 +777,7 @@ index aaaaaaa..bbbbbbb 100644
 --- a/README.md
 +++ b/README.md
 @@ -1,3 +1,3 @@
- # pprr
+ # prpr
 -A PR review tool.
 +A keyboard-driven PR review tool.
 
@@ -1363,7 +1363,7 @@ impl GitClient for GitCli {
     }
 
     fn fetch_pr(&self, repo_root: &Path, number: u32) -> Result<()> {
-        let refspec = format!("+refs/pull/{number}/head:refs/pprr/pr-{number}");
+        let refspec = format!("+refs/pull/{number}/head:refs/prpr/pr-{number}");
         run(Command::new("git")
             .current_dir(repo_root)
             .args(["fetch", "--quiet", "origin", &refspec]))?;
@@ -1812,7 +1812,7 @@ git commit -m "feat(data): in-memory cache keyed by head_sha"
 
 ## Task 11: Config schema + load
 
-Loads `~/.config/pprr/config.toml` if present. Returns defaults otherwise. CLI overrides applied later in Task 22.
+Loads `~/.config/prpr/config.toml` if present. Returns defaults otherwise. CLI overrides applied later in Task 22.
 
 **Files:**
 - Modify: `src/config.rs`
@@ -1888,7 +1888,7 @@ struct RawUi {
 /// Locate the config file path. Returns `None` if no XDG config dir is
 /// resolvable (very rare).
 pub fn config_path() -> Option<PathBuf> {
-    directories::ProjectDirs::from("", "", "pprr")
+    directories::ProjectDirs::from("", "", "prpr")
         .map(|d| d.config_dir().join("config.toml"))
 }
 
@@ -2221,7 +2221,7 @@ fn render_header(f: &mut Frame, area: Rect, st: &PrListState) {
     let visible = st.visible_prs();
     let count = visible.iter().filter(|p| p.state == PrState::Open).count();
     let header = format!(
-        "  pprr · {} · {} · {} open                                   filter: {}",
+        "  prpr · {} · {} · {} open                                   filter: {}",
         st.repo_name,
         st.branch,
         count,
@@ -2347,7 +2347,7 @@ mod tests {
         let json = include_str!("../../tests/fixtures/pr_list.json");
         let prs: Vec<Pr> = serde_json::from_str(json).unwrap();
         PrListState {
-            repo_name: "pprr".into(),
+            repo_name: "prpr".into(),
             branch: "main".into(),
             prs,
             selected: 0,
@@ -2369,7 +2369,7 @@ mod tests {
         .unwrap();
         let buf = term.backend().buffer();
         let line0 = buffer_line(buf, 0);
-        assert!(line0.contains("pprr"));
+        assert!(line0.contains("prpr"));
         assert!(line0.contains("2 open"));
     }
 
@@ -2468,7 +2468,7 @@ pub fn render(f: &mut Frame, area: Rect, pkg: &PrPackage, st: &PrReviewState) {
 fn render_header(f: &mut Frame, area: Rect, pkg: &PrPackage) {
     let d = &pkg.detail;
     let header = format!(
-        "  pprr · #{} {} · {} · {} ← {}",
+        "  prpr · #{} {} · {} · {} ← {}",
         d.number, d.title, d.author.login, d.base_ref_name, d.head_ref_name,
     );
     f.render_widget(
@@ -3933,13 +3933,13 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 
-use pprr::app::{install_panic_hook, restore_terminal, run, setup_terminal, App, AppState};
-use pprr::config;
-use pprr::data::gh::{GhCli, GhClient};
-use pprr::data::git::{GitCli, GitClient};
+use prpr::app::{install_panic_hook, restore_terminal, run, setup_terminal, App, AppState};
+use prpr::config;
+use prpr::data::gh::{GhCli, GhClient};
+use prpr::data::git::{GitCli, GitClient};
 
 #[derive(Debug, Parser)]
-#[command(name = "pprr", version, about = "TUI PR review")]
+#[command(name = "prpr", version, about = "TUI PR review")]
 struct Cli {
     /// Override window_size from the config file.
     #[arg(long)]
@@ -3952,7 +3952,7 @@ struct Cli {
 fn main() {
     if let Err(e) = real_main() {
         let _ = restore_terminal();
-        eprintln!("pprr: {e:?}");
+        eprintln!("prpr: {e:?}");
         std::process::exit(1);
     }
 }
@@ -3968,13 +3968,13 @@ fn real_main() -> Result<()> {
     }
 
     if !is_tty() {
-        return Err(anyhow!("pprr requires a TTY"));
+        return Err(anyhow!("prpr requires a TTY"));
     }
     if std::env::var("COLORTERM")
         .map(|v| !(v == "truecolor" || v == "24bit"))
         .unwrap_or(true)
     {
-        eprintln!("pprr: COLORTERM is not 'truecolor' — colors may render incorrectly");
+        eprintln!("prpr: COLORTERM is not 'truecolor' — colors may render incorrectly");
     }
 
     let gh: Arc<dyn GhClient> = Arc::new(GhCli);
@@ -4045,7 +4045,7 @@ git commit -m "feat: main wiring + launch preconditions"
 
 ## Task 23: Smoke test on Kitty + lockfile + README
 
-Final sanity pass. Run `pprr` in a real GitHub repo on Kitty. Document what to expect. Re-enable `Cargo.lock`.
+Final sanity pass. Run `prpr` in a real GitHub repo on Kitty. Document what to expect. Re-enable `Cargo.lock`.
 
 **Files:**
 - Modify: `.gitignore`
@@ -4068,7 +4068,7 @@ Run from inside a real GitHub-hosted Rust repo (e.g., clone `cli/cli` for quick 
 
 ```bash
 cd /tmp && git clone --depth=200 https://github.com/cli/cli && cd cli
-cargo run --manifest-path /Users/poga/projects/pprr/Cargo.toml
+cargo run --manifest-path /Users/poga/projects/prpr/Cargo.toml
 ```
 
 Verify, in order:
@@ -4092,7 +4092,7 @@ Stop on the first failure. Open a follow-up issue describing it; that's a v1.1 f
 Create `README.md`:
 
 ```markdown
-# pprr
+# prpr
 
 A keyboard-driven TUI for reviewing GitHub PRs, with per-commit color
 attribution in the diff.
@@ -4114,7 +4114,7 @@ cargo install --path .
 From inside a clone of any GitHub-hosted repo:
 
 ```bash
-pprr
+prpr
 ```
 
 ## Keys
@@ -4184,7 +4184,7 @@ A pass over the spec to confirm coverage:
 
 ## Execution Handoff
 
-Plan complete and saved to `docs/superpowers/plans/2026-05-06-pprr-tui-pr-review.md`. Two execution options:
+Plan complete and saved to `docs/superpowers/plans/2026-05-06-prpr-tui-pr-review.md`. Two execution options:
 
 **1. Subagent-Driven (recommended)** — I dispatch a fresh subagent per task, review between tasks, fast iteration.
 

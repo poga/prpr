@@ -1,4 +1,4 @@
-# pprr — TUI PR Review Tool
+# prpr — TUI PR Review Tool
 
 **Status:** Design
 **Date:** 2026-05-06
@@ -6,7 +6,7 @@
 
 ## Summary
 
-`pprr` is a fast, keyboard-driven terminal UI for reviewing GitHub Pull
+`prpr` is a fast, keyboard-driven terminal UI for reviewing GitHub Pull
 Requests. It reads PR data through the `gh` CLI and renders unified diffs
 where each changed line carries a colored gutter showing which commit in the
 PR introduced it. The tool is read-only with one write action: merging a PR.
@@ -41,7 +41,7 @@ came from.
 
 ### F1. Triage
 
-1. `cd` into a GitHub repo, run `pprr`.
+1. `cd` into a GitHub repo, run `prpr`.
 2. PR list view appears, focused on the most recent PR.
 3. `j`/`k` to move; `/` to fuzzy-search; `f` to cycle filter.
 4. `q` to quit.
@@ -64,7 +64,7 @@ came from.
 
 ## Tech stack
 
-Single Rust binary `pprr`. Subprocess-driven: `gh` for GitHub operations,
+Single Rust binary `prpr`. Subprocess-driven: `gh` for GitHub operations,
 `git` for diff and blame. No daemon.
 
 | Crate | Purpose |
@@ -73,7 +73,7 @@ Single Rust binary `pprr`. Subprocess-driven: `gh` for GitHub operations,
 | `crossterm` | Terminal backend (keyboard, mouse, truecolor); supports Kitty's keyboard protocol and SGR mouse mode |
 | `serde`, `serde_json` | Parse `gh --json` output |
 | `anyhow`, `thiserror` | Error handling |
-| `directories` | Locate `~/.config/pprr/config.toml` |
+| `directories` | Locate `~/.config/prpr/config.toml` |
 | `toml` | Parse config |
 | `unicode-width` | Correct terminal column accounting |
 
@@ -148,7 +148,7 @@ recomputed.
 ### PR List (full-screen)
 
 ```
-  pprr · main · 12 open                                   filter: open
+  prpr · main · 12 open                                   filter: open
   ──────────────────────────────────────────────────────────────────────
   ● ✓ ✓ #482 fix: race condition in scheduler  [bug]     alice 2d
   ● ✗ ! #479 feat: add /metrics endpoint       [feature] bob   3d
@@ -182,7 +182,7 @@ Five horizontal regions, top to bottom:
 5. Status line: cursor line's commit info + key hints
 
 ```
-  pprr · #482 fix: race in scheduler · alice · main ← fix-race · ✓ci ✓review
+  prpr · #482 fix: race in scheduler · alice · main ← fix-race · ✓ci ✓review
   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   commits  █ a1b2c3 init structure       █ d4e5f6 enum dispatch
            █ 789abc add Wait variant     ▒ (older)
@@ -373,7 +373,7 @@ cold cache; ≤ 10 ms on hot cache (in-memory lookup).
 
 ## Configuration
 
-`~/.config/pprr/config.toml`. Every key is optional.
+`~/.config/prpr/config.toml`. Every key is optional.
 
 ```toml
 [colors]
@@ -393,8 +393,8 @@ show_sha_margin   = false
 
 CLI flags override the file:
 ```
-pprr --window-size 5
-pprr --no-commit-strip
+prpr --window-size 5
+prpr --no-commit-strip
 ```
 
 ## Preconditions and errors
