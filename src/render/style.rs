@@ -21,16 +21,20 @@ pub const DIFF_ADD_BG: Color = Color::Rgb(0x1f, 0x2a, 0x1f);
 pub const DIFF_DEL_FG: Color = Color::Rgb(0xf3, 0x8b, 0xa8);
 pub const DIFF_DEL_BG: Color = Color::Rgb(0x2a, 0x1f, 0x23);
 
-// Commit slot palette — fixed order, oldest in window = slot 0.
-// Green and red are deliberately absent.
+// Commit slot palette — a cool→warm hue gradient. Slot 0 is the oldest
+// in-window commit; slot 6 is the newest. Reading the gutter top-to-bottom
+// in chronological order tracks the rainbow blue → purple → pink →
+// orange → yellow, so a glance tells you which commits are early and
+// which are late. Green and red are deliberately absent (reserved for
+// diff add/remove).
 pub const COMMIT_PALETTE: [Color; 7] = [
-    Color::Rgb(0x89, 0xb4, 0xfa), // 1 blue
-    Color::Rgb(0xcb, 0xa6, 0xf7), // 2 mauve
-    Color::Rgb(0xfa, 0xb3, 0x87), // 3 peach
-    Color::Rgb(0x94, 0xe2, 0xd5), // 4 teal
-    Color::Rgb(0xf9, 0xe2, 0xaf), // 5 yellow
-    Color::Rgb(0xf5, 0xc2, 0xe7), // 6 pink
-    Color::Rgb(0x74, 0xc7, 0xec), // 7 sapphire
+    Color::Rgb(0x74, 0xc7, 0xec), // 1 sapphire   (oldest)
+    Color::Rgb(0x89, 0xb4, 0xfa), // 2 blue
+    Color::Rgb(0xb4, 0xbe, 0xfe), // 3 lavender
+    Color::Rgb(0xcb, 0xa6, 0xf7), // 4 mauve
+    Color::Rgb(0xf5, 0xc2, 0xe7), // 5 pink
+    Color::Rgb(0xfa, 0xb3, 0x87), // 6 peach
+    Color::Rgb(0xf9, 0xe2, 0xaf), // 7 yellow     (newest)
 ];
 
 // Used for commits that fall outside the window.
