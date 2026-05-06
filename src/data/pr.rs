@@ -1,5 +1,16 @@
 use chrono::{DateTime, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
+
+/// `gh` returns `"reviewDecision": ""` for PRs that haven't been reviewed,
+/// not `null` and not a missing key. Treat empty strings as `None`.
+fn deser_review_decision<'de, D: Deserializer<'de>>(d: D) -> Result<Option<ReviewDecision>, D::Error> {
+    use serde::de::IntoDeserializer;
+    let s: Option<String> = Option::deserialize(d)?;
+    match s.as_deref() {
+        None | Some("") => Ok(None),
+        Some(other) => ReviewDecision::deserialize(other.into_deserializer()).map(Some),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Pr {
@@ -15,7 +26,11 @@ pub struct Pr {
     pub labels: Vec<Label>,
     #[serde(rename = "statusCheckRollup", default)]
     pub status_check_rollup: Vec<StatusCheck>,
-    #[serde(rename = "reviewDecision", default)]
+    #[serde(
+        rename = "reviewDecision",
+        default,
+        deserialize_with = "deser_review_decision"
+    )]
     pub review_decision: Option<ReviewDecision>,
 }
 
@@ -110,7 +125,11 @@ pub struct PrDetail {
     pub mergeable: Option<String>,
     #[serde(rename = "statusCheckRollup", default)]
     pub status_check_rollup: Vec<StatusCheck>,
-    #[serde(rename = "reviewDecision", default)]
+    #[serde(
+        rename = "reviewDecision",
+        default,
+        deserialize_with = "deser_review_decision"
+    )]
     pub review_decision: Option<ReviewDecision>,
     pub commits: Vec<Commit>,
     pub files: Vec<FileMeta>,
@@ -162,6 +181,25 @@ mod tests {
             review_decision: None,
         };
         assert_eq!(pr.ci_state(), CiState::None);
+    }
+
+    #[test]
+    fn empty_review_decision_string_parses_as_none() {
+        // `gh pr list --json reviewDecision` returns "" (not null, not missing)
+        // for PRs that haven't been reviewed yet. Make sure we tolerate that.
+        let json = r#"[{
+            "number": 1,
+            "title": "t",
+            "isDraft": false,
+            "state": "OPEN",
+            "author": { "login": "a" },
+            "createdAt": "2026-01-01T00:00:00Z",
+            "labels": [],
+            "statusCheckRollup": [],
+            "reviewDecision": ""
+        }]"#;
+        let prs: Vec<Pr> = serde_json::from_str(json).unwrap();
+        assert_eq!(prs[0].review_decision, None);
     }
 
     #[test]

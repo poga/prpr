@@ -77,7 +77,7 @@ fn render_rows(f: &mut Frame, area: Rect, st: &PrListState, now: DateTime<Utc>) 
     f.render_widget(Paragraph::new(lines), area);
 }
 
-fn render_footer(f: &mut Frame, area: Rect, _st: &PrListState) {
+fn render_footer(f: &mut Frame, area: Rect, st: &PrListState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Length(1)])
@@ -87,13 +87,22 @@ fn render_footer(f: &mut Frame, area: Rect, _st: &PrListState) {
             .style(Style::default().fg(OVERLAY1)),
         chunks[0],
     );
-    f.render_widget(
-        Paragraph::new(
-            "  state ●open ○draft   ci ✓pass ✗fail …pend   review ✓approved !changes ·pending",
-        )
-        .style(Style::default().fg(OVERLAY0)),
-        chunks[1],
-    );
+    // When there's a status (e.g. refresh error), show that instead of the
+    // legend. Errors must never be silent — the user should see them.
+    if !st.status.is_empty() {
+        f.render_widget(
+            Paragraph::new(format!("  {}", st.status)).style(Style::default().fg(DIFF_DEL_FG)),
+            chunks[1],
+        );
+    } else {
+        f.render_widget(
+            Paragraph::new(
+                "  state ●open ○draft   ci ✓pass ✗fail …pend   review ✓approved !changes ·pending",
+            )
+            .style(Style::default().fg(OVERLAY0)),
+            chunks[1],
+        );
+    }
 }
 
 fn divider(w: usize) -> Line<'static> {
