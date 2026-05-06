@@ -82,6 +82,12 @@ impl Cache {
             .map(|(_, v)| v)
     }
 
+    /// Run `gh pr merge <number> --<method>`. Method must be "merge" |
+    /// "squash" | "rebase". Errors propagate from gh.
+    pub fn merge_pr(&self, number: u32, method: &str) -> Result<()> {
+        self.gh.merge_pr(&self.repo_root, number, method)
+    }
+
     fn build_package(&self, detail: PrDetail) -> Result<PrPackage> {
         // 1. Make sure the PR refs are local.
         self.git

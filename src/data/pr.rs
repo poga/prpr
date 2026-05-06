@@ -3,7 +3,9 @@ use serde::{Deserialize, Deserializer};
 
 /// `gh` returns `"reviewDecision": ""` for PRs that haven't been reviewed,
 /// not `null` and not a missing key. Treat empty strings as `None`.
-fn deser_review_decision<'de, D: Deserializer<'de>>(d: D) -> Result<Option<ReviewDecision>, D::Error> {
+fn deser_review_decision<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<Option<ReviewDecision>, D::Error> {
     use serde::de::IntoDeserializer;
     let s: Option<String> = Option::deserialize(d)?;
     match s.as_deref() {

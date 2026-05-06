@@ -90,7 +90,7 @@ fn review(ev: KeyEvent) -> Action {
         KeyCode::Char('u') if ev.modifiers.contains(KeyModifiers::CONTROL) => Action::HalfPageUp,
         KeyCode::Char('G') => Action::Bottom,
         KeyCode::Char('g') => Action::Top,
-        KeyCode::Tab => Action::NextFile,
+        KeyCode::Tab | KeyCode::Enter => Action::NextFile,
         KeyCode::BackTab => Action::PrevFile,
         KeyCode::Char('f') => Action::OpenFilePicker,
         KeyCode::Char('m') => Action::Merge,

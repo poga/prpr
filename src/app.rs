@@ -183,6 +183,16 @@ fn draw(f: &mut ratatui::Frame, app: &App, st: &AppState) {
 }
 
 fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) {
+    // Kitty's enhanced keyboard protocol (PushKeyboardEnhancementFlags above)
+    // makes terminals emit Press AND Release for every key. We only want
+    // Press (and Repeat for held keys); Release would double-fire actions.
+    if !matches!(
+        ev.kind,
+        crossterm::event::KeyEventKind::Press | crossterm::event::KeyEventKind::Repeat
+    ) {
+        return;
+    }
+
     if st.focused == FocusedView::HelpOverlay {
         match ev.code {
             crossterm::event::KeyCode::Char('?')
@@ -196,6 +206,16 @@ fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) 
             }
             _ => {}
         }
+        return;
+    }
+
+    if st.focused == FocusedView::FilePicker {
+        handle_file_picker(app, st, ev);
+        return;
+    }
+
+    if st.focused == FocusedView::MergeModal {
+        handle_merge_modal(app, st, ev);
         return;
     }
 
@@ -283,11 +303,13 @@ fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) 
         Action::CursorDown => {
             if let Some(r) = st.review.as_mut() {
                 r.cursor_line = r.cursor_line.saturating_add(1);
+                r.scroll = r.scroll.saturating_add(1);
             }
         }
         Action::CursorUp => {
             if let Some(r) = st.review.as_mut() {
                 r.cursor_line = r.cursor_line.saturating_sub(1);
+                r.scroll = r.scroll.saturating_sub(1);
             }
         }
         Action::HalfPageDown => {
@@ -415,4 +437,87 @@ fn handle_mouse(_app: &mut App, st: &mut AppState, ev: crossterm::event::MouseEv
         }
         MouseAction::DoubleClickAt { .. } | MouseAction::Nothing => {}
     }
+}
+
+fn handle_file_picker(app: &App, st: &mut AppState, ev: crossterm::event::KeyEvent) {
+    use crossterm::event::KeyCode;
+    let Some(picker) = st.picker.as_mut() else {
+        return;
+    };
+    match ev.code {
+        KeyCode::Esc => {
+            st.picker = None;
+            st.focused = FocusedView::Review;
+        }
+        KeyCode::Enter => {
+            // Resolve selection to a file_index in the current PR.
+            let chosen = picker.matches().get(picker.selected).map(|s| (*s).clone());
+            if let (Some(path), Some(num)) = (chosen, st.current_pr)
+                && let Some(pkg) = app.cache.get(num)
+                && let Some(idx) = pkg.files.iter().position(|f| f.path == path)
+                && let Some(r) = st.review.as_mut()
+            {
+                r.file_index = idx;
+                r.cursor_line = 0;
+                r.scroll = 0;
+            }
+            st.picker = None;
+            st.focused = FocusedView::Review;
+        }
+        KeyCode::Down => {
+            let n = picker.matches().len();
+            if picker.selected + 1 < n {
+                picker.selected += 1;
+            }
+        }
+        KeyCode::Up => {
+            picker.selected = picker.selected.saturating_sub(1);
+        }
+        KeyCode::Backspace => {
+            picker.query.pop();
+            picker.selected = 0;
+        }
+        KeyCode::Char(c) => {
+            picker.query.push(c);
+            picker.selected = 0;
+        }
+        _ => {}
+    }
+}
+
+fn handle_merge_modal(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) {
+    use crossterm::event::KeyCode;
+    let Some(modal) = st.merge.as_mut() else {
+        return;
+    };
+    match ev.code {
+        KeyCode::Esc => {
+            close_merge_modal(st);
+        }
+        KeyCode::Enter => {
+            let method = modal.selected.cli_flag().to_string();
+            let num = modal.pr_number;
+            let result = app.cache.merge_pr(num, &method);
+            close_merge_modal(st);
+            st.list.status = match result {
+                Ok(()) => format!("merged #{num} ({method})"),
+                Err(e) => format!("merge failed: {e}"),
+            };
+        }
+        KeyCode::Char(c) => {
+            if let Some(method) = crate::view::merge_modal::from_letter(c) {
+                modal.selected = method;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn close_merge_modal(st: &mut AppState) {
+    st.merge = None;
+    st.focused = if st.review.is_some() {
+        FocusedView::Review
+    } else {
+        FocusedView::List
+    };
 }
