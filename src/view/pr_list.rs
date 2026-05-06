@@ -19,6 +19,9 @@ pub struct PrListState {
     pub filter_open_only: bool,
     pub search: Option<String>,
     pub status: String,
+    /// True while the initial `gh pr list` is in flight. The renderer
+    /// shows a centered "loading…" placeholder instead of an empty body.
+    pub loading: bool,
 }
 
 impl PrListState {
@@ -68,6 +71,15 @@ fn render_header(f: &mut Frame, area: Rect, st: &PrListState) {
 }
 
 fn render_rows(f: &mut Frame, area: Rect, st: &PrListState, now: DateTime<Utc>) {
+    if st.loading {
+        f.render_widget(
+            Paragraph::new("loading PRs…")
+                .style(Style::default().fg(OVERLAY1))
+                .alignment(ratatui::layout::Alignment::Center),
+            area,
+        );
+        return;
+    }
     let visible = st.visible_prs();
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(visible.len() + 1);
     lines.push(divider(area.width as usize));
@@ -205,6 +217,7 @@ mod tests {
             selected: 0,
             filter_open_only: true,
             search: None,
+            loading: false,
             status: String::new(),
         }
     }

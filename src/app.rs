@@ -1,4 +1,9 @@
 //! Top-level app: terminal init/teardown, panic hook, event loop, view transitions.
+//!
+//! Threading model: the main thread runs the ratatui draw + input loop and
+//! never makes a subprocess call. All `gh` and `git` work happens on the
+//! `Worker` thread and round-trips through channels (see `data::worker`).
+//! The UI drains worker responses each loop iteration.
 
 use std::io::{self, Stdout};
 use std::sync::Arc;
@@ -21,6 +26,7 @@ use crate::config::Config;
 use crate::data::cache::Cache;
 use crate::data::gh::GhClient;
 use crate::data::git::GitClient;
+use crate::data::worker::{Request, Response, Worker};
 use crate::keys::{Action, FocusedView, MouseAction, dispatch, mouse_dispatch};
 use crate::view::file_picker::FilePickerState;
 use crate::view::merge_modal::{MergeMethod, MergeModalState};
@@ -32,6 +38,7 @@ pub type Term = Terminal<CrosstermBackend<Stdout>>;
 pub struct App {
     pub cache: Cache,
     pub config: Config,
+    pub worker: Worker,
 }
 
 impl App {
@@ -41,22 +48,16 @@ impl App {
         git: Arc<dyn GitClient>,
         config: Config,
     ) -> Self {
-        let window = config.window_size;
+        let worker = Worker::spawn(repo_root, gh, git, config.window_size);
         Self {
-            cache: Cache::new(repo_root, gh, git, window),
+            cache: Cache::new(),
             config,
+            worker,
         }
     }
 
-    /// Populate the cache for `number` if not already loaded. Errors are
-    /// silently swallowed — they show up in `st.list.status` via the caller.
-    pub fn ensure_pr_loaded(&mut self, number: u32) {
-        if self.cache.get(number).is_some() {
-            return;
-        }
-        if let Err(e) = self.cache.load_pr(number) {
-            eprintln!("cache load #{number}: {e}");
-        }
+    fn request(&self, req: Request) {
+        self.worker.send(req);
     }
 }
 
@@ -83,6 +84,7 @@ impl AppState {
                 filter_open_only: true,
                 search: None,
                 status: String::new(),
+                loading: false,
             },
             review: None,
             current_pr: None,
@@ -127,15 +129,21 @@ pub fn restore_terminal() -> Result<()> {
 }
 
 pub fn run(term: &mut Term, app: &mut App, st: &mut AppState) -> Result<()> {
-    if let Err(e) = app.cache.refresh_list() {
-        st.list.status = format!("refresh failed: {e}");
-    } else if let Some(prs) = app.cache.list.as_ref() {
-        st.list.prs = prs.clone();
-    }
+    // Kick off the initial PR list load. The first draw will show
+    // "loading PRs…" while the worker thread does the gh subprocess.
+    st.list.loading = true;
+    app.request(Request::RefreshList);
 
     while st.running {
+        // Drain any worker responses before drawing.
+        while let Ok(resp) = app.worker.rx.try_recv() {
+            handle_response(app, st, resp);
+        }
+
         term.draw(|f| draw(f, app, st))?;
-        if event::poll(Duration::from_millis(250))? {
+
+        // Short timeout so we pick up worker responses promptly.
+        if event::poll(Duration::from_millis(100))? {
             match event::read()? {
                 Event::Key(k) => handle_key(app, st, k),
                 Event::Mouse(m) => handle_mouse(app, st, m),
@@ -145,6 +153,64 @@ pub fn run(term: &mut Term, app: &mut App, st: &mut AppState) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
+    match resp {
+        Response::ListLoaded(Ok(prs)) => {
+            st.list.prs = prs.clone();
+            app.cache.set_list(prs);
+            st.list.loading = false;
+            st.list.status = String::new();
+            // Clamp selection in case the list shrank.
+            let n = st.list.visible_prs().len();
+            if st.list.selected >= n {
+                st.list.selected = n.saturating_sub(1);
+            }
+        }
+        Response::ListLoaded(Err(e)) => {
+            st.list.loading = false;
+            st.list.status = format!("refresh failed: {e}");
+        }
+        Response::PrLoaded {
+            number,
+            result: Ok(pkg),
+        } => {
+            let files_count = pkg.files.len();
+            app.cache.insert(pkg);
+            if let Some(r) = st.review.as_mut()
+                && st.current_pr == Some(number)
+            {
+                r.status = format!("{} files", files_count);
+            }
+        }
+        Response::PrLoaded {
+            number,
+            result: Err(e),
+        } => {
+            if let Some(r) = st.review.as_mut()
+                && st.current_pr == Some(number)
+            {
+                r.status = format!("load failed: {e}");
+            }
+            st.list.status = format!("load #{number} failed: {e}");
+        }
+        Response::MergeDone {
+            number,
+            result: Ok(()),
+        } => {
+            st.list.status = format!("merged #{number}");
+            // Refresh the list so the merged PR shows its new state.
+            st.list.loading = true;
+            app.request(Request::RefreshList);
+        }
+        Response::MergeDone {
+            number,
+            result: Err(e),
+        } => {
+            st.list.status = format!("merge #{number} failed: {e}");
+        }
+    }
 }
 
 fn draw(f: &mut ratatui::Frame, app: &App, st: &AppState) {
@@ -183,9 +249,9 @@ fn draw(f: &mut ratatui::Frame, app: &App, st: &AppState) {
 }
 
 fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) {
-    // Kitty's enhanced keyboard protocol (PushKeyboardEnhancementFlags above)
-    // makes terminals emit Press AND Release for every key. We only want
-    // Press (and Repeat for held keys); Release would double-fire actions.
+    // Kitty's enhanced keyboard protocol emits Press AND Release for every
+    // key. We only want Press (and Repeat for held keys); Release would
+    // double-fire actions.
     if !matches!(
         ev.kind,
         crossterm::event::KeyEventKind::Press | crossterm::event::KeyEventKind::Repeat
@@ -269,27 +335,24 @@ fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) 
             if let Some(pr) = st.list.visible_prs().get(st.list.selected).copied() {
                 let num = pr.number;
                 st.current_pr = Some(num);
-                app.ensure_pr_loaded(num);
-                let pkg = app.cache.get(num);
-                let files_count = pkg.map(|p| p.files.len()).unwrap_or(0);
                 st.review = Some(PrReviewState {
                     file_index: 0,
                     cursor_line: 0,
                     scroll: 0,
                     show_commit_strip: app.config.show_commit_strip,
                     show_sha_margin: app.config.show_sha_margin,
-                    status: format!("{} files", files_count),
+                    status: "loading…".into(),
                 });
                 st.focused = FocusedView::Review;
+                if app.cache.get(num).is_none() {
+                    app.request(Request::LoadPr(num));
+                }
             }
         }
         Action::ListMerge => open_merge(st),
         Action::ListRefresh => {
-            if let Err(e) = app.cache.refresh_list() {
-                st.list.status = format!("refresh failed: {e}");
-            } else if let Some(prs) = app.cache.list.as_ref() {
-                st.list.prs = prs.clone();
-            }
+            st.list.loading = true;
+            app.request(Request::RefreshList);
         }
         Action::ListSearch => {
             st.list.search = Some(String::new());
@@ -382,7 +445,10 @@ fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) 
         }
         Action::Refresh => {
             if let Some(num) = st.current_pr {
-                let _ = app.cache.load_pr(num);
+                if let Some(r) = st.review.as_mut() {
+                    r.status = "loading…".into();
+                }
+                app.request(Request::LoadPr(num));
             }
         }
         Action::Nothing => {}
@@ -464,7 +530,6 @@ fn handle_file_picker(app: &App, st: &mut AppState, ev: crossterm::event::KeyEve
             st.focused = FocusedView::Review;
         }
         KeyCode::Enter => {
-            // Resolve selection to a file_index in the current PR.
             let chosen = picker.matches().get(picker.selected).map(|s| (*s).clone());
             if let (Some(path), Some(num)) = (chosen, st.current_pr)
                 && let Some(pkg) = app.cache.get(num)
@@ -511,12 +576,12 @@ fn handle_merge_modal(app: &mut App, st: &mut AppState, ev: crossterm::event::Ke
         KeyCode::Enter => {
             let method = modal.selected.cli_flag().to_string();
             let num = modal.pr_number;
-            let result = app.cache.merge_pr(num, &method);
+            app.request(Request::Merge {
+                number: num,
+                method: method.clone(),
+            });
+            st.list.status = format!("merging #{num} ({method})…");
             close_merge_modal(st);
-            st.list.status = match result {
-                Ok(()) => format!("merged #{num} ({method})"),
-                Err(e) => format!("merge failed: {e}"),
-            };
         }
         KeyCode::Char(c) => {
             if let Some(method) = crate::view::merge_modal::from_letter(c) {

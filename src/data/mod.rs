@@ -4,3 +4,4 @@ pub mod diff;
 pub mod gh;
 pub mod git;
 pub mod pr;
+pub mod worker;
