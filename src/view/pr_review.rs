@@ -245,8 +245,8 @@ mod tests {
         })
         .unwrap();
         let buf = term.backend().buffer();
-        // With strip hidden, body starts at row 3 (header row 0; strip 0 rows;
-        // file bar rows 1-2; body rows 3..18; status row 19).
+        // Body starts at row 3 (header row 0; file bar rows 1-2;
+        // body rows 3..18; status row 19).
         let body = buffer_line(buf, 3);
         assert!(body.contains("binary file"), "row 3 was: {:?}", body);
     }
