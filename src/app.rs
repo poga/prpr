@@ -684,7 +684,11 @@ fn close_merge_modal(st: &mut AppState) {
 }
 
 fn handle_commits_modal(st: &mut AppState, ev: crossterm::event::KeyEvent) {
-    use crossterm::event::KeyCode;
+    use crossterm::event::{KeyCode, KeyModifiers};
+    if ev.code == KeyCode::Char('c') && ev.modifiers.contains(KeyModifiers::CONTROL) {
+        st.running = false;
+        return;
+    }
     let Some(modal) = st.commits.as_mut() else {
         return;
     };
