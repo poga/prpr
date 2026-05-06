@@ -40,17 +40,34 @@ pub const OLDER_COMMIT: Color = SURFACE2;
 mod tests {
     use super::*;
 
-    #[test]
-    fn commit_palette_has_no_green_or_red() {
-        for c in COMMIT_PALETTE.iter() {
-            // No commit color should be too close to diff add (green) or remove (red).
-            // This is a sanity check, not a perceptual assertion.
-            if let Color::Rgb(r, g, b) = c {
-                let mostly_green = *g > 0xc0 && *r < *g && *b < *g;
-                let mostly_red = *r > 0xc0 && *g < *r && *b < *r;
-                assert!(!mostly_green, "commit palette contains a green-ish color");
-                assert!(!mostly_red, "commit palette contains a red-ish color");
+    fn rgb_distance(a: Color, b: Color) -> f64 {
+        match (a, b) {
+            (Color::Rgb(ar, ag, ab), Color::Rgb(br, bg, bb)) => {
+                let dr = ar as i32 - br as i32;
+                let dg = ag as i32 - bg as i32;
+                let db = ab as i32 - bb as i32;
+                ((dr * dr + dg * dg + db * db) as f64).sqrt()
             }
+            _ => f64::MAX,
+        }
+    }
+
+    #[test]
+    fn commit_palette_distinguishable_from_diff_colors() {
+        // Each commit color must be perceptually distinct from the diff
+        // add (green) and remove (red) foreground colors. RGB-distance is a
+        // crude proxy but works for the small, hand-picked palette.
+        for c in COMMIT_PALETTE.iter() {
+            assert!(
+                rgb_distance(*c, DIFF_ADD_FG) > 40.0,
+                "commit color {:?} too close to DIFF_ADD_FG",
+                c,
+            );
+            assert!(
+                rgb_distance(*c, DIFF_DEL_FG) > 40.0,
+                "commit color {:?} too close to DIFF_DEL_FG",
+                c,
+            );
         }
     }
 
