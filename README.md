@@ -3,6 +3,9 @@
 A keyboard-driven TUI for reviewing GitHub PRs, with per-commit color
 attribution in the diff.
 
+![](demo01.png)
+![](demo02.png)
+
 ## Requirements
 
 - `gh` CLI on `$PATH`, authenticated (`gh auth login`)
