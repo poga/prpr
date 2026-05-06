@@ -1,0 +1,100 @@
+%YAML 1.2
+---
+# Minimal GDScript sublime-syntax. Covers the common surface: comments,
+# strings (single/double/triple), keywords, built-in types, numbers,
+# function definitions, and operators. Not exhaustive — good enough for
+# code review at-a-glance.
+name: GDScript
+file_extensions:
+  - gd
+scope: source.gdscript
+
+variables:
+  identifier: '[A-Za-z_][A-Za-z0-9_]*'
+
+contexts:
+  main:
+    - include: comments
+    - include: strings
+    - include: numbers
+    - include: keywords
+    - include: types
+    - include: function-def
+    - include: function-call
+    - include: operators
+
+  comments:
+    - match: '#.*$'
+      scope: comment.line.number-sign.gdscript
+
+  strings:
+    - match: '"""'
+      scope: punctuation.definition.string.begin.gdscript
+      push:
+        - meta_scope: string.quoted.triple.gdscript
+        - match: '"""'
+          scope: punctuation.definition.string.end.gdscript
+          pop: true
+    - match: "'''"
+      scope: punctuation.definition.string.begin.gdscript
+      push:
+        - meta_scope: string.quoted.triple.gdscript
+        - match: "'''"
+          scope: punctuation.definition.string.end.gdscript
+          pop: true
+    - match: '"'
+      scope: punctuation.definition.string.begin.gdscript
+      push:
+        - meta_scope: string.quoted.double.gdscript
+        - match: '\\.'
+          scope: constant.character.escape.gdscript
+        - match: '"'
+          scope: punctuation.definition.string.end.gdscript
+          pop: true
+        - match: '$'
+          pop: true
+    - match: "'"
+      scope: punctuation.definition.string.begin.gdscript
+      push:
+        - meta_scope: string.quoted.single.gdscript
+        - match: "\\\\."
+          scope: constant.character.escape.gdscript
+        - match: "'"
+          scope: punctuation.definition.string.end.gdscript
+          pop: true
+        - match: '$'
+          pop: true
+
+  numbers:
+    - match: '\b0x[0-9a-fA-F_]+\b'
+      scope: constant.numeric.hex.gdscript
+    - match: '\b0b[01_]+\b'
+      scope: constant.numeric.binary.gdscript
+    - match: '\b\d[\d_]*\.\d[\d_]*([eE][+-]?\d+)?\b'
+      scope: constant.numeric.float.gdscript
+    - match: '\b\d[\d_]*\b'
+      scope: constant.numeric.integer.gdscript
+
+  keywords:
+    - match: '\b(var|const|func|class|class_name|extends|return|if|else|elif|while|for|in|match|when|pass|break|continue|signal|await|static|export|onready|tool|enum|namespace|null|true|false|self|super|and|or|not|is|as|yield|setget|get|set|preload|assert|breakpoint)\b'
+      scope: keyword.control.gdscript
+    - match: '@\b(export|export_range|export_enum|export_file|export_dir|export_global_file|export_global_dir|export_multiline|export_color_no_alpha|export_node_path|export_flags|onready|tool|warning_ignore|rpc|rpc_call_local|rpc_master|rpc_puppet|icon)\b'
+      scope: storage.modifier.annotation.gdscript
+
+  types:
+    - match: '\b(int|float|bool|String|StringName|Array|Dictionary|Vector2|Vector2i|Vector3|Vector3i|Vector4|Vector4i|Color|Rect2|Rect2i|Transform2D|Transform3D|Basis|Plane|Quaternion|AABB|Callable|Signal|NodePath|RID|PackedByteArray|PackedInt32Array|PackedInt64Array|PackedFloat32Array|PackedFloat64Array|PackedStringArray|PackedVector2Array|PackedVector3Array|PackedColorArray|Object|Variant|Node|Node2D|Node3D|Spatial|CanvasItem|Control|Resource|Reference|RefCounted|SceneTree|Viewport)\b'
+      scope: storage.type.gdscript
+
+  function-def:
+    - match: '\b(func)\s+({{identifier}})'
+      captures:
+        1: keyword.declaration.function.gdscript
+        2: entity.name.function.gdscript
+
+  function-call:
+    - match: '({{identifier}})(?=\s*\()'
+      scope: variable.function.gdscript
+
+  operators:
+    - match: '(\+=|-=|\*=|/=|%=|<<=|>>=|&=|\|=|\^=|==|!=|<=|>=|<<|>>|&&|\|\||\+|-|\*|/|%|=|<|>|!|&|\||\^|~)'
+      scope: keyword.operator.gdscript

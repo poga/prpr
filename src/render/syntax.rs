@@ -3,6 +3,10 @@
 //! Uses `syntect`'s bundled `base16-mocha.dark` theme — the closest fit to
 //! Catppuccin Mocha among the defaults. The `SyntaxSet` and `Theme` are
 //! loaded lazily on first call and cached for the rest of the process.
+//!
+//! GDScript is not in syntect's default syntaxes, so a minimal
+//! `.sublime-syntax` is bundled as `assets/gdscript.sublime-syntax` and
+//! added at startup.
 
 use std::sync::OnceLock;
 
@@ -10,11 +14,21 @@ use ratatui::style::{Color, Style};
 use ratatui::text::Span;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
-use syntect::parsing::SyntaxSet;
+use syntect::parsing::{SyntaxDefinition, SyntaxSet};
+
+const GDSCRIPT_SYNTAX: &str = include_str!("../../assets/gdscript.sublime-syntax");
 
 fn syntax_set() -> &'static SyntaxSet {
     static S: OnceLock<SyntaxSet> = OnceLock::new();
-    S.get_or_init(SyntaxSet::load_defaults_newlines)
+    S.get_or_init(|| {
+        let mut builder = SyntaxSet::load_defaults_newlines().into_builder();
+        // Best-effort: if the bundled syntax fails to parse for any reason,
+        // fall through with the defaults rather than crashing.
+        if let Ok(def) = SyntaxDefinition::load_from_str(GDSCRIPT_SYNTAX, true, Some("GDScript")) {
+            builder.add(def);
+        }
+        builder.build()
+    })
 }
 
 fn theme() -> &'static Theme {
@@ -87,5 +101,22 @@ mod tests {
         let spans = highlight_line("", "rs");
         assert_eq!(spans.len(), 1);
         assert!(spans[0].content.is_empty());
+    }
+
+    #[test]
+    fn gdscript_keyword_gets_a_distinct_color() {
+        let spans = highlight_line("func _ready() -> void:", "gd");
+        assert!(spans.len() > 1, "got {} spans: {:?}", spans.len(), spans);
+        let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(joined, "func _ready() -> void:");
+        // The keyword 'func' must end up styled with a different fg from
+        // the function name '_ready' — otherwise the highlighter is just
+        // returning one span for the whole line (i.e. plain text).
+        let fns: Vec<_> = spans.iter().map(|s| s.style.fg).collect();
+        assert!(
+            fns.iter().collect::<std::collections::HashSet<_>>().len() > 1,
+            "expected multiple distinct foreground colors, got {:?}",
+            fns
+        );
     }
 }
