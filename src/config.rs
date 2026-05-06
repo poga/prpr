@@ -66,8 +66,7 @@ struct RawUi {
 /// Locate the config file path. Returns `None` if no XDG config dir is
 /// resolvable (very rare).
 pub fn config_path() -> Option<PathBuf> {
-    directories::ProjectDirs::from("", "", "pprr")
-        .map(|d| d.config_dir().join("config.toml"))
+    directories::ProjectDirs::from("", "", "pprr").map(|d| d.config_dir().join("config.toml"))
 }
 
 /// Load the config from `config_path()`, merging with defaults. If the file
@@ -79,10 +78,10 @@ pub fn load() -> Result<Config> {
     if !path.exists() {
         return Ok(Config::default());
     }
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading {}", path.display()))?;
-    let raw: RawConfig = toml::from_str(&text)
-        .with_context(|| format!("parsing {}", path.display()))?;
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let raw: RawConfig =
+        toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
     Ok(merge(Config::default(), raw))
 }
 

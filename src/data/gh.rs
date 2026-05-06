@@ -4,7 +4,7 @@
 
 use std::process::{Command, Output};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 
 use crate::data::pr::{Pr, PrDetail};
 
@@ -19,7 +19,8 @@ pub trait GhClient: Send + Sync {
 
 pub struct GhCli;
 
-const PR_LIST_FIELDS: &str = "number,title,author,isDraft,state,createdAt,labels,statusCheckRollup,reviewDecision";
+const PR_LIST_FIELDS: &str =
+    "number,title,author,isDraft,state,createdAt,labels,statusCheckRollup,reviewDecision";
 const PR_VIEW_FIELDS: &str = "number,title,author,isDraft,state,createdAt,baseRefName,baseRefOid,headRefName,headRefOid,mergeable,labels,statusCheckRollup,reviewDecision,commits,files";
 
 fn run(cmd: &mut Command) -> Result<Output> {
@@ -35,9 +36,16 @@ fn run(cmd: &mut Command) -> Result<Output> {
 
 impl GhClient for GhCli {
     fn list_prs(&self, repo_root: &std::path::Path) -> Result<Vec<Pr>> {
-        let out = run(Command::new("gh")
-            .current_dir(repo_root)
-            .args(["pr", "list", "--limit", "200", "--state", "all", "--json", PR_LIST_FIELDS]))?;
+        let out = run(Command::new("gh").current_dir(repo_root).args([
+            "pr",
+            "list",
+            "--limit",
+            "200",
+            "--state",
+            "all",
+            "--json",
+            PR_LIST_FIELDS,
+        ]))?;
         let prs: Vec<Pr> = serde_json::from_slice(&out.stdout)
             .with_context(|| "parsing `gh pr list --json` output")?;
         Ok(prs)
@@ -45,9 +53,13 @@ impl GhClient for GhCli {
 
     fn view_pr(&self, repo_root: &std::path::Path, number: u32) -> Result<PrDetail> {
         let n = number.to_string();
-        let out = run(Command::new("gh")
-            .current_dir(repo_root)
-            .args(["pr", "view", &n, "--json", PR_VIEW_FIELDS]))?;
+        let out = run(Command::new("gh").current_dir(repo_root).args([
+            "pr",
+            "view",
+            &n,
+            "--json",
+            PR_VIEW_FIELDS,
+        ]))?;
         let pr: PrDetail = serde_json::from_slice(&out.stdout)
             .with_context(|| "parsing `gh pr view --json` output")?;
         Ok(pr)
@@ -99,7 +111,12 @@ pub(crate) mod fakes {
 
     impl FakeGh {
         pub fn new() -> Self {
-            Self { prs: vec![], views: HashMap::new(), diffs: HashMap::new(), merges: Mutex::new(vec![]) }
+            Self {
+                prs: vec![],
+                views: HashMap::new(),
+                diffs: HashMap::new(),
+                merges: Mutex::new(vec![]),
+            }
         }
     }
 
@@ -108,10 +125,16 @@ pub(crate) mod fakes {
             Ok(self.prs.clone())
         }
         fn view_pr(&self, _root: &std::path::Path, n: u32) -> Result<PrDetail> {
-            self.views.get(&n).cloned().ok_or_else(|| anyhow!("no fake view for #{n}"))
+            self.views
+                .get(&n)
+                .cloned()
+                .ok_or_else(|| anyhow!("no fake view for #{n}"))
         }
         fn diff_pr(&self, _root: &std::path::Path, n: u32) -> Result<String> {
-            self.diffs.get(&n).cloned().ok_or_else(|| anyhow!("no fake diff for #{n}"))
+            self.diffs
+                .get(&n)
+                .cloned()
+                .ok_or_else(|| anyhow!("no fake diff for #{n}"))
         }
         fn merge_pr(&self, _root: &std::path::Path, n: u32, m: &str) -> Result<()> {
             self.merges.lock().unwrap().push((n, m.to_string()));

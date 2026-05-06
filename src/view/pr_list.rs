@@ -1,11 +1,11 @@
 //! PR list view rendering. State is small and self-contained.
 
 use chrono::{DateTime, Utc};
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::Frame;
 
 use crate::data::pr::{CiState, Pr, PrState, ReviewDecision};
 use crate::render::style::*;
@@ -29,8 +29,7 @@ impl PrListState {
             .filter(|p| !self.filter_open_only || p.state == PrState::Open)
             .filter(|p| match &q {
                 Some(s) => {
-                    p.title.to_lowercase().contains(s)
-                        || p.author.login.to_lowercase().contains(s)
+                    p.title.to_lowercase().contains(s) || p.author.login.to_lowercase().contains(s)
                 }
                 None => true,
             })
@@ -148,7 +147,10 @@ fn row_for(pr: &Pr, selected: bool, now: DateTime<Utc>) -> Line<'static> {
         Span::styled(format!(" #{} ", pr.number), row_bg.fg(COMMIT_PALETTE[1])),
         Span::styled(truncate(&pr.title, 36), row_bg.fg(TEXT)),
         Span::styled(format!("  {}  ", label), row_bg.fg(COMMIT_PALETTE[4])),
-        Span::styled(format!("{} ", pr.author.login), row_bg.fg(COMMIT_PALETTE[0])),
+        Span::styled(
+            format!("{} ", pr.author.login),
+            row_bg.fg(COMMIT_PALETTE[0]),
+        ),
         Span::styled(age, row_bg.fg(OVERLAY0)),
     ])
 }
@@ -181,8 +183,8 @@ fn humanize_age(t: DateTime<Utc>, now: DateTime<Utc>) -> String {
 mod tests {
     use super::*;
     use crate::data::pr::Pr;
-    use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     fn fixture_state() -> PrListState {
         let json = include_str!("../../tests/fixtures/pr_list.json");

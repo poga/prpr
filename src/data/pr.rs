@@ -171,7 +171,10 @@ mod tests {
         assert_eq!(pr.number, 482);
         assert_eq!(pr.head_ref_oid.len(), 40);
         assert_eq!(pr.commits.len(), 3);
-        assert_eq!(pr.commits[0].oid, "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0");
+        assert_eq!(
+            pr.commits[0].oid,
+            "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0"
+        );
         assert_eq!(pr.files.len(), 4);
         assert_eq!(pr.files[0].path, "src/sched.rs");
     }

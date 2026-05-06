@@ -12,16 +12,16 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
 
 use crate::config::Config;
 use crate::data::cache::Cache;
 use crate::data::gh::GhClient;
 use crate::data::git::GitClient;
-use crate::keys::{dispatch, mouse_dispatch, Action, FocusedView, MouseAction};
+use crate::keys::{Action, FocusedView, MouseAction, dispatch, mouse_dispatch};
 use crate::view::file_picker::FilePickerState;
 use crate::view::merge_modal::{MergeMethod, MergeModalState};
 use crate::view::pr_list::PrListState;
@@ -209,19 +209,19 @@ fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) 
     }
     st.pending_g = false;
 
-    if st.focused == FocusedView::List {
-        if let Some(buf) = st.list.search.as_mut() {
-            match ev.code {
-                crossterm::event::KeyCode::Esc => st.list.search = None,
-                crossterm::event::KeyCode::Enter => {}
-                crossterm::event::KeyCode::Backspace => {
-                    buf.pop();
-                }
-                crossterm::event::KeyCode::Char(c) => buf.push(c),
-                _ => {}
+    if st.focused == FocusedView::List
+        && let Some(buf) = st.list.search.as_mut()
+    {
+        match ev.code {
+            crossterm::event::KeyCode::Esc => st.list.search = None,
+            crossterm::event::KeyCode::Enter => {}
+            crossterm::event::KeyCode::Backspace => {
+                buf.pop();
             }
-            return;
+            crossterm::event::KeyCode::Char(c) => buf.push(c),
+            _ => {}
         }
+        return;
     }
 
     let action = dispatch(st.focused, ev);
@@ -314,15 +314,15 @@ fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) 
         Action::NextFile => cycle_file(app, st, 1),
         Action::PrevFile => cycle_file(app, st, -1),
         Action::OpenFilePicker => {
-            if let (Some(num), Some(_)) = (st.current_pr, st.review.as_ref()) {
-                if let Some(pkg) = app.cache.get(num) {
-                    st.picker = Some(FilePickerState {
-                        query: String::new(),
-                        all_files: pkg.files.iter().map(|f| f.path.clone()).collect(),
-                        selected: 0,
-                    });
-                    st.focused = FocusedView::FilePicker;
-                }
+            if let (Some(num), Some(_)) = (st.current_pr, st.review.as_ref())
+                && let Some(pkg) = app.cache.get(num)
+            {
+                st.picker = Some(FilePickerState {
+                    query: String::new(),
+                    all_files: pkg.files.iter().map(|f| f.path.clone()).collect(),
+                    selected: 0,
+                });
+                st.focused = FocusedView::FilePicker;
             }
         }
         Action::Merge => open_merge(st),
@@ -372,7 +372,9 @@ fn open_merge(st: &mut AppState) {
 
 fn cycle_file(app: &App, st: &mut AppState, delta: i32) {
     let Some(num) = st.current_pr else { return };
-    let Some(pkg) = app.cache.get(num) else { return };
+    let Some(pkg) = app.cache.get(num) else {
+        return;
+    };
     let n = pkg.files.len() as i32;
     if n == 0 {
         return;
@@ -391,8 +393,7 @@ fn handle_mouse(_app: &mut App, st: &mut AppState, ev: crossterm::event::MouseEv
             if st.focused == FocusedView::List {
                 let n = st.list.visible_prs().len();
                 if d > 0 {
-                    st.list.selected =
-                        (st.list.selected + d as usize).min(n.saturating_sub(1));
+                    st.list.selected = (st.list.selected + d as usize).min(n.saturating_sub(1));
                 } else {
                     st.list.selected = st.list.selected.saturating_sub((-d) as usize);
                 }

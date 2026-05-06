@@ -31,14 +31,17 @@ pub fn parse_blame(input: &str) -> Blame {
             continue;
         }
         let _orig = parts.next();
-        let Some(result_str) = parts.next() else { continue };
-        let Ok(result_lineno) = result_str.parse::<u32>() else { continue };
+        let Some(result_str) = parts.next() else {
+            continue;
+        };
+        let Ok(result_lineno) = result_str.parse::<u32>() else {
+            continue;
+        };
 
         // Skip metadata lines until we hit the TAB-prefixed source line.
         // Metadata appears only on first-mention of a SHA; for subsequent
         // mentions we go straight to the TAB line.
-        loop {
-            let Some(next) = lines.next() else { break };
+        for next in lines.by_ref() {
             if next.starts_with('\t') {
                 break;
             }

@@ -1,10 +1,10 @@
 //! Merge modal: pick Merge / Squash / Rebase, confirm with Enter.
 
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
-use ratatui::Frame;
 
 use crate::render::style::*;
 

@@ -2,7 +2,7 @@
 //! one or more file diffs separated by `diff --git` headers, each followed
 //! by `--- a/<path>` / `+++ b/<path>` and one or more `@@ ...` hunks.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileDiff {
@@ -53,7 +53,11 @@ pub fn parse_diff(input: &str) -> Result<Vec<FileDiff>> {
                 .and_then(|s| s.strip_prefix("b/"))
                 .unwrap_or("")
                 .to_string();
-            current = Some(FileDiff { path, lines: Vec::new(), binary: false });
+            current = Some(FileDiff {
+                path,
+                lines: Vec::new(),
+                binary: false,
+            });
             old_ln = 0;
             new_ln = 0;
             continue;
@@ -65,25 +69,36 @@ pub fn parse_diff(input: &str) -> Result<Vec<FileDiff>> {
             f.binary = true;
             continue;
         }
-        if line.starts_with("--- ") || line.starts_with("+++ ")
-            || line.starts_with("index ") || line.starts_with("similarity ")
-            || line.starts_with("rename ") || line.starts_with("new file mode")
-            || line.starts_with("deleted file mode") || line.starts_with("\\ No newline") {
+        if line.starts_with("--- ")
+            || line.starts_with("+++ ")
+            || line.starts_with("index ")
+            || line.starts_with("similarity ")
+            || line.starts_with("rename ")
+            || line.starts_with("new file mode")
+            || line.starts_with("deleted file mode")
+            || line.starts_with("\\ No newline")
+        {
             continue;
         }
 
         if let Some(rest) = line.strip_prefix("@@") {
             // @@ -<old_start>[,<old_count>] +<new_start>[,<new_count>] @@ ...
             let body = rest.trim_start_matches(' ');
-            let (header, _) = body.split_once("@@").ok_or_else(|| anyhow!("malformed hunk: {line}"))?;
+            let (header, _) = body
+                .split_once("@@")
+                .ok_or_else(|| anyhow!("malformed hunk: {line}"))?;
             let parts: Vec<&str> = header.split_whitespace().collect();
             if parts.len() < 2 {
                 return Err(anyhow!("malformed hunk: {line}"));
             }
             let old_start = parts[0].trim_start_matches('-').split(',').next().unwrap();
             let new_start = parts[1].trim_start_matches('+').split(',').next().unwrap();
-            old_ln = old_start.parse().map_err(|_| anyhow!("bad hunk old start: {line}"))?;
-            new_ln = new_start.parse().map_err(|_| anyhow!("bad hunk new start: {line}"))?;
+            old_ln = old_start
+                .parse()
+                .map_err(|_| anyhow!("bad hunk old start: {line}"))?;
+            new_ln = new_start
+                .parse()
+                .map_err(|_| anyhow!("bad hunk new start: {line}"))?;
             f.lines.push(DiffLine {
                 op: DiffOp::Hunk,
                 old_lineno: None,
@@ -95,14 +110,18 @@ pub fn parse_diff(input: &str) -> Result<Vec<FileDiff>> {
         }
 
         let (op, old, new, text) = if let Some(t) = line.strip_prefix('+') {
-            let n = new_ln; new_ln += 1;
+            let n = new_ln;
+            new_ln += 1;
             (DiffOp::Add, None, Some(n), t.to_string())
         } else if let Some(t) = line.strip_prefix('-') {
-            let n = old_ln; old_ln += 1;
+            let n = old_ln;
+            old_ln += 1;
             (DiffOp::Delete, Some(n), None, t.to_string())
         } else if let Some(t) = line.strip_prefix(' ') {
-            let o = old_ln; old_ln += 1;
-            let n = new_ln; new_ln += 1;
+            let o = old_ln;
+            old_ln += 1;
+            let n = new_ln;
+            new_ln += 1;
             (DiffOp::Context, Some(o), Some(n), t.to_string())
         } else if line.is_empty() {
             // Trailing blank line in patch.

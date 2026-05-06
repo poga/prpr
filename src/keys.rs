@@ -106,9 +106,15 @@ pub enum MouseAction {
     /// Scroll the focused region by `delta` (negative = up).
     Scroll(i16),
     /// Move selection / cursor to the given cell coordinates.
-    ClickAt { col: u16, row: u16 },
+    ClickAt {
+        col: u16,
+        row: u16,
+    },
     /// Treat as the same as Enter (open / confirm).
-    DoubleClickAt { col: u16, row: u16 },
+    DoubleClickAt {
+        col: u16,
+        row: u16,
+    },
 }
 
 pub fn mouse_dispatch(ev: MouseEvent) -> MouseAction {

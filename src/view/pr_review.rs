@@ -2,11 +2,11 @@
 
 use std::collections::HashMap;
 
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use ratatui::Frame;
 
 use crate::data::cache::PrPackage;
 use crate::data::diff::FileDiff;
@@ -67,7 +67,10 @@ fn render_commit_strip(f: &mut Frame, area: Rect, pkg: &PrPackage) {
     for c in &pkg.detail.commits {
         let color = palette.get(&c.oid).copied().unwrap_or(OLDER_COMMIT);
         spans.push(Span::styled("█ ", Style::default().fg(color)));
-        spans.push(Span::styled(short_sha(&c.oid), Style::default().fg(SUBTEXT0)));
+        spans.push(Span::styled(
+            short_sha(&c.oid),
+            Style::default().fg(SUBTEXT0),
+        ));
         spans.push(Span::raw(" "));
         spans.push(Span::styled(
             truncate(&c.message_headline, 18),
@@ -125,10 +128,7 @@ fn render_diff_body(f: &mut Frame, area: Rect, pkg: &PrPackage, st: &PrReviewSta
     f.render_widget(Paragraph::new(lines).scroll((st.scroll, 0)), area);
 }
 
-fn body_lines<'a>(
-    file: &'a FileDiff,
-    colors: &'a HashMap<String, LineColors>,
-) -> Vec<Line<'a>> {
+fn body_lines<'a>(file: &'a FileDiff, colors: &'a HashMap<String, LineColors>) -> Vec<Line<'a>> {
     let lookup = colors.get(&file.path);
     file.lines
         .iter()
@@ -188,14 +188,18 @@ mod tests {
     use crate::data::cache::PrPackage;
     use crate::data::diff::parse_diff;
     use crate::data::pr::PrDetail;
-    use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     fn fixture_pkg() -> PrPackage {
         let detail: PrDetail =
             serde_json::from_str(include_str!("../../tests/fixtures/pr_view.json")).unwrap();
         let files = parse_diff(include_str!("../../tests/fixtures/diff_basic.patch")).unwrap();
-        PrPackage { detail, files, colors: HashMap::new() }
+        PrPackage {
+            detail,
+            files,
+            colors: HashMap::new(),
+        }
     }
 
     fn buffer_line(buf: &ratatui::buffer::Buffer, y: u16) -> String {
@@ -207,7 +211,10 @@ mod tests {
     #[test]
     fn renders_pr_number_in_header() {
         let pkg = fixture_pkg();
-        let st = PrReviewState { show_commit_strip: false, ..Default::default() };
+        let st = PrReviewState {
+            show_commit_strip: false,
+            ..Default::default()
+        };
         let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
         term.draw(|f| {
             let area = f.area();
@@ -228,7 +235,10 @@ mod tests {
             lines: vec![],
             binary: true,
         }];
-        let st = PrReviewState { show_commit_strip: false, ..Default::default() };
+        let st = PrReviewState {
+            show_commit_strip: false,
+            ..Default::default()
+        };
         let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
         term.draw(|f| {
             let area = f.area();

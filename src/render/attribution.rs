@@ -48,7 +48,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     fn sha(c: char) -> String {
-        std::iter::repeat(c).take(40).collect()
+        std::iter::repeat_n(c, 40).collect()
     }
 
     #[test]
@@ -69,7 +69,9 @@ mod tests {
     fn lines_from_pre_pr_commits_get_older_gray() {
         // The PR has commit a; line is owned by an unrelated SHA z.
         let commits = vec![sha('a')];
-        let head_blame = Blame { line_shas: vec![sha('z')] };
+        let head_blame = Blame {
+            line_shas: vec![sha('z')],
+        };
         let base_blame = Blame { line_shas: vec![] };
         let colors = attribute_file(&commits, 7, &head_blame, &base_blame);
         assert_eq!(colors.head[0], Some(OLDER_COMMIT));

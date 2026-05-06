@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 
-use pprr::app::{install_panic_hook, restore_terminal, run, setup_terminal, App, AppState};
+use pprr::app::{App, AppState, install_panic_hook, restore_terminal, run, setup_terminal};
 use pprr::config;
 use pprr::data::gh::{GhCli, GhClient};
 use pprr::data::git::{GitCli, GitClient};
@@ -56,10 +56,7 @@ fn real_main() -> Result<()> {
     let cwd = std::env::current_dir()?;
     let repo_root = git.repo_root(&cwd).context("not inside a git repo")?;
     if !git.has_github_remote(&repo_root)? {
-        return Err(anyhow!(
-            "no github.com remote in {}",
-            repo_root.display()
-        ));
+        return Err(anyhow!("no github.com remote in {}", repo_root.display()));
     }
 
     let repo_name = repo_root

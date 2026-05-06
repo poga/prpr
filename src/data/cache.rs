@@ -10,12 +10,12 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 
-use crate::data::blame::{parse_blame, Blame};
-use crate::data::diff::{parse_diff, FileDiff};
+use crate::data::blame::{Blame, parse_blame};
+use crate::data::diff::{FileDiff, parse_diff};
 use crate::data::gh::GhClient;
 use crate::data::git::GitClient;
 use crate::data::pr::{Pr, PrDetail};
-use crate::render::attribution::{attribute_file, LineColors};
+use crate::render::attribution::{LineColors, attribute_file};
 
 #[derive(Debug, Clone)]
 pub struct PrPackage {
@@ -167,8 +167,10 @@ mod tests {
         let porcelain = include_str!("../../tests/fixtures/blame_porcelain.txt").to_string();
         git.blames
             .insert((head_sha.clone(), "src/sched.rs".into()), porcelain.clone());
-        git.blames
-            .insert((detail.base_ref_oid.clone(), "src/sched.rs".into()), porcelain);
+        git.blames.insert(
+            (detail.base_ref_oid.clone(), "src/sched.rs".into()),
+            porcelain,
+        );
         // README.md has no blame fixture — cache should tolerate missing blame.
 
         let mut cache = Cache::new("/tmp/repo".into(), Arc::new(gh), Arc::new(git), 7);

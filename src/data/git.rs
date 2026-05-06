@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 
 pub trait GitClient: Send + Sync {
     /// Resolve the repo root containing `cwd`. Errors if `cwd` is not in a git repo.
@@ -34,9 +34,7 @@ impl GitClient for GitCli {
         let out = run(Command::new("git")
             .current_dir(cwd)
             .args(["rev-parse", "--show-toplevel"]))?;
-        let s = String::from_utf8(out.stdout)?
-            .trim()
-            .to_string();
+        let s = String::from_utf8(out.stdout)?.trim().to_string();
         if s.is_empty() {
             Err(anyhow!("git rev-parse returned empty"))
         } else {
@@ -61,9 +59,13 @@ impl GitClient for GitCli {
     }
 
     fn blame(&self, repo_root: &Path, commit: &str, file: &str) -> Result<String> {
-        let out = run(Command::new("git")
-            .current_dir(repo_root)
-            .args(["blame", "--porcelain", commit, "--", file]))?;
+        let out = run(Command::new("git").current_dir(repo_root).args([
+            "blame",
+            "--porcelain",
+            commit,
+            "--",
+            file,
+        ]))?;
         let s = String::from_utf8(out.stdout)?;
         Ok(s)
     }
@@ -83,7 +85,11 @@ pub(crate) mod fakes {
 
     impl FakeGit {
         pub fn new(root: impl Into<PathBuf>) -> Self {
-            Self { root: root.into(), has_gh: true, blames: HashMap::new() }
+            Self {
+                root: root.into(),
+                has_gh: true,
+                blames: HashMap::new(),
+            }
         }
     }
 

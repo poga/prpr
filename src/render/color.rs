@@ -41,7 +41,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     fn sha(c: char) -> String {
-        std::iter::repeat(c).take(40).collect()
+        std::iter::repeat_n(c, 40).collect()
     }
 
     #[test]
@@ -62,8 +62,15 @@ mod tests {
     #[test]
     fn more_commits_than_window_pushes_old_into_gray() {
         let commits = vec![
-            sha('a'), sha('b'), sha('c'), sha('d'),
-            sha('e'), sha('f'), sha('g'), sha('h'), sha('i'),
+            sha('a'),
+            sha('b'),
+            sha('c'),
+            sha('d'),
+            sha('e'),
+            sha('f'),
+            sha('g'),
+            sha('h'),
+            sha('i'),
         ]; // 9 commits, window 7
         let map = assign_commit_colors(&commits, 7);
         // Two oldest are out-of-window → gray.
