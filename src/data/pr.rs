@@ -143,6 +143,8 @@ pub struct Commit {
     #[serde(rename = "messageHeadline")]
     pub message_headline: String,
     pub authors: Vec<Author>,
+    #[serde(rename = "committedDate", default)]
+    pub committed_date: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -217,5 +219,25 @@ mod tests {
         );
         assert_eq!(pr.files.len(), 4);
         assert_eq!(pr.files[0].path, "src/sched.rs");
+    }
+
+    #[test]
+    fn parses_committed_date_when_present() {
+        use chrono::TimeZone;
+        let json = include_str!("../../tests/fixtures/pr_view.json");
+        let detail: PrDetail = serde_json::from_str(json).unwrap();
+        let first = &detail.commits[0];
+        assert_eq!(
+            first.committed_date,
+            Some(Utc.with_ymd_and_hms(2026, 5, 4, 12, 0, 0).unwrap()),
+        );
+    }
+
+    #[test]
+    fn missing_committed_date_is_none() {
+        // Older API responses or edge fixtures may omit the field.
+        let json = r#"{"oid":"a","messageHeadline":"x","authors":[]}"#;
+        let c: Commit = serde_json::from_str(json).unwrap();
+        assert_eq!(c.committed_date, None);
     }
 }

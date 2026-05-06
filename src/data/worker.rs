@@ -24,7 +24,7 @@ use crate::data::gh::GhClient;
 use crate::data::git::GitClient;
 use crate::data::log_patches::parse_deletions;
 use crate::data::pr::Pr;
-use crate::render::attribution::attribute_file;
+use crate::render::attribution::{attribute_file, commit_stats_for_file, CommitStats};
 
 #[derive(Debug)]
 pub enum Request {
@@ -146,6 +146,10 @@ pub fn build_package(
 
     let commits: Vec<String> = detail.commits.iter().map(|c| c.oid.clone()).collect();
     let mut colors = HashMap::new();
+    let mut commit_stats: HashMap<String, CommitStats> = commits
+        .iter()
+        .map(|oid| (oid.clone(), CommitStats::default()))
+        .collect();
     for f in &files {
         if f.binary {
             continue;
@@ -170,12 +174,20 @@ pub fn build_package(
         let deletes = parse_deletions(&log_out);
         let lc = attribute_file(&commits, window_size, &head, &deletes);
         colors.insert(f.path.clone(), lc);
+
+        let per_file = commit_stats_for_file(&commits, &head, &deletes);
+        for (oid, s) in per_file {
+            let entry = commit_stats.entry(oid).or_default();
+            entry.adds += s.adds;
+            entry.dels += s.dels;
+        }
     }
 
     Ok(PrPackage {
         detail,
         files,
         colors,
+        commit_stats,
     })
 }
 
@@ -216,6 +228,41 @@ mod tests {
         let pkg = build_package(&gh, &git, Path::new("/tmp/repo"), detail.number, 7).unwrap();
         assert_eq!(pkg.files.len(), 2);
         assert!(pkg.colors.contains_key("src/sched.rs"));
+    }
+
+    #[test]
+    fn build_package_populates_commit_stats() {
+        let detail = fixture_detail();
+        let head_sha = detail.head_ref_oid.clone();
+
+        let mut gh = FakeGh::new();
+        gh.views.insert(detail.number, detail.clone());
+        gh.diffs.insert(
+            detail.number,
+            include_str!("../../tests/fixtures/diff_basic.patch").to_string(),
+        );
+
+        let mut git = FakeGit::new("/tmp/repo");
+        let porcelain = include_str!("../../tests/fixtures/blame_porcelain.txt").to_string();
+        git.blames
+            .insert((head_sha, "src/sched.rs".into()), porcelain);
+
+        let pkg = build_package(&gh, &git, Path::new("/tmp/repo"), detail.number, 7).unwrap();
+
+        // Every PR commit gets an entry, even if it didn't touch any tracked file.
+        for c in &detail.commits {
+            assert!(
+                pkg.commit_stats.contains_key(&c.oid),
+                "missing stats entry for commit {}",
+                c.oid,
+            );
+        }
+        // Sanity: at least one commit has nonzero adds (the basic fixture
+        // includes head-blame entries).
+        assert!(
+            pkg.commit_stats.values().any(|s| s.adds > 0),
+            "expected at least one commit with adds > 0",
+        );
     }
 
     #[test]

@@ -32,8 +32,8 @@ pub enum Action {
     NextFile,
     PrevFile,
     OpenFilePicker,
+    OpenCommitsModal,
     Merge,
-    ToggleCommitStrip,
     ToggleShaMargin,
     BackToList,
 
@@ -49,6 +49,7 @@ pub enum FocusedView {
     HelpOverlay,
     FilePicker,
     MergeModal,
+    CommitsModal,
 }
 
 pub fn dispatch(view: FocusedView, ev: KeyEvent) -> Action {
@@ -59,7 +60,7 @@ pub fn dispatch(view: FocusedView, ev: KeyEvent) -> Action {
         FocusedView::List => list(ev),
         FocusedView::Review => review(ev),
         FocusedView::HelpOverlay => Action::Nothing, // swallowed by caller
-        FocusedView::FilePicker | FocusedView::MergeModal => Action::Nothing, // overlay impls
+        FocusedView::FilePicker | FocusedView::MergeModal | FocusedView::CommitsModal => Action::Nothing, // overlay impls
     }
 }
 
@@ -100,7 +101,7 @@ fn review(ev: KeyEvent) -> Action {
         KeyCode::BackTab => Action::PrevFile,
         KeyCode::Char('f') => Action::OpenFilePicker,
         KeyCode::Char('m') => Action::Merge,
-        KeyCode::Char('c') => Action::ToggleCommitStrip,
+        KeyCode::Char('c') => Action::OpenCommitsModal,
         KeyCode::Char('s') => Action::ToggleShaMargin,
         _ => Action::Nothing,
     }
@@ -215,5 +216,13 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
         assert_eq!(mouse_dispatch(ev), MouseAction::ClickAt { col: 12, row: 7 });
+    }
+
+    #[test]
+    fn review_c_opens_commits_modal() {
+        assert_eq!(
+            dispatch(FocusedView::Review, k('c')),
+            Action::OpenCommitsModal,
+        );
     }
 }

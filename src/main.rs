@@ -14,9 +14,6 @@ struct Cli {
     /// Override window_size from the config file.
     #[arg(long)]
     window_size: Option<usize>,
-    /// Hide the commit strip on launch.
-    #[arg(long)]
-    no_commit_strip: bool,
 }
 
 fn main() {
@@ -32,9 +29,6 @@ fn real_main() -> Result<()> {
     let mut cfg = config::load()?;
     if let Some(n) = cli.window_size {
         cfg.window_size = n;
-    }
-    if cli.no_commit_strip {
-        cfg.show_commit_strip = false;
     }
 
     if !is_tty() {

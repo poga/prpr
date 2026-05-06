@@ -9,7 +9,6 @@ use serde::Deserialize;
 pub struct Config {
     pub theme: Theme,
     pub window_size: usize,
-    pub show_commit_strip: bool,
     pub show_sha_margin: bool,
 }
 
@@ -26,7 +25,6 @@ impl Default for Config {
         Self {
             theme: Theme::Mocha,
             window_size: default_window_size(),
-            show_commit_strip: true,
             show_sha_margin: false,
         }
     }
@@ -57,8 +55,6 @@ struct RawCommit {
 }
 #[derive(Debug, Default, Deserialize)]
 struct RawUi {
-    #[serde(default)]
-    show_commit_strip: Option<bool>,
     #[serde(default)]
     show_sha_margin: Option<bool>,
 }
@@ -92,9 +88,6 @@ fn merge(mut cfg: Config, raw: RawConfig) -> Config {
     if let Some(n) = raw.commit_attribution.window_size {
         cfg.window_size = n;
     }
-    if let Some(b) = raw.ui.show_commit_strip {
-        cfg.show_commit_strip = b;
-    }
     if let Some(b) = raw.ui.show_sha_margin {
         cfg.show_sha_margin = b;
     }
@@ -114,15 +107,22 @@ mod tests {
             [commit_attribution]
             window_size = 5
             [ui]
-            show_commit_strip = false
             show_sha_margin = true
         "#;
         let raw: RawConfig = toml::from_str(toml).unwrap();
         let cfg = merge(Config::default(), raw);
         assert_eq!(cfg.theme, Theme::Latte);
         assert_eq!(cfg.window_size, 5);
-        assert_eq!(cfg.show_commit_strip, false);
         assert_eq!(cfg.show_sha_margin, true);
+    }
+
+    #[test]
+    fn unknown_show_commit_strip_key_is_ignored() {
+        // Stale configs from before the strip removal must keep parsing.
+        let toml = "[ui]\nshow_commit_strip = false\n";
+        let raw: RawConfig = toml::from_str(toml).unwrap();
+        let cfg = merge(Config::default(), raw);
+        assert_eq!(cfg, Config::default());
     }
 
     #[test]

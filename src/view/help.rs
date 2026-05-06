@@ -53,7 +53,7 @@ const HELP_TEXT: &[&str] = &[
     "    Tab / ↵      next file",
     "    Shift-Tab    previous file",
     "    f            file picker      m  merge modal",
-    "    c            toggle commit strip",
+    "    c            commits modal",
     "    s            toggle SHA margin",
     "    q / Esc      back to list",
     "",

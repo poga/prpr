@@ -28,6 +28,7 @@ use crate::data::gh::GhClient;
 use crate::data::git::GitClient;
 use crate::data::worker::{Request, Response, Worker};
 use crate::keys::{Action, FocusedView, MouseAction, dispatch, mouse_dispatch};
+use crate::view::commits_modal::{self, CommitsModalState};
 use crate::view::file_picker::FilePickerState;
 use crate::view::merge_modal::{MergeMethod, MergeModalState, MergingState};
 use crate::view::pr_list::PrListState;
@@ -69,6 +70,7 @@ pub struct AppState {
     pub picker: Option<FilePickerState>,
     pub merge: Option<MergeModalState>,
     pub merging: Option<MergingState>,
+    pub commits: Option<CommitsModalState>,
     pub pending_g: bool,
     pub running: bool,
 }
@@ -92,6 +94,7 @@ impl AppState {
             picker: None,
             merge: None,
             merging: None,
+            commits: None,
             pending_g: false,
             running: true,
         }
@@ -239,7 +242,10 @@ fn draw(f: &mut ratatui::Frame, app: &App, st: &AppState) {
         FocusedView::List | FocusedView::HelpOverlay => {
             crate::view::pr_list::render(f, area, &st.list, Utc::now());
         }
-        FocusedView::Review | FocusedView::FilePicker | FocusedView::MergeModal => {
+        FocusedView::Review
+        | FocusedView::FilePicker
+        | FocusedView::MergeModal
+        | FocusedView::CommitsModal => {
             let pkg = st.current_pr.and_then(|n| app.cache.get(n));
             if let (Some(pkg), Some(review)) = (pkg, st.review.as_ref()) {
                 crate::view::pr_review::render(f, area, pkg, review);
@@ -261,6 +267,9 @@ fn draw(f: &mut ratatui::Frame, app: &App, st: &AppState) {
     }
     if let Some(m) = &st.merging {
         crate::view::merge_modal::render_progress(f, area, m);
+    }
+    if let Some(c) = &st.commits {
+        crate::view::commits_modal::render(f, area, c);
     }
     if st.focused == FocusedView::HelpOverlay {
         crate::view::help::render(f, area);
@@ -320,6 +329,11 @@ fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) 
         return;
     }
 
+    if st.focused == FocusedView::CommitsModal {
+        handle_commits_modal(st, ev);
+        return;
+    }
+
     if st.focused == FocusedView::List
         && st.pending_g
         && ev.code == crossterm::event::KeyCode::Char('g')
@@ -374,7 +388,6 @@ fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) 
                     file_index: 0,
                     cursor_line: 0,
                     scroll: 0,
-                    show_commit_strip: app.config.show_commit_strip,
                     show_sha_margin: app.config.show_sha_margin,
                     status: "loading…".into(),
                 });
@@ -433,12 +446,21 @@ fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) 
                 st.focused = FocusedView::FilePicker;
             }
         }
-        Action::Merge => open_merge(st),
-        Action::ToggleCommitStrip => {
-            if let Some(r) = st.review.as_mut() {
-                r.show_commit_strip = !r.show_commit_strip;
+        Action::OpenCommitsModal => {
+            if let (Some(num), Some(_)) = (st.current_pr, st.review.as_ref())
+                && let Some(pkg) = app.cache.get(num)
+            {
+                let rows = commits_modal::build_rows(
+                    &pkg.detail.commits,
+                    &pkg.commit_stats,
+                    app.config.window_size,
+                    Utc::now(),
+                );
+                st.commits = Some(CommitsModalState { rows, selected: 0 });
+                st.focused = FocusedView::CommitsModal;
             }
         }
+        Action::Merge => open_merge(st),
         Action::ToggleShaMargin => {
             if let Some(r) = st.review.as_mut() {
                 r.show_sha_margin = !r.show_sha_margin;
@@ -659,4 +681,24 @@ fn close_merge_modal(st: &mut AppState) {
     } else {
         FocusedView::List
     };
+}
+
+fn handle_commits_modal(st: &mut AppState, ev: crossterm::event::KeyEvent) {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    if ev.code == KeyCode::Char('c') && ev.modifiers.contains(KeyModifiers::CONTROL) {
+        st.running = false;
+        return;
+    }
+    let Some(modal) = st.commits.as_mut() else {
+        return;
+    };
+    match ev.code {
+        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('c') | KeyCode::Char('C') => {
+            st.commits = None;
+            st.focused = FocusedView::Review;
+        }
+        KeyCode::Down | KeyCode::Char('j') => modal.move_down(),
+        KeyCode::Up | KeyCode::Char('k') => modal.move_up(),
+        _ => {}
+    }
 }

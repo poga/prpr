@@ -145,3 +145,17 @@ pub(crate) mod fakes {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn fixture_view_round_trips_committed_date() {
+        // Guards that the shared fixture carries the field the modal uses.
+        let json = include_str!("../../tests/fixtures/pr_view.json");
+        let pr: crate::data::pr::PrDetail = serde_json::from_str(json).unwrap();
+        assert!(
+            pr.commits.iter().all(|c| c.committed_date.is_some()),
+            "every commit in the fixture must have committed_date set",
+        );
+    }
+}
