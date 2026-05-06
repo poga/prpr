@@ -1,0 +1,28 @@
+[
+  {
+    "number": 482,
+    "title": "fix: race condition in scheduler",
+    "isDraft": false,
+    "state": "OPEN",
+    "author": { "login": "alice" },
+    "createdAt": "2026-05-04T12:00:00Z",
+    "labels": [{ "name": "bug" }],
+    "statusCheckRollup": [
+      { "conclusion": "SUCCESS", "status": "COMPLETED" }
+    ],
+    "reviewDecision": "APPROVED"
+  },
+  {
+    "number": 479,
+    "title": "feat: add /metrics endpoint",
+    "isDraft": false,
+    "state": "OPEN",
+    "author": { "login": "bob" },
+    "createdAt": "2026-05-03T08:30:00Z",
+    "labels": [{ "name": "feature" }],
+    "statusCheckRollup": [
+      { "conclusion": "FAILURE", "status": "COMPLETED" }
+    ],
+    "reviewDecision": "CHANGES_REQUESTED"
+  }
+]
