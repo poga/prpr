@@ -315,11 +315,25 @@ fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) 
         Action::HalfPageDown => {
             if let Some(r) = st.review.as_mut() {
                 r.scroll = r.scroll.saturating_add(10);
+                r.cursor_line = r.cursor_line.saturating_add(10);
             }
         }
         Action::HalfPageUp => {
             if let Some(r) = st.review.as_mut() {
                 r.scroll = r.scroll.saturating_sub(10);
+                r.cursor_line = r.cursor_line.saturating_sub(10);
+            }
+        }
+        Action::PageDown => {
+            if let Some(r) = st.review.as_mut() {
+                r.scroll = r.scroll.saturating_add(20);
+                r.cursor_line = r.cursor_line.saturating_add(20);
+            }
+        }
+        Action::PageUp => {
+            if let Some(r) = st.review.as_mut() {
+                r.scroll = r.scroll.saturating_sub(20);
+                r.cursor_line = r.cursor_line.saturating_sub(20);
             }
         }
         Action::Top => {
