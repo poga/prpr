@@ -14,9 +14,9 @@
   "statusCheckRollup": [{ "conclusion": "SUCCESS", "status": "COMPLETED" }],
   "reviewDecision": "APPROVED",
   "commits": [
-    { "oid": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0", "messageHeadline": "init structure", "authors": [{ "login": "alice" }] },
-    { "oid": "d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3", "messageHeadline": "enum dispatch", "authors": [{ "login": "alice" }] },
-    { "oid": "789abcdef0123456789abcdef0123456789abcde", "messageHeadline": "add Wait variant", "authors": [{ "login": "alice" }] }
+    { "oid": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0", "messageHeadline": "init structure", "authors": [{ "login": "alice" }], "committedDate": "2026-05-04T12:00:00Z" },
+    { "oid": "d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3", "messageHeadline": "enum dispatch", "authors": [{ "login": "alice" }], "committedDate": "2026-05-05T09:30:00Z" },
+    { "oid": "789abcdef0123456789abcdef0123456789abcde", "messageHeadline": "add Wait variant", "authors": [{ "login": "alice" }], "committedDate": "2026-05-06T08:15:00Z" }
   ],
   "files": [
     { "path": "src/sched.rs", "additions": 5, "deletions": 1 },
