@@ -199,8 +199,18 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
             number,
             result: Ok(()),
         } => {
+            // Drop the user back into the PR list — the PR they were
+            // looking at is now merged, so the review view's data is
+            // stale. The status line confirms what just happened, and
+            // the auto-refresh below repopulates the list with the new
+            // PR states (the merged one disappears from the open-only
+            // filter that's on by default).
+            st.focused = FocusedView::List;
+            st.review = None;
+            st.current_pr = None;
+            st.merge = None;
+            st.picker = None;
             st.list.status = format!("merged #{number}");
-            // Refresh the list so the merged PR shows its new state.
             st.list.loading = true;
             app.request(Request::RefreshList);
         }
