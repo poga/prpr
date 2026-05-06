@@ -24,8 +24,9 @@ came from.
 4. Be snappy: every keystroke draws within one frame; data fetches happen
    off the UI thread.
 5. Be visually pleasing without animations.
-6. Run reliably on Kitty (primary target) and other modern terminals with
-   truecolor support.
+6. Run reliably on Kitty (the primary target). Render correctly on any
+   terminal that reports truecolor; degrade gracefully (with a warning) on
+   terminals that don't.
 
 ## Non-goals (v1)
 
@@ -271,8 +272,10 @@ Commit color slots, in fixed order:
 | 7 | `#74c7ec` | sapphire |
 
 Green and red are reserved for diff add/remove and never appear in the
-commit palette. Slot order is fixed so a given commit position always gets
-the same color across PRs.
+commit palette. Slot order is fixed: the oldest in-window commit is always
+slot 1 (blue), the next is always slot 2 (mauve), and so on. A given commit
+SHA does not get a stable color across PRs — its color depends on its
+position in the current PR's window.
 
 ### Assignment
 
