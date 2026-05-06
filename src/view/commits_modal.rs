@@ -6,9 +6,14 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
-use ratatui::style::Color;
+use ratatui::Frame;
+use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::render::attribution::CommitStats;
+use crate::render::style::*;
 
 #[derive(Debug, Clone)]
 pub struct CommitRow {
@@ -37,6 +42,60 @@ impl CommitsModalState {
 
     pub fn move_up(&mut self) {
         self.selected = self.selected.saturating_sub(1);
+    }
+}
+
+/// Centered ~60% × 60% overlay listing the PR's commits, one per row.
+pub fn render(f: &mut Frame, area: Rect, st: &CommitsModalState) {
+    let modal = centered(area, 60, 60);
+    f.render_widget(Clear, modal);
+
+    let lines: Vec<Line> = st
+        .rows
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let row_style = if i == st.selected {
+                Style::default().bg(SURFACE0).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(TEXT)
+            };
+            Line::from(vec![
+                Span::styled(" █ ", Style::default().fg(r.color)),
+                Span::styled(format!("{}  ", r.short_sha), Style::default().fg(SUBTEXT0)),
+                Span::styled(truncate(&r.headline, 36), row_style),
+                Span::styled(
+                    format!("  {} · {}  ", r.author, r.relative_date),
+                    Style::default().fg(OVERLAY1),
+                ),
+                Span::styled(format!("+{}", r.adds), Style::default().fg(DIFF_ADD_FG)),
+                Span::raw(" "),
+                Span::styled(format!("−{}", r.dels), Style::default().fg(DIFF_DEL_FG)),
+            ])
+        })
+        .collect();
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(SURFACE2))
+        .title(" commits ");
+    f.render_widget(Paragraph::new(lines).block(block), modal);
+}
+
+fn centered(area: Rect, pct_w: u16, pct_h: u16) -> Rect {
+    let w = area.width * pct_w / 100;
+    let h = area.height * pct_h / 100;
+    let x = (area.width - w) / 2 + area.x;
+    let y = (area.height - h) / 2 + area.y;
+    Rect::new(x, y, w, h)
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let cut: String = s.chars().take(max - 1).collect();
+        format!("{}…", cut)
     }
 }
 
@@ -195,5 +254,91 @@ mod tests {
             adds: 0,
             dels: 0,
         }
+    }
+
+    #[test]
+    fn render_draws_one_row_per_commit() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let st = CommitsModalState {
+            rows: vec![
+                CommitRow {
+                    color: Color::Red,
+                    short_sha: "abc123".into(),
+                    headline: "first commit".into(),
+                    author: "alice".into(),
+                    relative_date: "3d".into(),
+                    adds: 5,
+                    dels: 1,
+                },
+                CommitRow {
+                    color: Color::Green,
+                    short_sha: "def456".into(),
+                    headline: "second commit".into(),
+                    author: "bob".into(),
+                    relative_date: "2d".into(),
+                    adds: 12,
+                    dels: 0,
+                },
+            ],
+            selected: 1,
+        };
+
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| {
+            let area = f.area();
+            render(f, area, &st);
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+
+        let dump: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+
+        assert!(dump.contains("abc123"), "missing first sha:\n{dump}");
+        assert!(dump.contains("def456"), "missing second sha:\n{dump}");
+        assert!(dump.contains("first commit"), "missing first headline:\n{dump}");
+        assert!(dump.contains("second commit"), "missing second headline:\n{dump}");
+        assert!(dump.contains("alice"), "missing author:\n{dump}");
+        assert!(dump.contains("+5"), "missing adds:\n{dump}");
+        assert!(dump.contains("commits"), "missing title:\n{dump}");
+    }
+
+    #[test]
+    fn render_highlights_selected_row() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use crate::render::style::SURFACE0;
+
+        let st = CommitsModalState {
+            rows: vec![dummy_row(), dummy_row()],
+            selected: 1,
+        };
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| {
+            let area = f.area();
+            render(f, area, &st);
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+
+        // Find a row that contains the selected highlight bg. We don't
+        // hard-code the row index because the modal is centered.
+        let mut found_highlighted = false;
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                if buf[(x, y)].style().bg == Some(SURFACE0) {
+                    found_highlighted = true;
+                }
+            }
+        }
+        assert!(found_highlighted, "no cell with SURFACE0 bg found");
     }
 }
