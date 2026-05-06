@@ -34,7 +34,7 @@ pub fn render(f: &mut Frame, area: Rect, pkg: &PrPackage, st: &PrReviewState) {
             Constraint::Length(strip_h), // commit strip (0 if hidden)
             Constraint::Length(2),       // file bar (title + divider)
             Constraint::Min(1),          // diff body
-            Constraint::Length(1),       // status
+            Constraint::Length(3),       // status (cursor + 2 hint rows)
         ])
         .split(area);
 
@@ -149,23 +149,46 @@ fn body_lines<'a>(file: &'a FileDiff, colors: &'a HashMap<String, LineColors>) -
 }
 
 fn render_status(f: &mut Frame, area: Rect, pkg: &PrPackage, st: &PrReviewState) {
-    let Some(file) = pkg.files.get(st.file_index) else {
-        return;
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // cursor / status info
+            Constraint::Length(1), // hints row 1: scrolling
+            Constraint::Length(1), // hints row 2: actions
+        ])
+        .split(area);
+
+    let cursor_info = if let Some(file) = pkg.files.get(st.file_index) {
+        let cursor_lineno = file
+            .lines
+            .iter()
+            .filter(|l| !l.is_hunk_header)
+            .nth(st.cursor_line)
+            .and_then(|l| l.new_lineno.or(l.old_lineno));
+        match cursor_lineno {
+            Some(n) => format!("line {n}"),
+            None => st.status.clone(),
+        }
+    } else {
+        st.status.clone()
     };
-    let cursor_lineno = file
-        .lines
-        .iter()
-        .filter(|l| !l.is_hunk_header)
-        .nth(st.cursor_line)
-        .and_then(|l| l.new_lineno.or(l.old_lineno));
-    let cursor_info = match cursor_lineno {
-        Some(n) => format!("line {n}"),
-        None => st.status.clone(),
-    };
-    let bar = format!("  {}    │ ↵ next file   Esc back", cursor_info);
     f.render_widget(
-        Paragraph::new(bar).style(Style::default().fg(SUBTEXT0)),
-        area,
+        Paragraph::new(format!("  {cursor_info}")).style(Style::default().fg(SUBTEXT0)),
+        chunks[0],
+    );
+    f.render_widget(
+        Paragraph::new(
+            "  j/k or ↑/↓ scroll   Ctrl-d/u half-page   PgUp/PgDn page   Home/End top/bottom",
+        )
+        .style(Style::default().fg(OVERLAY1)),
+        chunks[1],
+    );
+    f.render_widget(
+        Paragraph::new(
+            "  Tab/↵ next file   Shift-Tab prev   f files   m merge   c strip   s sha   ? help   q back",
+        )
+        .style(Style::default().fg(OVERLAY0)),
+        chunks[2],
     );
 }
 
