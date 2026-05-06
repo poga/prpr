@@ -1,0 +1,117 @@
+%YAML 1.2
+---
+# Minimal GDShader sublime-syntax. GDShader is Godot's shading language
+# (GLSL-like, with Godot-specific declarations such as `shader_type`,
+# `render_mode`, and uniform hints). Covers the common surface for code
+# review at-a-glance — not a complete spec.
+name: GDShader
+file_extensions:
+  - gdshader
+  - gdshaderinc
+scope: source.gdshader
+
+variables:
+  identifier: '[A-Za-z_][A-Za-z0-9_]*'
+
+contexts:
+  main:
+    - include: comments
+    - include: preprocessor
+    - include: strings
+    - include: numbers
+    - include: shader-decls
+    - include: storage-modifiers
+    - include: keywords
+    - include: types
+    - include: builtins
+    - include: function-def
+    - include: function-call
+    - include: operators
+
+  comments:
+    - match: '//.*$'
+      scope: comment.line.double-slash.gdshader
+    - match: '/\*'
+      push:
+        - meta_scope: comment.block.gdshader
+        - match: '\*/'
+          pop: true
+
+  preprocessor:
+    - match: '^\s*#\s*(include|define|undef|if|ifdef|ifndef|else|elif|endif|pragma)\b'
+      scope: meta.preprocessor.gdshader
+
+  strings:
+    - match: '"'
+      scope: punctuation.definition.string.begin.gdshader
+      push:
+        - meta_scope: string.quoted.double.gdshader
+        - match: '\\.'
+          scope: constant.character.escape.gdshader
+        - match: '"'
+          scope: punctuation.definition.string.end.gdshader
+          pop: true
+        - match: '$'
+          pop: true
+
+  numbers:
+    - match: '\b0x[0-9a-fA-F]+u?\b'
+      scope: constant.numeric.hex.gdshader
+    - match: '\b\d+\.\d*([eE][+-]?\d+)?[fF]?\b'
+      scope: constant.numeric.float.gdshader
+    - match: '\b\.\d+([eE][+-]?\d+)?[fF]?\b'
+      scope: constant.numeric.float.gdshader
+    - match: '\b\d+[fF]\b'
+      scope: constant.numeric.float.gdshader
+    - match: '\b\d+u?\b'
+      scope: constant.numeric.integer.gdshader
+
+  shader-decls:
+    - match: '\b(shader_type)\b\s*'
+      scope: keyword.declaration.shader-type.gdshader
+      push:
+        - match: '\b(canvas_item|spatial|particles|sky|fog)\b'
+          scope: entity.name.shader-type.gdshader
+          pop: true
+        - match: '(?=\S)'
+          pop: true
+    - match: '\b(render_mode)\b'
+      scope: keyword.declaration.render-mode.gdshader
+    - match: '\b(group_uniforms)\b'
+      scope: keyword.declaration.group.gdshader
+
+  storage-modifiers:
+    - match: '\b(const|varying|uniform|in|out|inout|global|instance|flat|smooth|highp|mediump|lowp|precision)\b'
+      scope: storage.modifier.gdshader
+
+  keywords:
+    - match: '\b(if|else|while|for|do|break|continue|return|switch|case|default|discard|true|false)\b'
+      scope: keyword.control.gdshader
+    - match: '\b(struct)\b'
+      scope: storage.type.struct.gdshader
+
+  types:
+    - match: '\b(void|bool|int|uint|float|double|bvec2|bvec3|bvec4|ivec2|ivec3|ivec4|uvec2|uvec3|uvec4|vec2|vec3|vec4|dvec2|dvec3|dvec4|mat2|mat3|mat4|mat2x2|mat2x3|mat2x4|mat3x2|mat3x3|mat3x4|mat4x2|mat4x3|mat4x4|sampler2D|sampler2DArray|sampler3D|samplerCube|samplerCubeArray|isampler2D|isampler2DArray|isampler3D|usampler2D|usampler2DArray|usampler3D|sampler2DShadow|samplerCubeShadow|samplerExternalOES)\b'
+      scope: storage.type.gdshader
+
+  builtins:
+    # Common GDShader builtin variables.
+    - match: '\b(VERTEX|NORMAL|TANGENT|BINORMAL|UV|UV2|COLOR|POINT_SIZE|MODELVIEW_MATRIX|MODELVIEW_NORMAL_MATRIX|VIEW_MATRIX|INV_VIEW_MATRIX|PROJECTION_MATRIX|INV_PROJECTION_MATRIX|MODEL_MATRIX|MODEL_NORMAL_MATRIX|TIME|PI|TAU|E|FRAGCOORD|POINT_COORD|FRONT_FACING|VIEW|FRAGMENT|ALBEDO|ALPHA|ROUGHNESS|METALLIC|SPECULAR|EMISSION|AO|AO_LIGHT_AFFECT|RIM|RIM_TINT|CLEARCOAT|CLEARCOAT_GLOSS|ANISOTROPY|ANISOTROPY_FLOW|SSS_STRENGTH|SSS_TRANSMITTANCE_COLOR|SSS_TRANSMITTANCE_DEPTH|SSS_TRANSMITTANCE_BOOST|BACKLIGHT|TRANSMISSION|REFRACTION|NORMAL_MAP|NORMAL_MAP_DEPTH|DEPTH|SCREEN_UV|SCREEN_TEXTURE|DEPTH_TEXTURE|NORMAL_TEXTURE|LIGHT|LIGHT_COLOR|LIGHT_IS_DIRECTIONAL|ATTENUATION|SHADOW_ATTENUATION|VIEWPORT_SIZE|OUTPUT_IS_SRGB|VERTEX_ID|INSTANCE_ID|INSTANCE_CUSTOM)\b'
+      scope: support.constant.builtin.gdshader
+    # Common GDShader builtin functions (subset of GLSL plus Godot extras).
+    - match: '\b(texture|textureLod|textureProj|textureProjLod|textureGrad|textureGather|textureSize|texelFetch|abs|sign|floor|ceil|round|trunc|fract|mod|min|max|clamp|mix|step|smoothstep|sqrt|inversesqrt|pow|exp|exp2|log|log2|sin|cos|tan|asin|acos|atan|sinh|cosh|tanh|asinh|acosh|atanh|degrees|radians|length|distance|normalize|dot|cross|reflect|refract|faceforward|determinant|inverse|transpose|matrixCompMult|outerProduct|all|any|equal|notEqual|lessThan|greaterThan|lessThanEqual|greaterThanEqual|isnan|isinf|dFdx|dFdy|fwidth|noise)\b(?=\s*\()'
+      scope: support.function.builtin.gdshader
+
+  function-def:
+    - match: '\b({{identifier}})\s+({{identifier}})(?=\s*\()'
+      captures:
+        1: storage.type.gdshader
+        2: entity.name.function.gdshader
+
+  function-call:
+    - match: '({{identifier}})(?=\s*\()'
+      scope: variable.function.gdshader
+
+  operators:
+    - match: '(\+=|-=|\*=|/=|%=|<<=|>>=|&=|\|=|\^=|==|!=|<=|>=|<<|>>|&&|\|\||\+\+|--|\+|-|\*|/|%|=|<|>|!|&|\||\^|~|\?|:)'
+      scope: keyword.operator.gdshader

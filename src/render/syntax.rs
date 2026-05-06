@@ -4,9 +4,8 @@
 //! Catppuccin Mocha among the defaults. The `SyntaxSet` and `Theme` are
 //! loaded lazily on first call and cached for the rest of the process.
 //!
-//! GDScript is not in syntect's default syntaxes, so a minimal
-//! `.sublime-syntax` is bundled as `assets/gdscript.sublime-syntax` and
-//! added at startup.
+//! GDScript and GDShader are not in syntect's default syntaxes, so minimal
+//! `.sublime-syntax` files are bundled in `assets/` and added at startup.
 
 use std::sync::OnceLock;
 
@@ -17,15 +16,18 @@ use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::{SyntaxDefinition, SyntaxSet};
 
 const GDSCRIPT_SYNTAX: &str = include_str!("../../assets/gdscript.sublime-syntax");
+const GDSHADER_SYNTAX: &str = include_str!("../../assets/gdshader.sublime-syntax");
 
 fn syntax_set() -> &'static SyntaxSet {
     static S: OnceLock<SyntaxSet> = OnceLock::new();
     S.get_or_init(|| {
         let mut builder = SyntaxSet::load_defaults_newlines().into_builder();
-        // Best-effort: if the bundled syntax fails to parse for any reason,
-        // fall through with the defaults rather than crashing.
-        if let Ok(def) = SyntaxDefinition::load_from_str(GDSCRIPT_SYNTAX, true, Some("GDScript")) {
-            builder.add(def);
+        // Best-effort: if any bundled syntax fails to parse, fall through
+        // with the rest rather than crashing.
+        for (yaml, name) in [(GDSCRIPT_SYNTAX, "GDScript"), (GDSHADER_SYNTAX, "GDShader")] {
+            if let Ok(def) = SyntaxDefinition::load_from_str(yaml, true, Some(name)) {
+                builder.add(def);
+            }
         }
         builder.build()
     })
@@ -101,6 +103,16 @@ mod tests {
         let spans = highlight_line("", "rs");
         assert_eq!(spans.len(), 1);
         assert!(spans[0].content.is_empty());
+    }
+
+    #[test]
+    fn gdshader_keyword_gets_a_distinct_color() {
+        let spans = highlight_line("uniform vec4 albedo : source_color;", "gdshader");
+        assert!(spans.len() > 1, "got {} spans: {:?}", spans.len(), spans);
+        let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(joined, "uniform vec4 albedo : source_color;");
+        let fgs: std::collections::HashSet<_> = spans.iter().map(|s| s.style.fg).collect();
+        assert!(fgs.len() > 1, "expected multiple fg colors, got {:?}", fgs);
     }
 
     #[test]
