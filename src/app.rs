@@ -230,7 +230,9 @@ fn draw(f: &mut ratatui::Frame, app: &App, st: &AppState) {
             if let (Some(pkg), Some(review)) = (pkg, st.review.as_ref()) {
                 crate::view::pr_review::render(f, area, pkg, review);
             } else {
-                let msg = ratatui::widgets::Paragraph::new("loading…")
+                let text = format!("{} loading…", crate::render::spinner::glyph());
+                let msg = ratatui::widgets::Paragraph::new(text)
+                    .style(ratatui::style::Style::default().fg(crate::render::style::OVERLAY1))
                     .alignment(ratatui::layout::Alignment::Center);
                 f.render_widget(msg, area);
             }

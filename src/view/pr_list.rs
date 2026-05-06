@@ -8,6 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::data::pr::{CiState, Pr, PrState, ReviewDecision};
+use crate::render::spinner;
 use crate::render::style::*;
 
 #[derive(Debug, Default)]
@@ -73,7 +74,7 @@ fn render_header(f: &mut Frame, area: Rect, st: &PrListState) {
 fn render_rows(f: &mut Frame, area: Rect, st: &PrListState, now: DateTime<Utc>) {
     if st.loading {
         f.render_widget(
-            Paragraph::new("loading PRs…")
+            Paragraph::new(format!("{} loading PRs…", spinner::glyph()))
                 .style(Style::default().fg(OVERLAY1))
                 .alignment(ratatui::layout::Alignment::Center),
             area,
@@ -99,11 +100,17 @@ fn render_footer(f: &mut Frame, area: Rect, st: &PrListState) {
             .style(Style::default().fg(OVERLAY1)),
         chunks[0],
     );
-    // When there's a status (e.g. refresh error), show that instead of the
-    // legend. Errors must never be silent — the user should see them.
+    // When there's a status (e.g. refresh error or in-progress merge),
+    // show that instead of the legend. Errors must never be silent — the
+    // user should see them. In-progress messages get a spinner prefix.
     if !st.status.is_empty() {
+        let (prefix, color) = if spinner::looks_in_progress(&st.status) {
+            (format!("{} ", spinner::glyph()), OVERLAY1)
+        } else {
+            (String::new(), DIFF_DEL_FG)
+        };
         f.render_widget(
-            Paragraph::new(format!("  {}", st.status)).style(Style::default().fg(DIFF_DEL_FG)),
+            Paragraph::new(format!("  {prefix}{}", st.status)).style(Style::default().fg(color)),
             chunks[1],
         );
     } else {
