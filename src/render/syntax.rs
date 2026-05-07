@@ -15,6 +15,11 @@ use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::{SyntaxDefinition, SyntaxSet};
 
+/// Tab stops for diff body rendering. ratatui's text widgets render `\t` as a
+/// single cell, so without expansion any tab-indented diff (Go, Makefiles, …)
+/// loses its indentation.
+const TAB_WIDTH: usize = 4;
+
 const GDSCRIPT_SYNTAX: &str = include_str!("../../assets/gdscript.sublime-syntax");
 const GDSHADER_SYNTAX: &str = include_str!("../../assets/gdshader.sublime-syntax");
 
@@ -62,8 +67,9 @@ pub fn highlight_line(text: &str, ext: &str) -> Vec<Span<'static>> {
     let with_nl = format!("{text}\n");
     let regions = match h.highlight_line(&with_nl, ss) {
         Ok(r) => r,
-        Err(_) => return vec![Span::raw(text.to_string())],
+        Err(_) => return vec![Span::raw(expand_tabs(text, &mut 0))],
     };
+    let mut col = 0usize;
     regions
         .into_iter()
         .filter_map(|(style, frag)| {
@@ -71,10 +77,34 @@ pub fn highlight_line(text: &str, ext: &str) -> Vec<Span<'static>> {
             if frag.is_empty() {
                 return None;
             }
+            let expanded = expand_tabs(frag, &mut col);
             let fg = Color::Rgb(style.foreground.r, style.foreground.g, style.foreground.b);
-            Some(Span::styled(frag.to_string(), Style::default().fg(fg)))
+            Some(Span::styled(expanded, Style::default().fg(fg)))
         })
         .collect()
+}
+
+/// Replace `\t` with the right number of spaces to advance to the next tab
+/// stop, threading the running column across calls so inline tabs still align.
+fn expand_tabs(frag: &str, col: &mut usize) -> String {
+    if !frag.contains('\t') {
+        *col += frag.chars().count();
+        return frag.to_string();
+    }
+    let mut out = String::with_capacity(frag.len());
+    for ch in frag.chars() {
+        if ch == '\t' {
+            let pad = TAB_WIDTH - (*col % TAB_WIDTH);
+            for _ in 0..pad {
+                out.push(' ');
+            }
+            *col += pad;
+        } else {
+            out.push(ch);
+            *col += 1;
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -96,6 +126,21 @@ mod tests {
         let spans = highlight_line("hello world", "xyznotalanguage");
         let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(joined, "hello world");
+    }
+
+    #[test]
+    fn tab_indent_is_expanded_to_tab_stops() {
+        let spans = highlight_line("\tfoo", "rs");
+        let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(joined, "    foo");
+    }
+
+    #[test]
+    fn inline_tab_aligns_to_next_tab_stop() {
+        // After "ab" (col 2), a tab should advance to col 4 — i.e. 2 spaces.
+        let spans = highlight_line("ab\tcd", "txt");
+        let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(joined, "ab  cd");
     }
 
     #[test]

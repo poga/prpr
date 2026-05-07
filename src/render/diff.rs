@@ -169,6 +169,31 @@ mod tests {
     }
 
     #[test]
+    fn tab_indent_expands_to_tab_stop() {
+        // ratatui renders `\t` as a single cell, so without expansion any
+        // tab-indented language (Go, Makefile, …) reads as un-indented.
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui::widgets::Paragraph;
+
+        let line = add("\tlet x = 2;", 45);
+        let rendered = render_line(&line, None, None, "rs");
+        let mut term = Terminal::new(TestBackend::new(40, 1)).unwrap();
+        term.draw(|f| f.render_widget(Paragraph::new(vec![rendered.clone()]), f.area()))
+            .unwrap();
+        let buf = term.backend().buffer();
+        let row: String = (0..buf.area.width)
+            .map(|x| buf[(x, 0)].symbol().to_string())
+            .collect();
+        // Layout: "  45" + " " + gutter(" ") + " " + "+" + " " + body.
+        // Body must start with at least four cells of indent before "let".
+        assert!(
+            row.contains("+     let"),
+            "tab-indented body did not expand to a 4-wide tab stop: {row:?}"
+        );
+    }
+
+    #[test]
     fn ext_of_strips_path_and_dot() {
         assert_eq!(ext_of("src/lib.rs"), "rs");
         assert_eq!(ext_of("README.md"), "md");
