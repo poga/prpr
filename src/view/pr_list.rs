@@ -72,7 +72,10 @@ fn render_header(f: &mut Frame, area: Rect, st: &PrListState) {
 }
 
 fn render_rows(f: &mut Frame, area: Rect, st: &PrListState, now: DateTime<Utc>) {
-    if st.loading {
+    // Only blank the body on a cold load (no prior rows). For refreshes,
+    // keep the existing rows visible and let the footer carry the spinner —
+    // otherwise the user loses their place every time they press `r`.
+    if st.loading && st.prs.is_empty() {
         f.render_widget(
             Paragraph::new(format!("{} loading PRs…", spinner::glyph()))
                 .style(Style::default().fg(OVERLAY1))
@@ -111,6 +114,14 @@ fn render_footer(f: &mut Frame, area: Rect, st: &PrListState) {
         };
         f.render_widget(
             Paragraph::new(format!("  {prefix}{}", st.status)).style(Style::default().fg(color)),
+            chunks[1],
+        );
+    } else if st.loading {
+        // Refresh in flight while the list is still showing prior rows —
+        // keep the spinner visible so background work is never silent.
+        f.render_widget(
+            Paragraph::new(format!("  {} refreshing…", spinner::glyph()))
+                .style(Style::default().fg(OVERLAY1)),
             chunks[1],
         );
     } else {

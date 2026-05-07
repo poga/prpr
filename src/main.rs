@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::thread;
 
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
@@ -44,20 +45,28 @@ fn real_main() -> Result<()> {
     let gh: Arc<dyn GhClient> = Arc::new(GhCli);
     let git: Arc<dyn GitClient> = Arc::new(GitCli);
 
-    gh.auth_status()
-        .context("gh auth status failed (run `gh auth login`)")?;
-
     let cwd = std::env::current_dir()?;
     let repo_root = git.repo_root(&cwd).context("not inside a git repo")?;
-    if !git.has_github_remote(&repo_root)? {
+
+    // Run the two remaining git probes in parallel — they're independent and
+    // each spawns a subprocess. `current_branch` is cosmetic (title bar), so
+    // `has_github_remote` is the only one that gates startup.
+    let (has_remote, branch) = thread::scope(|s| {
+        let git_ref = git.as_ref();
+        let root = repo_root.as_path();
+        let remote_h = s.spawn(move || git_ref.has_github_remote(root));
+        let branch_h = s.spawn(move || current_branch(root));
+        (remote_h.join().unwrap(), branch_h.join().unwrap())
+    });
+    if !has_remote? {
         return Err(anyhow!("no github.com remote in {}", repo_root.display()));
     }
+    let branch = branch.unwrap_or_else(|| "?".into());
 
     let repo_name = repo_root
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let branch = current_branch(&repo_root).unwrap_or_else(|| "?".into());
 
     let mut app = App::new(repo_root, gh, git, cfg);
     let mut st = AppState::new(repo_name, branch);

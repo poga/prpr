@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::{self, JoinHandle};
 
@@ -24,7 +25,7 @@ use crate::data::gh::GhClient;
 use crate::data::git::GitClient;
 use crate::data::log_patches::parse_deletions;
 use crate::data::pr::Pr;
-use crate::render::attribution::{attribute_file, commit_stats_for_file, CommitStats};
+use crate::render::attribution::{CommitStats, LineColors, attribute_file, commit_stats_for_file};
 
 #[derive(Debug)]
 pub enum Request {
@@ -138,45 +139,47 @@ pub fn build_package(
     number: u32,
     window_size: usize,
 ) -> Result<PrPackage> {
-    let detail = gh.view_pr(repo_root, number)?;
-    git.fetch_pr(repo_root, number)
-        .with_context(|| format!("fetching PR #{number}"))?;
-    let raw = gh.diff_pr(repo_root, number)?;
+    // Phase 1: gh pr view, gh pr diff, and git fetch are all keyed only on
+    // `number` and don't depend on each other's output. Run them in parallel.
+    let (detail_res, fetch_res, diff_res) = thread::scope(|s| {
+        let detail_h = s.spawn(|| gh.view_pr(repo_root, number));
+        let fetch_h = s.spawn(|| git.fetch_pr(repo_root, number));
+        let diff_h = s.spawn(|| gh.diff_pr(repo_root, number));
+        (
+            detail_h.join().unwrap(),
+            fetch_h.join().unwrap(),
+            diff_h.join().unwrap(),
+        )
+    });
+    let detail = detail_res?;
+    fetch_res.with_context(|| format!("fetching PR #{number}"))?;
+    let raw = diff_res?;
     let files = parse_diff(&raw)?;
 
     let commits: Vec<String> = detail.commits.iter().map(|c| c.oid.clone()).collect();
-    let mut colors = HashMap::new();
     let mut commit_stats: HashMap<String, CommitStats> = commits
         .iter()
         .map(|oid| (oid.clone(), CommitStats::default()))
         .collect();
-    for f in &files {
-        if f.binary {
-            continue;
-        }
-        let head = git
-            .blame(repo_root, &detail.head_ref_oid, &f.path)
-            .map(|s| parse_blame(&s))
-            .unwrap_or_else(|_| Blame { line_shas: vec![] });
-        // Walk the PR commits' patches to find which commit's diff
-        // contained each removed line. Deleted lines used to be blamed
-        // against the base commit, which always resolved to pre-PR
-        // commits (i.e., gray) — never the PR commit that actually did
-        // the deletion.
-        let log_out = git
-            .log_patches(
-                repo_root,
-                &detail.base_ref_oid,
-                &detail.head_ref_oid,
-                &f.path,
-            )
-            .unwrap_or_default();
-        let deletes = parse_deletions(&log_out);
-        let lc = attribute_file(&commits, window_size, &head, &deletes);
-        colors.insert(f.path.clone(), lc);
 
-        let per_file = commit_stats_for_file(&commits, &head, &deletes);
-        for (oid, s) in per_file {
+    // Phase 2: per-file blame + log_patches are independent across files.
+    // Fan out to a bounded pool of workers that pull file indexes off an
+    // atomic counter — gives work-stealing behavior without dragging in a
+    // dep, and caps the number of concurrent git subprocesses on huge PRs.
+    let per_file = parallel_per_file(
+        git,
+        repo_root,
+        &files,
+        &commits,
+        &detail.head_ref_oid,
+        &detail.base_ref_oid,
+        window_size,
+    );
+
+    let mut colors = HashMap::new();
+    for (path, lc, per) in per_file {
+        colors.insert(path, lc);
+        for (oid, s) in per {
             let entry = commit_stats.entry(oid).or_default();
             entry.adds += s.adds;
             entry.dels += s.dels;
@@ -188,6 +191,69 @@ pub fn build_package(
         files,
         colors,
         commit_stats,
+    })
+}
+
+type FileResult = (String, LineColors, HashMap<String, CommitStats>);
+
+fn parallel_per_file(
+    git: &dyn GitClient,
+    repo_root: &Path,
+    files: &[crate::data::diff::FileDiff],
+    commits: &[String],
+    head_oid: &str,
+    base_oid: &str,
+    window_size: usize,
+) -> Vec<FileResult> {
+    let n = files.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let n_workers = thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4)
+        .min(n);
+    let next_idx = AtomicUsize::new(0);
+
+    thread::scope(|s| {
+        let workers: Vec<_> = (0..n_workers)
+            .map(|_| {
+                s.spawn(|| {
+                    let mut local: Vec<FileResult> = Vec::new();
+                    loop {
+                        let i = next_idx.fetch_add(1, Ordering::Relaxed);
+                        if i >= n {
+                            break;
+                        }
+                        let f = &files[i];
+                        if f.binary {
+                            continue;
+                        }
+                        let head = git
+                            .blame(repo_root, head_oid, &f.path)
+                            .map(|s| parse_blame(&s))
+                            .unwrap_or_else(|_| Blame { line_shas: vec![] });
+                        // Walk the PR commits' patches to find which commit's
+                        // diff contained each removed line. Deleted lines used
+                        // to be blamed against the base commit, which always
+                        // resolved to pre-PR commits (i.e., gray) — never the
+                        // PR commit that actually did the deletion.
+                        let log_out = git
+                            .log_patches(repo_root, base_oid, head_oid, &f.path)
+                            .unwrap_or_default();
+                        let deletes = parse_deletions(&log_out);
+                        let lc = attribute_file(commits, window_size, &head, &deletes);
+                        let per = commit_stats_for_file(commits, &head, &deletes);
+                        local.push((f.path.clone(), lc, per));
+                    }
+                    local
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect()
     })
 }
 

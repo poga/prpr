@@ -131,22 +131,35 @@ fn render_status(f: &mut Frame, area: Rect, pkg: &PrPackage, st: &PrReviewState)
         ])
         .split(area);
 
-    let cursor_info = if let Some(file) = pkg.files.get(st.file_index) {
-        let cursor_lineno = file
-            .lines
-            .iter()
-            .filter(|l| !l.is_hunk_header)
-            .nth(st.cursor_line)
-            .and_then(|l| l.new_lineno.or(l.old_lineno));
-        match cursor_lineno {
-            Some(n) => format!("line {n}"),
-            None => st.status.clone(),
-        }
-    } else {
+    let cursor_info = pkg
+        .files
+        .get(st.file_index)
+        .and_then(|file| {
+            file.lines
+                .iter()
+                .filter(|l| !l.is_hunk_header)
+                .nth(st.cursor_line)
+                .and_then(|l| l.new_lineno.or(l.old_lineno))
+        })
+        .map(|n| format!("line {n}"))
+        .unwrap_or_default();
+    // Surface in-progress status (refresh in flight) alongside the cursor
+    // position so background work isn't silent — `…` is the convention.
+    let status_text = if crate::render::spinner::looks_in_progress(&st.status) {
+        format!("{} {}", crate::render::spinner::glyph(), st.status)
+    } else if cursor_info.is_empty() {
         st.status.clone()
+    } else {
+        String::new()
+    };
+    let line = match (cursor_info.is_empty(), status_text.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => cursor_info,
+        (true, false) => status_text,
+        (false, false) => format!("{cursor_info}    {status_text}"),
     };
     f.render_widget(
-        Paragraph::new(format!("  {cursor_info}")).style(Style::default().fg(SUBTEXT0)),
+        Paragraph::new(format!("  {line}")).style(Style::default().fg(SUBTEXT0)),
         chunks[0],
     );
     f.render_widget(

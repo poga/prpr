@@ -14,7 +14,6 @@ pub trait GhClient: Send + Sync {
     fn diff_pr(&self, repo_root: &std::path::Path, number: u32) -> Result<String>;
     /// `method` is one of "merge", "squash", "rebase".
     fn merge_pr(&self, repo_root: &std::path::Path, number: u32, method: &str) -> Result<()>;
-    fn auth_status(&self) -> Result<()>;
 }
 
 pub struct GhCli;
@@ -88,11 +87,6 @@ impl GhClient for GhCli {
             .args(["pr", "merge", &n, flag]))?;
         Ok(())
     }
-
-    fn auth_status(&self) -> Result<()> {
-        run(Command::new("gh").args(["auth", "status"]))?;
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -138,9 +132,6 @@ pub(crate) mod fakes {
         }
         fn merge_pr(&self, _root: &std::path::Path, n: u32, m: &str) -> Result<()> {
             self.merges.lock().unwrap().push((n, m.to_string()));
-            Ok(())
-        }
-        fn auth_status(&self) -> Result<()> {
             Ok(())
         }
     }
