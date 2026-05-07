@@ -210,6 +210,7 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
             // the auto-refresh below repopulates the list with the new
             // PR states (the merged one disappears from the open-only
             // filter that's on by default).
+            let was_in_review = st.current_pr.is_some();
             st.focused = FocusedView::List;
             st.review = None;
             st.current_pr = None;
@@ -218,6 +219,14 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
             st.picker = None;
             st.list.status = format!("merged #{number}");
             st.list.loading = true;
+            // Coming back from review, the existing rows still include the
+            // just-merged PR — clear them so the loading placeholder shows
+            // instead of stale data. List-view merges keep rows visible to
+            // preserve the user's place (see pr_list::render_rows).
+            if was_in_review {
+                st.list.prs.clear();
+                st.list.selected = 0;
+            }
             app.request(Request::RefreshList);
         }
         Response::MergeDone {
