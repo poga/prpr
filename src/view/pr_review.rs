@@ -4,8 +4,8 @@ use std::collections::HashMap;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::Style;
-use ratatui::text::Line;
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::data::cache::PrPackage;
@@ -28,6 +28,7 @@ pub fn render(f: &mut Frame, area: Rect, pkg: &PrPackage, st: &PrReviewState) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1), // header
+            Constraint::Length(1), // spacer between header and file bar
             Constraint::Length(2), // file bar (title + divider)
             Constraint::Min(1),    // diff body
             Constraint::Length(3), // status (cursor + 2 hint rows)
@@ -35,9 +36,9 @@ pub fn render(f: &mut Frame, area: Rect, pkg: &PrPackage, st: &PrReviewState) {
         .split(area);
 
     render_header(f, chunks[0], pkg);
-    render_file_bar(f, chunks[1], pkg, st);
-    render_diff_body(f, chunks[2], pkg, st);
-    render_status(f, chunks[3], pkg, st);
+    render_file_bar(f, chunks[2], pkg, st);
+    render_diff_body(f, chunks[3], pkg, st);
+    render_status(f, chunks[4], pkg, st);
 }
 
 fn render_header(f: &mut Frame, area: Rect, pkg: &PrPackage) {
@@ -59,21 +60,22 @@ fn render_file_bar(f: &mut Frame, area: Rect, pkg: &PrPackage, st: &PrReviewStat
         .get(st.file_index)
         .map(|f| f.path.as_str())
         .unwrap_or("");
-    let label = format!(
-        "  {}{}                                              file {}/{}",
-        path,
-        " ".repeat(40_usize.saturating_sub(path.len())),
-        st.file_index + 1,
-        total,
-    );
+    let counter = format!("file {}/{}", st.file_index + 1, total);
+    let pad = 40_usize.saturating_sub(path.len()) + 46;
+    let line = Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            path.to_string(),
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" ".repeat(pad)),
+        Span::styled(counter, Style::default().fg(SUBTEXT0)),
+    ]);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Length(1)])
         .split(area);
-    f.render_widget(
-        Paragraph::new(label).style(Style::default().fg(SUBTEXT0)),
-        chunks[0],
-    );
+    f.render_widget(Paragraph::new(line), chunks[0]);
     f.render_widget(
         Paragraph::new("  ".to_string() + &"─".repeat((area.width as usize).saturating_sub(2)))
             .style(Style::default().fg(SURFACE2)),
@@ -258,9 +260,9 @@ mod tests {
         })
         .unwrap();
         let buf = term.backend().buffer();
-        // Body starts at row 3 (header row 0; file bar rows 1-2;
-        // body rows 3..18; status row 19).
-        let body = buffer_line(buf, 3);
-        assert!(body.contains("binary file"), "row 3 was: {:?}", body);
+        // Body starts at row 4 (header row 0; spacer row 1; file bar rows 2-3;
+        // body rows 4..17; status row 17-19).
+        let body = buffer_line(buf, 4);
+        assert!(body.contains("binary file"), "row 4 was: {:?}", body);
     }
 }
