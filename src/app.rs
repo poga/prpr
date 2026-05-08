@@ -34,10 +34,8 @@ use crate::view::merge_modal::{MergeMethod, MergeModalState, MergingState};
 use crate::view::pr_list::PrListState;
 use crate::view::pr_review::PrReviewState;
 
-#[allow(dead_code)]
 const AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
-#[allow(dead_code)]
 fn should_auto_refresh(
     focused: FocusedView,
     merging: bool,
@@ -185,6 +183,19 @@ pub fn run(term: &mut Term, app: &mut App, st: &mut AppState) -> Result<()> {
         // Drain any worker responses before drawing.
         while let Ok(resp) = app.worker.rx.try_recv() {
             handle_response(app, st, resp);
+        }
+
+        // Silent auto-refresh: while the user is on the list and not in
+        // the middle of a merge, re-fetch every AUTO_REFRESH_INTERVAL so
+        // CI / review / merge-by-others changes show up without pressing r.
+        if should_auto_refresh(
+            st.focused,
+            st.merging.is_some(),
+            st.last_refresh_at,
+            Instant::now(),
+            AUTO_REFRESH_INTERVAL,
+        ) {
+            send_refresh(app, st, true);
         }
 
         term.draw(|f| draw(f, app, st))?;
