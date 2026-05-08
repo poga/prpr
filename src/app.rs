@@ -40,6 +40,7 @@ const RETURN_REFRESH_STALE_AFTER: Duration = Duration::from_secs(30);
 fn should_auto_refresh(
     focused: FocusedView,
     merging: bool,
+    in_flight: bool,
     last_refresh_at: Option<Instant>,
     now: Instant,
     interval: Duration,
@@ -48,6 +49,9 @@ fn should_auto_refresh(
         return false;
     }
     if merging {
+        return false;
+    }
+    if in_flight {
         return false;
     }
     match last_refresh_at {
@@ -105,6 +109,7 @@ pub struct AppState {
     pub pending_g: bool,
     pub running: bool,
     pub last_refresh_at: Option<Instant>,
+    pub list_refresh_in_flight: bool,
 }
 
 impl AppState {
@@ -130,6 +135,7 @@ impl AppState {
             pending_g: false,
             running: true,
             last_refresh_at: None,
+            list_refresh_in_flight: false,
         }
     }
 }
@@ -168,6 +174,7 @@ pub fn restore_terminal() -> Result<()> {
 
 fn send_refresh(app: &App, st: &mut AppState, silent: bool) {
     st.last_refresh_at = Some(Instant::now());
+    st.list_refresh_in_flight = true;
     if !silent {
         st.list.loading = true;
     }
@@ -191,6 +198,7 @@ pub fn run(term: &mut Term, app: &mut App, st: &mut AppState) -> Result<()> {
         if should_auto_refresh(
             st.focused,
             st.merging.is_some(),
+            st.list_refresh_in_flight,
             st.last_refresh_at,
             Instant::now(),
             AUTO_REFRESH_INTERVAL,
@@ -216,6 +224,7 @@ pub fn run(term: &mut Term, app: &mut App, st: &mut AppState) -> Result<()> {
 fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
     match resp {
         Response::ListLoaded(Ok(prs)) => {
+            st.list_refresh_in_flight = false;
             // Preserve the user's selected PR across refreshes: capture the
             // previously-selected PR's number, replace rows, then re-find the
             // same number in the new visible list. Falls back to a clamped
@@ -239,6 +248,7 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
                 reselect_by_number(prev_selected, &new_numbers, st.list.selected);
         }
         Response::ListLoaded(Err(e)) => {
+            st.list_refresh_in_flight = false;
             st.list.loading = false;
             st.list.status = format!("refresh failed: {e}");
         }
@@ -539,10 +549,11 @@ fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) 
             // If the cached list is older than RETURN_REFRESH_STALE_AFTER,
             // kick off a silent refresh so the user lands on fresh data.
             // Bouncing in/out of a PR review within the threshold reuses
-            // the existing rows.
-            let stale = st
-                .last_refresh_at
-                .is_none_or(|t| t.elapsed() >= RETURN_REFRESH_STALE_AFTER);
+            // the existing rows. Skip if a refresh is already in flight.
+            let stale = !st.list_refresh_in_flight
+                && st
+                    .last_refresh_at
+                    .is_none_or(|t| t.elapsed() >= RETURN_REFRESH_STALE_AFTER);
             if stale {
                 send_refresh(app, st, true);
             }
@@ -791,6 +802,7 @@ mod tests {
         assert!(!should_auto_refresh(
             FocusedView::Review,
             false,
+            false,
             last,
             now,
             Duration::from_secs(60)
@@ -804,6 +816,7 @@ mod tests {
         assert!(!should_auto_refresh(
             FocusedView::List,
             true,
+            false,
             last,
             now,
             Duration::from_secs(60)
@@ -815,6 +828,7 @@ mod tests {
         let now = Instant::now();
         assert!(!should_auto_refresh(
             FocusedView::List,
+            false,
             false,
             None,
             now,
@@ -829,6 +843,7 @@ mod tests {
         assert!(!should_auto_refresh(
             FocusedView::List,
             false,
+            false,
             last,
             now,
             Duration::from_secs(60)
@@ -841,6 +856,7 @@ mod tests {
         let last = Some(now - Duration::from_secs(61));
         assert!(should_auto_refresh(
             FocusedView::List,
+            false,
             false,
             last,
             now,
@@ -855,6 +871,21 @@ mod tests {
         assert!(should_auto_refresh(
             FocusedView::List,
             false,
+            false,
+            last,
+            now,
+            Duration::from_secs(60)
+        ));
+    }
+
+    #[test]
+    fn auto_refresh_blocked_when_in_flight() {
+        let now = Instant::now();
+        let last = Some(now - Duration::from_secs(120));
+        assert!(!should_auto_refresh(
+            FocusedView::List,
+            false,
+            true,
             last,
             now,
             Duration::from_secs(60)
