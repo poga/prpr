@@ -7,7 +7,7 @@
 
 use std::io::{self, Stdout};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use chrono::Utc;
@@ -33,6 +33,41 @@ use crate::view::file_picker::FilePickerState;
 use crate::view::merge_modal::{MergeMethod, MergeModalState, MergingState};
 use crate::view::pr_list::PrListState;
 use crate::view::pr_review::PrReviewState;
+
+const AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+const RETURN_REFRESH_STALE_AFTER: Duration = Duration::from_secs(30);
+
+fn should_auto_refresh(
+    focused: FocusedView,
+    merging: bool,
+    in_flight: bool,
+    last_refresh_at: Option<Instant>,
+    now: Instant,
+    interval: Duration,
+) -> bool {
+    if focused != FocusedView::List {
+        return false;
+    }
+    if merging {
+        return false;
+    }
+    if in_flight {
+        return false;
+    }
+    match last_refresh_at {
+        None => false,
+        Some(t) => now.duration_since(t) >= interval,
+    }
+}
+
+fn reselect_by_number(prev: Option<u32>, new_numbers: &[u32], old_idx: usize) -> usize {
+    if let Some(n) = prev
+        && let Some(i) = new_numbers.iter().position(|m| *m == n)
+    {
+        return i;
+    }
+    old_idx.min(new_numbers.len().saturating_sub(1))
+}
 
 pub type Term = Terminal<CrosstermBackend<Stdout>>;
 
@@ -73,6 +108,8 @@ pub struct AppState {
     pub commits: Option<CommitsModalState>,
     pub pending_g: bool,
     pub running: bool,
+    pub last_refresh_at: Option<Instant>,
+    pub list_refresh_in_flight: bool,
 }
 
 impl AppState {
@@ -97,6 +134,8 @@ impl AppState {
             commits: None,
             pending_g: false,
             running: true,
+            last_refresh_at: None,
+            list_refresh_in_flight: false,
         }
     }
 }
@@ -133,16 +172,38 @@ pub fn restore_terminal() -> Result<()> {
     Ok(())
 }
 
+fn send_refresh(app: &App, st: &mut AppState, silent: bool) {
+    st.last_refresh_at = Some(Instant::now());
+    st.list_refresh_in_flight = true;
+    if !silent {
+        st.list.loading = true;
+    }
+    app.request(Request::RefreshList);
+}
+
 pub fn run(term: &mut Term, app: &mut App, st: &mut AppState) -> Result<()> {
     // Kick off the initial PR list load. The first draw will show
     // "loading PRs…" while the worker thread does the gh subprocess.
-    st.list.loading = true;
-    app.request(Request::RefreshList);
+    send_refresh(app, st, false);
 
     while st.running {
         // Drain any worker responses before drawing.
         while let Ok(resp) = app.worker.rx.try_recv() {
             handle_response(app, st, resp);
+        }
+
+        // Silent auto-refresh: while the user is on the list and not in
+        // the middle of a merge, re-fetch every AUTO_REFRESH_INTERVAL so
+        // CI / review / merge-by-others changes show up without pressing r.
+        if should_auto_refresh(
+            st.focused,
+            st.merging.is_some(),
+            st.list_refresh_in_flight,
+            st.last_refresh_at,
+            Instant::now(),
+            AUTO_REFRESH_INTERVAL,
+        ) {
+            send_refresh(app, st, true);
         }
 
         term.draw(|f| draw(f, app, st))?;
@@ -163,17 +224,31 @@ pub fn run(term: &mut Term, app: &mut App, st: &mut AppState) -> Result<()> {
 fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
     match resp {
         Response::ListLoaded(Ok(prs)) => {
+            st.list_refresh_in_flight = false;
+            // Preserve the user's selected PR across refreshes: capture the
+            // previously-selected PR's number, replace rows, then re-find the
+            // same number in the new visible list. Falls back to a clamped
+            // index if the PR is gone (e.g. closed/merged out of the filter).
+            let prev_selected = st
+                .list
+                .visible_prs()
+                .get(st.list.selected)
+                .map(|p| p.number);
             st.list.prs = prs.clone();
             app.cache.set_list(prs);
             st.list.loading = false;
             st.list.status = String::new();
-            // Clamp selection in case the list shrank.
-            let n = st.list.visible_prs().len();
-            if st.list.selected >= n {
-                st.list.selected = n.saturating_sub(1);
-            }
+            let new_numbers: Vec<u32> = st
+                .list
+                .visible_prs()
+                .iter()
+                .map(|p| p.number)
+                .collect();
+            st.list.selected =
+                reselect_by_number(prev_selected, &new_numbers, st.list.selected);
         }
         Response::ListLoaded(Err(e)) => {
+            st.list_refresh_in_flight = false;
             st.list.loading = false;
             st.list.status = format!("refresh failed: {e}");
         }
@@ -218,10 +293,9 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
             st.merging = None;
             st.picker = None;
             st.list.status = format!("merged #{number}");
-            st.list.loading = true;
             st.list.prs.clear();
             st.list.selected = 0;
-            app.request(Request::RefreshList);
+            send_refresh(app, st, false);
         }
         Response::MergeDone {
             number,
@@ -402,8 +476,7 @@ fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) 
         }
         Action::ListMerge => open_merge(st),
         Action::ListRefresh => {
-            st.list.loading = true;
-            app.request(Request::RefreshList);
+            send_refresh(app, st, false);
         }
         Action::ListSearch => {
             st.list.search = Some(String::new());
@@ -473,6 +546,17 @@ fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) 
             st.focused = FocusedView::List;
             st.review = None;
             st.current_pr = None;
+            // If the cached list is older than RETURN_REFRESH_STALE_AFTER,
+            // kick off a silent refresh so the user lands on fresh data.
+            // Bouncing in/out of a PR review within the threshold reuses
+            // the existing rows. Skip if a refresh is already in flight.
+            let stale = !st.list_refresh_in_flight
+                && st
+                    .last_refresh_at
+                    .is_none_or(|t| t.elapsed() >= RETURN_REFRESH_STALE_AFTER);
+            if stale {
+                send_refresh(app, st, true);
+            }
         }
         Action::Help => {
             st.focused = FocusedView::HelpOverlay;
@@ -703,5 +787,141 @@ fn handle_commits_modal(st: &mut AppState, ev: crossterm::event::KeyEvent) {
         KeyCode::Down | KeyCode::Char('j') => modal.move_down(),
         KeyCode::Up | KeyCode::Char('k') => modal.move_up(),
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn auto_refresh_blocked_when_not_on_list() {
+        let now = Instant::now();
+        let last = Some(now - Duration::from_secs(120));
+        assert!(!should_auto_refresh(
+            FocusedView::Review,
+            false,
+            false,
+            last,
+            now,
+            Duration::from_secs(60)
+        ));
+    }
+
+    #[test]
+    fn auto_refresh_blocked_when_merging() {
+        let now = Instant::now();
+        let last = Some(now - Duration::from_secs(120));
+        assert!(!should_auto_refresh(
+            FocusedView::List,
+            true,
+            false,
+            last,
+            now,
+            Duration::from_secs(60)
+        ));
+    }
+
+    #[test]
+    fn auto_refresh_blocked_when_last_refresh_unset() {
+        let now = Instant::now();
+        assert!(!should_auto_refresh(
+            FocusedView::List,
+            false,
+            false,
+            None,
+            now,
+            Duration::from_secs(60)
+        ));
+    }
+
+    #[test]
+    fn auto_refresh_blocked_when_interval_not_elapsed() {
+        let now = Instant::now();
+        let last = Some(now - Duration::from_secs(30));
+        assert!(!should_auto_refresh(
+            FocusedView::List,
+            false,
+            false,
+            last,
+            now,
+            Duration::from_secs(60)
+        ));
+    }
+
+    #[test]
+    fn auto_refresh_fires_when_interval_elapsed() {
+        let now = Instant::now();
+        let last = Some(now - Duration::from_secs(61));
+        assert!(should_auto_refresh(
+            FocusedView::List,
+            false,
+            false,
+            last,
+            now,
+            Duration::from_secs(60)
+        ));
+    }
+
+    #[test]
+    fn auto_refresh_fires_exactly_at_interval_boundary() {
+        let now = Instant::now();
+        let last = Some(now - Duration::from_secs(60));
+        assert!(should_auto_refresh(
+            FocusedView::List,
+            false,
+            false,
+            last,
+            now,
+            Duration::from_secs(60)
+        ));
+    }
+
+    #[test]
+    fn auto_refresh_blocked_when_in_flight() {
+        let now = Instant::now();
+        let last = Some(now - Duration::from_secs(120));
+        assert!(!should_auto_refresh(
+            FocusedView::List,
+            false,
+            true,
+            last,
+            now,
+            Duration::from_secs(60)
+        ));
+    }
+
+    #[test]
+    fn reselect_keeps_position_when_pr_still_present() {
+        let new = [101u32, 99, 42, 7];
+        // prev = 42, was at index 1; now at index 2
+        assert_eq!(reselect_by_number(Some(42), &new, 1), 2);
+    }
+
+    #[test]
+    fn reselect_falls_back_to_clamped_old_idx_when_pr_gone() {
+        let new = [101u32, 99, 7];
+        // prev = 42 no longer in the list; old_idx 1 stays valid
+        assert_eq!(reselect_by_number(Some(42), &new, 1), 1);
+    }
+
+    #[test]
+    fn reselect_clamps_old_idx_when_list_shrinks() {
+        let new = [101u32, 99];
+        // prev = 42 gone, old_idx 5 clamped to len-1 = 1
+        assert_eq!(reselect_by_number(Some(42), &new, 5), 1);
+    }
+
+    #[test]
+    fn reselect_handles_empty_list() {
+        let new: [u32; 0] = [];
+        assert_eq!(reselect_by_number(Some(42), &new, 3), 0);
+    }
+
+    #[test]
+    fn reselect_with_no_prev_clamps_old_idx() {
+        let new = [101u32, 99, 7];
+        assert_eq!(reselect_by_number(None, &new, 5), 2);
     }
 }
