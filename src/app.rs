@@ -7,7 +7,7 @@
 
 use std::io::{self, Stdout};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use chrono::Utc;
@@ -33,6 +33,29 @@ use crate::view::file_picker::FilePickerState;
 use crate::view::merge_modal::{MergeMethod, MergeModalState, MergingState};
 use crate::view::pr_list::PrListState;
 use crate::view::pr_review::PrReviewState;
+
+#[allow(dead_code)]
+const AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
+#[allow(dead_code)]
+fn should_auto_refresh(
+    focused: FocusedView,
+    merging: bool,
+    last_refresh_at: Option<Instant>,
+    now: Instant,
+    interval: Duration,
+) -> bool {
+    if focused != FocusedView::List {
+        return false;
+    }
+    if merging {
+        return false;
+    }
+    match last_refresh_at {
+        None => false,
+        Some(t) => now.duration_since(t) >= interval,
+    }
+}
 
 pub type Term = Terminal<CrosstermBackend<Stdout>>;
 
@@ -703,5 +726,75 @@ fn handle_commits_modal(st: &mut AppState, ev: crossterm::event::KeyEvent) {
         KeyCode::Down | KeyCode::Char('j') => modal.move_down(),
         KeyCode::Up | KeyCode::Char('k') => modal.move_up(),
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn auto_refresh_blocked_when_not_on_list() {
+        let now = Instant::now();
+        let last = Some(now - Duration::from_secs(120));
+        assert!(!should_auto_refresh(
+            FocusedView::Review,
+            false,
+            last,
+            now,
+            Duration::from_secs(60)
+        ));
+    }
+
+    #[test]
+    fn auto_refresh_blocked_when_merging() {
+        let now = Instant::now();
+        let last = Some(now - Duration::from_secs(120));
+        assert!(!should_auto_refresh(
+            FocusedView::List,
+            true,
+            last,
+            now,
+            Duration::from_secs(60)
+        ));
+    }
+
+    #[test]
+    fn auto_refresh_blocked_when_last_refresh_unset() {
+        let now = Instant::now();
+        assert!(!should_auto_refresh(
+            FocusedView::List,
+            false,
+            None,
+            now,
+            Duration::from_secs(60)
+        ));
+    }
+
+    #[test]
+    fn auto_refresh_blocked_when_interval_not_elapsed() {
+        let now = Instant::now();
+        let last = Some(now - Duration::from_secs(30));
+        assert!(!should_auto_refresh(
+            FocusedView::List,
+            false,
+            last,
+            now,
+            Duration::from_secs(60)
+        ));
+    }
+
+    #[test]
+    fn auto_refresh_fires_when_interval_elapsed() {
+        let now = Instant::now();
+        let last = Some(now - Duration::from_secs(61));
+        assert!(should_auto_refresh(
+            FocusedView::List,
+            false,
+            last,
+            now,
+            Duration::from_secs(60)
+        ));
     }
 }
