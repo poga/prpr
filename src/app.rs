@@ -57,6 +57,16 @@ fn should_auto_refresh(
     }
 }
 
+#[allow(dead_code)]
+fn reselect_by_number(prev: Option<u32>, new_numbers: &[u32], old_idx: usize) -> usize {
+    if let Some(n) = prev
+        && let Some(i) = new_numbers.iter().position(|m| *m == n)
+    {
+        return i;
+    }
+    old_idx.min(new_numbers.len().saturating_sub(1))
+}
+
 pub type Term = Terminal<CrosstermBackend<Stdout>>;
 
 pub struct App {
@@ -809,5 +819,38 @@ mod tests {
             now,
             Duration::from_secs(60)
         ));
+    }
+
+    #[test]
+    fn reselect_keeps_position_when_pr_still_present() {
+        let new = [101u32, 99, 42, 7];
+        // prev = 42, was at index 1; now at index 2
+        assert_eq!(reselect_by_number(Some(42), &new, 1), 2);
+    }
+
+    #[test]
+    fn reselect_falls_back_to_clamped_old_idx_when_pr_gone() {
+        let new = [101u32, 99, 7];
+        // prev = 42 no longer in the list; old_idx 1 stays valid
+        assert_eq!(reselect_by_number(Some(42), &new, 1), 1);
+    }
+
+    #[test]
+    fn reselect_clamps_old_idx_when_list_shrinks() {
+        let new = [101u32, 99];
+        // prev = 42 gone, old_idx 5 clamped to len-1 = 1
+        assert_eq!(reselect_by_number(Some(42), &new, 5), 1);
+    }
+
+    #[test]
+    fn reselect_handles_empty_list() {
+        let new: [u32; 0] = [];
+        assert_eq!(reselect_by_number(Some(42), &new, 3), 0);
+    }
+
+    #[test]
+    fn reselect_with_no_prev_clamps_old_idx() {
+        let new = [101u32, 99, 7];
+        assert_eq!(reselect_by_number(None, &new, 5), 2);
     }
 }
