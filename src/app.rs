@@ -797,4 +797,17 @@ mod tests {
             Duration::from_secs(60)
         ));
     }
+
+    #[test]
+    fn auto_refresh_fires_exactly_at_interval_boundary() {
+        let now = Instant::now();
+        let last = Some(now - Duration::from_secs(60));
+        assert!(should_auto_refresh(
+            FocusedView::List,
+            false,
+            last,
+            now,
+            Duration::from_secs(60)
+        ));
+    }
 }
