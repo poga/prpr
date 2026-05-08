@@ -56,7 +56,6 @@ fn should_auto_refresh(
     }
 }
 
-#[allow(dead_code)]
 fn reselect_by_number(prev: Option<u32>, new_numbers: &[u32], old_idx: usize) -> usize {
     if let Some(n) = prev
         && let Some(i) = new_numbers.iter().position(|m| *m == n)
@@ -217,15 +216,27 @@ pub fn run(term: &mut Term, app: &mut App, st: &mut AppState) -> Result<()> {
 fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
     match resp {
         Response::ListLoaded(Ok(prs)) => {
+            // Preserve the user's selected PR across refreshes: capture the
+            // previously-selected PR's number, replace rows, then re-find the
+            // same number in the new visible list. Falls back to a clamped
+            // index if the PR is gone (e.g. closed/merged out of the filter).
+            let prev_selected = st
+                .list
+                .visible_prs()
+                .get(st.list.selected)
+                .map(|p| p.number);
             st.list.prs = prs.clone();
             app.cache.set_list(prs);
             st.list.loading = false;
             st.list.status = String::new();
-            // Clamp selection in case the list shrank.
-            let n = st.list.visible_prs().len();
-            if st.list.selected >= n {
-                st.list.selected = n.saturating_sub(1);
-            }
+            let new_numbers: Vec<u32> = st
+                .list
+                .visible_prs()
+                .iter()
+                .map(|p| p.number)
+                .collect();
+            st.list.selected =
+                reselect_by_number(prev_selected, &new_numbers, st.list.selected);
         }
         Response::ListLoaded(Err(e)) => {
             st.list.loading = false;
