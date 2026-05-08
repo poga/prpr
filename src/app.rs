@@ -106,6 +106,7 @@ pub struct AppState {
     pub commits: Option<CommitsModalState>,
     pub pending_g: bool,
     pub running: bool,
+    pub last_refresh_at: Option<Instant>,
 }
 
 impl AppState {
@@ -130,6 +131,7 @@ impl AppState {
             commits: None,
             pending_g: false,
             running: true,
+            last_refresh_at: None,
         }
     }
 }
@@ -166,11 +168,18 @@ pub fn restore_terminal() -> Result<()> {
     Ok(())
 }
 
+fn send_refresh(app: &App, st: &mut AppState, silent: bool) {
+    st.last_refresh_at = Some(Instant::now());
+    if !silent {
+        st.list.loading = true;
+    }
+    app.request(Request::RefreshList);
+}
+
 pub fn run(term: &mut Term, app: &mut App, st: &mut AppState) -> Result<()> {
     // Kick off the initial PR list load. The first draw will show
     // "loading PRs…" while the worker thread does the gh subprocess.
-    st.list.loading = true;
-    app.request(Request::RefreshList);
+    send_refresh(app, st, false);
 
     while st.running {
         // Drain any worker responses before drawing.
@@ -251,10 +260,9 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
             st.merging = None;
             st.picker = None;
             st.list.status = format!("merged #{number}");
-            st.list.loading = true;
             st.list.prs.clear();
             st.list.selected = 0;
-            app.request(Request::RefreshList);
+            send_refresh(app, st, false);
         }
         Response::MergeDone {
             number,
@@ -435,8 +443,7 @@ fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) 
         }
         Action::ListMerge => open_merge(st),
         Action::ListRefresh => {
-            st.list.loading = true;
-            app.request(Request::RefreshList);
+            send_refresh(app, st, false);
         }
         Action::ListSearch => {
             st.list.search = Some(String::new());
