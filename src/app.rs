@@ -35,6 +35,7 @@ use crate::view::pr_list::PrListState;
 use crate::view::pr_review::PrReviewState;
 
 const AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+const RETURN_REFRESH_STALE_AFTER: Duration = Duration::from_secs(30);
 
 fn should_auto_refresh(
     focused: FocusedView,
@@ -524,6 +525,16 @@ fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) 
             st.focused = FocusedView::List;
             st.review = None;
             st.current_pr = None;
+            // If the cached list is older than RETURN_REFRESH_STALE_AFTER,
+            // kick off a silent refresh so the user lands on fresh data.
+            // Bouncing in/out of a PR review within the threshold reuses
+            // the existing rows.
+            let stale = st
+                .last_refresh_at
+                .is_none_or(|t| t.elapsed() >= RETURN_REFRESH_STALE_AFTER);
+            if stale {
+                send_refresh(app, st, true);
+            }
         }
         Action::Help => {
             st.focused = FocusedView::HelpOverlay;
