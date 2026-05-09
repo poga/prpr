@@ -36,7 +36,10 @@ pub struct Pr {
         deserialize_with = "deser_review_decision"
     )]
     pub review_decision: Option<ReviewDecision>,
+    #[serde(default)]
+    pub mergeable: Option<String>,
 }
+
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
@@ -73,6 +76,12 @@ pub enum ReviewDecision {
 }
 
 impl Pr {
+    /// True only when GitHub has computed mergeability and reports a conflict.
+    /// "UNKNOWN" or missing values are treated as not-yet-known, not conflicting.
+    pub fn is_conflicting(&self) -> bool {
+        matches!(self.mergeable.as_deref(), Some("CONFLICTING"))
+    }
+
     /// Aggregate CI conclusion across status_check_rollup.
     /// Returns "fail" if any check failed, "pending" if any are pending,
     /// "pass" if all completed successfully, "none" if empty.
@@ -170,7 +179,9 @@ mod tests {
         assert_eq!(prs[0].labels[0].name, "bug");
         assert_eq!(prs[0].ci_state(), CiState::Pass);
         assert_eq!(prs[0].review_decision, Some(ReviewDecision::Approved));
+        assert!(!prs[0].is_conflicting());
         assert_eq!(prs[1].ci_state(), CiState::Fail);
+        assert!(prs[1].is_conflicting());
     }
 
     #[test]
@@ -186,6 +197,7 @@ mod tests {
             labels: vec![],
             status_check_rollup: vec![],
             review_decision: None,
+            mergeable: None,
         };
         assert_eq!(pr.ci_state(), CiState::None);
     }

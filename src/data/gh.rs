@@ -19,7 +19,7 @@ pub trait GhClient: Send + Sync {
 pub struct GhCli;
 
 const PR_LIST_FIELDS: &str =
-    "number,title,author,isDraft,state,createdAt,updatedAt,labels,statusCheckRollup,reviewDecision";
+    "number,title,author,isDraft,state,createdAt,updatedAt,mergeable,labels,statusCheckRollup,reviewDecision";
 const PR_VIEW_FIELDS: &str = "number,title,author,isDraft,state,createdAt,baseRefName,baseRefOid,headRefName,headRefOid,mergeable,labels,statusCheckRollup,reviewDecision,commits,files";
 
 fn run(cmd: &mut Command) -> Result<Output> {

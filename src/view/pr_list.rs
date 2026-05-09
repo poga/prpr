@@ -127,7 +127,7 @@ fn render_footer(f: &mut Frame, area: Rect, st: &PrListState) {
     } else {
         f.render_widget(
             Paragraph::new(
-                "  state ●open ○draft   ci ✓pass ✗fail …pend   review ✓approved !changes ·pending",
+                "  state ●open ○draft   ci ✓pass ✗fail …pend   review ✓approved !changes ·pending   ⚠conflict",
             )
             .style(Style::default().fg(OVERLAY0)),
             chunks[1],
@@ -168,6 +168,13 @@ fn row_for(pr: &Pr, selected: bool, now: DateTime<Utc>, area_width: u16) -> Line
         }
         _ => Span::styled("·", Style::default().fg(COMMIT_PALETTE[1])),
     };
+    // Conflict marker only fires for OPEN PRs; merged/closed PRs report stale
+    // mergeability that's no longer actionable.
+    let conflict_glyph = if pr.state == PrState::Open && pr.is_conflicting() {
+        Span::styled("⚠", Style::default().fg(DIFF_DEL_FG))
+    } else {
+        Span::styled(" ", Style::default())
+    };
 
     let pr_num = format!(" #{} ", pr.number);
     let label_str = pr
@@ -185,8 +192,8 @@ fn row_for(pr: &Pr, selected: bool, now: DateTime<Utc>, area_width: u16) -> Line
     // Layout widths. Title takes whatever's left after the fixed-width
     // glyphs and the variable-width right side, so a wide terminal shows
     // long titles in full and a narrow terminal truncates with "…".
-    // Fixed left = "  " + state + " " + ci + " " + review = 7 cells.
-    let left_cols = 7 + pr_num.chars().count();
+    // Fixed left = "  " + state + " " + ci + " " + review + " " + conflict = 9 cells.
+    let left_cols = 9 + pr_num.chars().count();
     let right_cols = label_str.chars().count() + author_str.chars().count() + age.chars().count();
     let title_budget = (area_width as usize)
         .saturating_sub(left_cols)
@@ -200,6 +207,8 @@ fn row_for(pr: &Pr, selected: bool, now: DateTime<Utc>, area_width: u16) -> Line
         ci_glyph,
         Span::styled(" ", row_bg),
         review_glyph,
+        Span::styled(" ", row_bg),
+        conflict_glyph,
         Span::styled(pr_num, row_bg.fg(COMMIT_PALETTE[1])),
         Span::styled(truncate(&pr.title, title_budget), row_bg.fg(TEXT)),
         Span::styled(label_str, row_bg.fg(COMMIT_PALETTE[4])),
