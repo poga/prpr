@@ -79,7 +79,15 @@ pub fn render(f: &mut Frame, area: Rect, st: &CommitsModalState) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(SURFACE2))
         .title(" commits ");
-    f.render_widget(Paragraph::new(lines).block(block), modal);
+    // -2 strips the top and bottom border rows.
+    let visible = modal.height.saturating_sub(2) as usize;
+    let scroll_offset = if visible == 0 {
+        0
+    } else {
+        // Pin selected row at the bottom of the viewport once it would scroll off.
+        st.selected.saturating_sub(visible.saturating_sub(1))
+    };
+    f.render_widget(Paragraph::new(lines).scroll((scroll_offset as u16, 0)).block(block), modal);
 }
 
 fn centered(area: Rect, pct_w: u16, pct_h: u16) -> Rect {
@@ -309,6 +317,49 @@ mod tests {
         assert!(dump.contains("alice"), "missing author:\n{dump}");
         assert!(dump.contains("+5"), "missing adds:\n{dump}");
         assert!(dump.contains("commits"), "missing title:\n{dump}");
+    }
+
+    fn row_with_sha(sha: &str) -> CommitRow {
+        CommitRow {
+            color: Color::White,
+            short_sha: sha.to_string(),
+            headline: "x".into(),
+            author: "a".into(),
+            relative_date: "1d".into(),
+            adds: 0,
+            dels: 0,
+        }
+    }
+
+    #[test]
+    fn selected_row_visible_when_past_viewport() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let rows: Vec<CommitRow> = (0..50).map(|i| row_with_sha(&format!("c{:04}", i))).collect();
+        let st = CommitsModalState { rows, selected: 40 };
+
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| {
+            let area = f.area();
+            render(f, area, &st);
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+
+        let dump: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+
+        assert!(
+            dump.contains("c0040"),
+            "selected commit not visible in rendered output:\n{dump}"
+        );
     }
 
     #[test]
