@@ -176,7 +176,11 @@ fn row_for(pr: &Pr, selected: bool, now: DateTime<Utc>, area_width: u16) -> Line
         .map(|l| format!("  [{}]  ", l.name))
         .unwrap_or_else(|| "  ".to_string());
     let author_str = format!("{} ", pr.author.login);
-    let age = humanize_age(pr.created_at, now);
+    let age = format!(
+        "c{} · u{}",
+        humanize_age(pr.created_at, now),
+        humanize_age(pr.updated_at, now),
+    );
 
     // Layout widths. Title takes whatever's left after the fixed-width
     // glyphs and the variable-width right side, so a wide terminal shows

@@ -6,6 +6,7 @@
     "state": "OPEN",
     "author": { "login": "alice" },
     "createdAt": "2026-05-04T12:00:00Z",
+    "updatedAt": "2026-05-05T22:00:00Z",
     "labels": [{ "name": "bug" }],
     "statusCheckRollup": [
       { "conclusion": "SUCCESS", "status": "COMPLETED" }
@@ -19,6 +20,7 @@
     "state": "OPEN",
     "author": { "login": "bob" },
     "createdAt": "2026-05-03T08:30:00Z",
+    "updatedAt": "2026-05-03T08:30:00Z",
     "labels": [{ "name": "feature" }],
     "statusCheckRollup": [
       { "conclusion": "FAILURE", "status": "COMPLETED" }

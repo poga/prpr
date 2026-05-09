@@ -24,6 +24,8 @@ pub struct Pr {
     pub author: Author,
     #[serde(rename = "createdAt")]
     pub created_at: DateTime<Utc>,
+    #[serde(rename = "updatedAt")]
+    pub updated_at: DateTime<Utc>,
     #[serde(default)]
     pub labels: Vec<Label>,
     #[serde(rename = "statusCheckRollup", default)]
@@ -180,6 +182,7 @@ mod tests {
             state: PrState::Open,
             author: Author { login: "a".into() },
             created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            updated_at: "2026-01-01T00:00:00Z".parse().unwrap(),
             labels: vec![],
             status_check_rollup: vec![],
             review_decision: None,
@@ -198,6 +201,7 @@ mod tests {
             "state": "OPEN",
             "author": { "login": "a" },
             "createdAt": "2026-01-01T00:00:00Z",
+            "updatedAt": "2026-01-01T00:00:00Z",
             "labels": [],
             "statusCheckRollup": [],
             "reviewDecision": ""
