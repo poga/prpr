@@ -77,11 +77,21 @@ pub fn render(f: &mut Frame, area: Rect, st: &FilePickerState) {
             Line::from(vec![Span::styled(format!("  {}", p), style)])
         })
         .collect();
-    let list = Paragraph::new(list_lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(SURFACE2)),
-    );
+    // -2 strips the top and bottom border rows.
+    let visible = chunks[1].height.saturating_sub(2) as usize;
+    let scroll_offset = if visible == 0 {
+        0
+    } else {
+        // Pin selected row at the bottom of the viewport once it would scroll off.
+        st.selected.saturating_sub(visible.saturating_sub(1))
+    };
+    let list = Paragraph::new(list_lines)
+        .scroll((scroll_offset as u16, 0))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(SURFACE2)),
+        );
     f.render_widget(list, chunks[1]);
 }
 
@@ -123,5 +133,40 @@ mod tests {
         let m = st.matches();
         let names: Vec<_> = m.iter().map(|s| s.as_str()).collect();
         assert_eq!(names, vec!["src/main.rs", "tests/main.rs"]);
+    }
+
+    #[test]
+    fn selected_row_visible_when_past_viewport() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let files: Vec<String> = (0..50).map(|i| format!("dir/file_{:02}.rs", i)).collect();
+        let st = FilePickerState {
+            query: String::new(),
+            all_files: files,
+            selected: 40,
+        };
+
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| {
+            let area = f.area();
+            render(f, area, &st);
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+
+        let dump: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+
+        assert!(
+            dump.contains("dir/file_40.rs"),
+            "selected file not visible in rendered output:\n{dump}"
+        );
     }
 }
