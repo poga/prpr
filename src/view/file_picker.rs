@@ -16,6 +16,23 @@ pub struct FilePickerState {
 }
 
 impl FilePickerState {
+    pub fn page_down(&mut self, page: usize, match_count: usize) {
+        let last = match_count.saturating_sub(1);
+        self.selected = (self.selected + page).min(last);
+    }
+
+    pub fn page_up(&mut self, page: usize) {
+        self.selected = self.selected.saturating_sub(page);
+    }
+
+    pub fn to_top(&mut self) {
+        self.selected = 0;
+    }
+
+    pub fn to_bottom(&mut self, match_count: usize) {
+        self.selected = match_count.saturating_sub(1);
+    }
+
     pub fn matches(&self) -> Vec<&String> {
         let q = self.query.to_lowercase();
         let mut scored: Vec<(i64, &String)> = self
@@ -133,6 +150,70 @@ mod tests {
         let m = st.matches();
         let names: Vec<_> = m.iter().map(|s| s.as_str()).collect();
         assert_eq!(names, vec!["src/main.rs", "tests/main.rs"]);
+    }
+
+    #[test]
+    fn page_down_jumps_by_page_size_bounded_by_match_count() {
+        let mut st = st_with(&[], "");
+        st.selected = 5;
+        st.page_down(10, 30);
+        assert_eq!(st.selected, 15);
+    }
+
+    #[test]
+    fn page_down_clamps_at_last_match() {
+        let mut st = st_with(&[], "");
+        st.selected = 5;
+        st.page_down(20, 10);
+        assert_eq!(st.selected, 9);
+    }
+
+    #[test]
+    fn page_down_on_empty_matches_stays_at_zero() {
+        let mut st = st_with(&[], "");
+        st.selected = 0;
+        st.page_down(10, 0);
+        assert_eq!(st.selected, 0);
+    }
+
+    #[test]
+    fn page_up_jumps_by_page_size() {
+        let mut st = st_with(&[], "");
+        st.selected = 25;
+        st.page_up(10);
+        assert_eq!(st.selected, 15);
+    }
+
+    #[test]
+    fn page_up_clamps_at_top() {
+        let mut st = st_with(&[], "");
+        st.selected = 3;
+        st.page_up(10);
+        assert_eq!(st.selected, 0);
+    }
+
+    #[test]
+    fn to_top_goes_to_first_match() {
+        let mut st = st_with(&[], "");
+        st.selected = 7;
+        st.to_top();
+        assert_eq!(st.selected, 0);
+    }
+
+    #[test]
+    fn to_bottom_goes_to_last_match() {
+        let mut st = st_with(&[], "");
+        st.selected = 0;
+        st.to_bottom(10);
+        assert_eq!(st.selected, 9);
+    }
+
+    #[test]
+    fn to_bottom_on_empty_matches_stays_at_zero() {
+        let mut st = st_with(&[], "");
+        st.selected = 0;
+        st.to_bottom(0);
+        assert_eq!(st.selected, 0);
     }
 
     #[test]

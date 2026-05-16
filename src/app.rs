@@ -706,6 +706,20 @@ fn handle_file_picker(app: &App, st: &mut AppState, ev: crossterm::event::KeyEve
         KeyCode::Up => {
             picker.selected = picker.selected.saturating_sub(1);
         }
+        KeyCode::PageDown => {
+            let n = picker.matches().len();
+            picker.page_down(10, n);
+        }
+        KeyCode::PageUp => {
+            picker.page_up(10);
+        }
+        KeyCode::Home => {
+            picker.to_top();
+        }
+        KeyCode::End => {
+            let n = picker.matches().len();
+            picker.to_bottom(n);
+        }
         KeyCode::Backspace => {
             picker.query.pop();
             picker.selected = 0;
@@ -786,6 +800,10 @@ fn handle_commits_modal(st: &mut AppState, ev: crossterm::event::KeyEvent) {
         }
         KeyCode::Down | KeyCode::Char('j') => modal.move_down(),
         KeyCode::Up | KeyCode::Char('k') => modal.move_up(),
+        KeyCode::PageDown => modal.page_down(10),
+        KeyCode::PageUp => modal.page_up(10),
+        KeyCode::Home => modal.to_top(),
+        KeyCode::End => modal.to_bottom(),
         _ => {}
     }
 }

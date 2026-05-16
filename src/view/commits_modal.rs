@@ -43,6 +43,23 @@ impl CommitsModalState {
     pub fn move_up(&mut self) {
         self.selected = self.selected.saturating_sub(1);
     }
+
+    pub fn page_down(&mut self, page: usize) {
+        let last = self.rows.len().saturating_sub(1);
+        self.selected = (self.selected + page).min(last);
+    }
+
+    pub fn page_up(&mut self, page: usize) {
+        self.selected = self.selected.saturating_sub(page);
+    }
+
+    pub fn to_top(&mut self) {
+        self.selected = 0;
+    }
+
+    pub fn to_bottom(&mut self) {
+        self.selected = self.rows.len().saturating_sub(1);
+    }
 }
 
 /// Centered ~60% × 60% overlay listing the PR's commits, one per row.
@@ -236,6 +253,73 @@ mod tests {
             selected: 0,
         };
         st.move_up();
+        assert_eq!(st.selected, 0);
+    }
+
+    #[test]
+    fn page_down_jumps_by_page_size() {
+        let mut st = CommitsModalState {
+            rows: (0..30).map(|_| dummy_row()).collect(),
+            selected: 5,
+        };
+        st.page_down(10);
+        assert_eq!(st.selected, 15);
+    }
+
+    #[test]
+    fn page_down_clamps_at_bottom() {
+        let mut st = CommitsModalState {
+            rows: (0..10).map(|_| dummy_row()).collect(),
+            selected: 5,
+        };
+        st.page_down(20);
+        assert_eq!(st.selected, 9);
+    }
+
+    #[test]
+    fn page_up_jumps_by_page_size() {
+        let mut st = CommitsModalState {
+            rows: (0..30).map(|_| dummy_row()).collect(),
+            selected: 25,
+        };
+        st.page_up(10);
+        assert_eq!(st.selected, 15);
+    }
+
+    #[test]
+    fn page_up_clamps_at_top() {
+        let mut st = CommitsModalState {
+            rows: (0..30).map(|_| dummy_row()).collect(),
+            selected: 3,
+        };
+        st.page_up(10);
+        assert_eq!(st.selected, 0);
+    }
+
+    #[test]
+    fn to_top_goes_to_first_row() {
+        let mut st = CommitsModalState {
+            rows: (0..10).map(|_| dummy_row()).collect(),
+            selected: 7,
+        };
+        st.to_top();
+        assert_eq!(st.selected, 0);
+    }
+
+    #[test]
+    fn to_bottom_goes_to_last_row() {
+        let mut st = CommitsModalState {
+            rows: (0..10).map(|_| dummy_row()).collect(),
+            selected: 2,
+        };
+        st.to_bottom();
+        assert_eq!(st.selected, 9);
+    }
+
+    #[test]
+    fn to_bottom_on_empty_stays_at_zero() {
+        let mut st = CommitsModalState { rows: vec![], selected: 0 };
+        st.to_bottom();
         assert_eq!(st.selected, 0);
     }
 
