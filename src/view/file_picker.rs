@@ -16,6 +16,20 @@ pub struct FilePickerState {
 }
 
 impl FilePickerState {
+    pub fn new(all_files: Vec<String>, current: Option<&str>) -> Self {
+        let mut st = Self {
+            query: String::new(),
+            all_files,
+            selected: 0,
+        };
+        if let Some(path) = current
+            && let Some(idx) = st.matches().iter().position(|p| p.as_str() == path)
+        {
+            st.selected = idx;
+        }
+        st
+    }
+
     pub fn page_down(&mut self, page: usize, match_count: usize) {
         let last = match_count.saturating_sub(1);
         self.selected = (self.selected + page).min(last);
@@ -131,6 +145,31 @@ mod tests {
             all_files: files.iter().map(|s| s.to_string()).collect(),
             selected: 0,
         }
+    }
+
+    #[test]
+    fn new_selects_current_file_in_sorted_matches() {
+        let files: Vec<String> = ["src/main.rs", "src/lib.rs", "README.md"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let st = FilePickerState::new(files, Some("src/main.rs"));
+        // Sorted matches order is alphabetical: README.md, src/lib.rs, src/main.rs.
+        assert_eq!(st.selected, 2);
+    }
+
+    #[test]
+    fn new_without_current_file_starts_at_zero() {
+        let files: Vec<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
+        let st = FilePickerState::new(files, None);
+        assert_eq!(st.selected, 0);
+    }
+
+    #[test]
+    fn new_with_unknown_current_file_starts_at_zero() {
+        let files: Vec<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
+        let st = FilePickerState::new(files, Some("nope"));
+        assert_eq!(st.selected, 0);
     }
 
     #[test]

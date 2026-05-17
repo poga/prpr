@@ -511,14 +511,12 @@ fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) 
         Action::NextFile => cycle_file(app, st, 1),
         Action::PrevFile => cycle_file(app, st, -1),
         Action::OpenFilePicker => {
-            if let (Some(num), Some(_)) = (st.current_pr, st.review.as_ref())
+            if let (Some(num), Some(r)) = (st.current_pr, st.review.as_ref())
                 && let Some(pkg) = app.cache.get(num)
             {
-                st.picker = Some(FilePickerState {
-                    query: String::new(),
-                    all_files: pkg.files.iter().map(|f| f.path.clone()).collect(),
-                    selected: 0,
-                });
+                let paths: Vec<String> = pkg.files.iter().map(|f| f.path.clone()).collect();
+                let current = pkg.files.get(r.file_index).map(|f| f.path.as_str());
+                st.picker = Some(FilePickerState::new(paths, current));
                 st.focused = FocusedView::FilePicker;
             }
         }
