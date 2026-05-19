@@ -38,11 +38,39 @@ pub enum Request {
     Merge { number: u32, method: String },
 }
 
+/// Pipeline stage emitted by the worker while servicing `RefreshList`.
+/// Lets the UI replace the generic "loading PRs…" indicator with the
+/// step that's currently running, so a slow `gh` or `git fetch` never
+/// looks like a hang.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListStage {
+    /// `gh pr list` is running.
+    FetchingList,
+    /// `git fetch` for open-PR head refs is running.
+    FetchingRefs,
+}
+
+impl ListStage {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::FetchingList => "fetching PR list (gh)",
+            Self::FetchingRefs => "fetching branches (git)",
+        }
+    }
+}
+
 // PrPackage-derived variants are larger than the others. The channel
 // is low-volume per cycle so the size disparity isn't worth boxing for.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum Response {
+    /// Emitted before each blocking step of `RefreshList` so the UI can
+    /// show what's running. Carries the same `generation` as the
+    /// terminal `ListFast` event so stale-cycle updates can be dropped.
+    ListProgress {
+        generation: u32,
+        stage: ListStage,
+    },
     ListFast {
         generation: u32,
         result: anyhow::Result<Vec<crate::data::pr::Pr>>,
@@ -161,6 +189,10 @@ fn run_worker(
                     });
                 });
 
+                let _ = res_tx.send(Response::ListProgress {
+                    generation,
+                    stage: ListStage::FetchingList,
+                });
                 let combined = match gh.list_prs_fast(&repo_root) {
                     Err(e) => Err(e),
                     Ok(prs) => {
@@ -169,6 +201,10 @@ fn run_worker(
                             .filter(|p| p.state == crate::data::pr::PrState::Open)
                             .map(|p| p.number)
                             .collect();
+                        let _ = res_tx.send(Response::ListProgress {
+                            generation,
+                            stage: ListStage::FetchingRefs,
+                        });
                         match git.fetch_pr_refs(&repo_root, &open) {
                             Ok(()) => Ok(prs),
                             Err(e) => Err(anyhow::anyhow!("fetching open PR refs: {e:#}")),
@@ -519,6 +555,56 @@ mod tests {
     }
 
     #[test]
+    fn refresh_emits_progress_stages_before_list_fast() {
+        use crate::data::pr::{Author, Pr, PrState};
+
+        let mut gh = FakeGh::new();
+        gh.prs_fast = vec![Pr {
+            number: 1,
+            title: "t".into(),
+            is_draft: false,
+            state: PrState::Open,
+            author: Author { login: "a".into() },
+            created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            updated_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            base_ref_name: "main".into(),
+            head_ref_name: "feature".into(),
+            labels: vec![],
+            status_check_rollup: vec![],
+            review_decision: None,
+            mergeable: None,
+        }];
+        let git = FakeGit::new("/tmp/repo");
+        let worker = Worker::spawn("/tmp/repo".into(), Arc::new(gh), Arc::new(git), 7);
+
+        worker.send(Request::RefreshList { generation: 9 });
+
+        // Collect every progress stage observed before ListFast lands.
+        // ListEnriched runs on a detached thread so it may interleave —
+        // ignore it here.
+        let mut stages: Vec<ListStage> = vec![];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let resp = worker
+                .rx
+                .recv_timeout(std::time::Duration::from_millis(500))
+                .expect("worker stalled");
+            match resp {
+                Response::ListProgress { generation: 9, stage } => stages.push(stage),
+                Response::ListFast { generation: 9, .. } => break,
+                Response::ListEnriched { .. } => {}
+                other => panic!("unexpected response: {other:?}"),
+            }
+            assert!(std::time::Instant::now() < deadline, "ListFast never arrived");
+        }
+        assert_eq!(
+            stages,
+            vec![ListStage::FetchingList, ListStage::FetchingRefs],
+            "expected fetch-list → fetch-refs in order before ListFast"
+        );
+    }
+
+    #[test]
     fn worker_emits_list_fast_then_enriched_with_matching_gen() {
         use crate::data::pr::{Author, Label, Pr, PrEnrichment, PrState, StatusCheck};
 
@@ -552,23 +638,37 @@ mod tests {
 
         worker.send(Request::RefreshList { generation: 42 });
 
-        let resp1 = worker.rx.recv().unwrap();
-        match resp1 {
-            Response::ListFast { generation: 42, result: Ok(prs) } => {
-                assert_eq!(prs.len(), 1);
-                assert_eq!(prs[0].number, 7);
+        // `ListEnriched` is fired on a detached thread so it can land
+        // anywhere in the stream; `ListProgress` events are emitted
+        // before `ListFast`. Track both terminal events and skip the
+        // progress noise.
+        let mut got_fast = false;
+        let mut got_enriched = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !(got_fast && got_enriched) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for ListFast + ListEnriched (got_fast={got_fast}, got_enriched={got_enriched})"
+            );
+            let resp = worker
+                .rx
+                .recv_timeout(std::time::Duration::from_millis(500))
+                .expect("worker channel closed unexpectedly");
+            match resp {
+                Response::ListProgress { generation: 42, .. } => {}
+                Response::ListFast { generation: 42, result: Ok(prs) } => {
+                    assert_eq!(prs.len(), 1);
+                    assert_eq!(prs[0].number, 7);
+                    got_fast = true;
+                }
+                Response::ListEnriched { generation: 42, result: Ok(e) } => {
+                    assert_eq!(e.len(), 1);
+                    assert_eq!(e[0].number, 7);
+                    assert_eq!(e[0].status_check_rollup.len(), 1);
+                    got_enriched = true;
+                }
+                other => panic!("unexpected response on generation 42: {other:?}"),
             }
-            other => panic!("expected ListFast{{generation:42}}, got {:?}", other),
-        }
-
-        let resp2 = worker.rx.recv().unwrap();
-        match resp2 {
-            Response::ListEnriched { generation: 42, result: Ok(e) } => {
-                assert_eq!(e.len(), 1);
-                assert_eq!(e[0].number, 7);
-                assert_eq!(e[0].status_check_rollup.len(), 1);
-            }
-            other => panic!("expected ListEnriched{{generation:42}}, got {:?}", other),
         }
     }
 }

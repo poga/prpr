@@ -128,6 +128,7 @@ impl AppState {
                 status: String::new(),
                 loading: false,
                 enriching: false,
+                loading_stage: None,
             },
             review: None,
             current_pr: None,
@@ -183,6 +184,10 @@ fn send_refresh(app: &App, st: &mut AppState, silent: bool) {
     if !silent {
         st.list.loading = true;
     }
+    // Seed the stage so the very first frame after a manual `r` already
+    // shows what step is running. The worker's own ListProgress arrives a
+    // moment later and may overwrite this — that's fine.
+    st.list.loading_stage = Some(crate::data::worker::ListStage::FetchingList);
     st.list_gen = st.list_gen.wrapping_add(1);
     let g = st.list_gen;
     app.request(Request::RefreshList { generation: g });
@@ -230,6 +235,10 @@ pub fn run(term: &mut Term, app: &mut App, st: &mut AppState) -> Result<()> {
 
 fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
     match resp {
+        Response::ListProgress { generation, stage } if generation == st.list_gen => {
+            st.list.loading_stage = Some(stage);
+        }
+        Response::ListProgress { .. } => { /* stale; drop */ }
         Response::ListFast { generation, result } if generation == st.list_gen => match result {
             Ok(prs) => {
                 let prev_selected = st
@@ -241,6 +250,7 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
                 app.cache.set_list(prs);
                 st.list.loading = false;
                 st.list.enriching = true;
+                st.list.loading_stage = None;
                 st.list.status = String::new();
                 let new_numbers: Vec<u32> = st
                     .list
@@ -255,6 +265,7 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
                 st.list_refresh_in_flight = false;
                 st.list.enriching = false;
                 st.list.loading = false;
+                st.list.loading_stage = None;
                 st.list.status = format!("refresh failed: {e}");
             }
         },
@@ -262,6 +273,7 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
         Response::ListEnriched { generation, result } if generation == st.list_gen => {
             st.list_refresh_in_flight = false;
             st.list.enriching = false;
+            st.list.loading_stage = None;
             if let Ok(es) = result {
                 for e in &es {
                     if let Some(p) =
@@ -1099,6 +1111,90 @@ mod tests {
         let mut app = App::new("/tmp/repo".into(), gh, git, Config::default());
         std::mem::swap(&mut app.cache, cache);
         app
+    }
+
+    #[test]
+    fn list_progress_updates_stage_then_clears_on_list_fast() {
+        use crate::data::worker::ListStage;
+
+        let mut st = dummy_app_state();
+        let mut cache = Cache::new();
+        let mut app = test_app_for_state(&mut cache);
+        st.list_gen = 3;
+        // Worker reports the first stage.
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::ListProgress {
+                generation: 3,
+                stage: ListStage::FetchingList,
+            },
+        );
+        assert_eq!(st.list.loading_stage, Some(ListStage::FetchingList));
+        // Then the second stage replaces it.
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::ListProgress {
+                generation: 3,
+                stage: ListStage::FetchingRefs,
+            },
+        );
+        assert_eq!(st.list.loading_stage, Some(ListStage::FetchingRefs));
+        // ListFast clears the stage so the body can render rows.
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::ListFast {
+                generation: 3,
+                result: Ok(vec![]),
+            },
+        );
+        assert_eq!(st.list.loading_stage, None);
+    }
+
+    #[test]
+    fn stale_list_progress_is_dropped() {
+        use crate::data::worker::ListStage;
+
+        let mut st = dummy_app_state();
+        let mut cache = Cache::new();
+        let mut app = test_app_for_state(&mut cache);
+        st.list_gen = 5;
+        st.list.loading_stage = Some(ListStage::FetchingList);
+        // A leftover progress event from an older cycle must not stomp on
+        // the current cycle's stage.
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::ListProgress {
+                generation: 1,
+                stage: ListStage::FetchingRefs,
+            },
+        );
+        assert_eq!(st.list.loading_stage, Some(ListStage::FetchingList));
+    }
+
+    #[test]
+    fn list_fast_error_clears_stage() {
+        use crate::data::worker::ListStage;
+
+        let mut st = dummy_app_state();
+        let mut cache = Cache::new();
+        let mut app = test_app_for_state(&mut cache);
+        st.list_gen = 2;
+        st.list.loading = true;
+        st.list.loading_stage = Some(ListStage::FetchingRefs);
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::ListFast {
+                generation: 2,
+                result: Err(anyhow::anyhow!("boom")),
+            },
+        );
+        assert_eq!(st.list.loading_stage, None);
+        assert!(st.list.status.starts_with("refresh failed"));
     }
 
     #[test]

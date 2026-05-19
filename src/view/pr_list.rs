@@ -8,6 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::data::pr::{CiState, Pr, PrState, ReviewDecision};
+use crate::data::worker::ListStage;
 use crate::render::spinner;
 use crate::render::style::*;
 
@@ -26,6 +27,10 @@ pub struct PrListState {
     /// True between `ListFast` and `ListEnriched` arrivals. Footer shows
     /// `enriching…` so background work is never silent.
     pub enriching: bool,
+    /// Most-recent pipeline stage reported by the worker during a refresh.
+    /// Renderer prefers this label over the generic "loading PRs…" so the
+    /// user sees whether `gh` or `git fetch` is the slow step.
+    pub loading_stage: Option<ListStage>,
 }
 
 impl PrListState {
@@ -79,8 +84,12 @@ fn render_rows(f: &mut Frame, area: Rect, st: &PrListState, now: DateTime<Utc>) 
     // keep the existing rows visible and let the footer carry the spinner —
     // otherwise the user loses their place every time they press `r`.
     if st.loading && st.prs.is_empty() {
+        let body = st
+            .loading_stage
+            .map(|s| s.label())
+            .unwrap_or("loading PRs");
         f.render_widget(
-            Paragraph::new(format!("{} loading PRs…", spinner::glyph()))
+            Paragraph::new(format!("{} {body}…", spinner::glyph()))
                 .style(Style::default().fg(OVERLAY1))
                 .alignment(ratatui::layout::Alignment::Center),
             area,
@@ -122,8 +131,12 @@ fn render_footer(f: &mut Frame, area: Rect, st: &PrListState) {
     } else if st.loading {
         // Refresh in flight while the list is still showing prior rows —
         // keep the spinner visible so background work is never silent.
+        let label = st
+            .loading_stage
+            .map(|s| s.label())
+            .unwrap_or("refreshing");
         f.render_widget(
-            Paragraph::new(format!("  {} refreshing…", spinner::glyph()))
+            Paragraph::new(format!("  {} {label}…", spinner::glyph()))
                 .style(Style::default().fg(OVERLAY1)),
             chunks[1],
         );
@@ -269,6 +282,7 @@ mod tests {
             search: None,
             loading: false,
             enriching: false,
+            loading_stage: None,
             status: String::new(),
         }
     }
@@ -317,6 +331,56 @@ mod tests {
         let buf = term.backend().buffer();
         let bottom = buffer_line(buf, 9);
         assert!(bottom.contains("enriching"), "footer was: {bottom:?}");
+    }
+
+    #[test]
+    fn cold_load_body_shows_current_stage_label() {
+        let mut st = fixture_state();
+        st.prs.clear();
+        st.loading = true;
+        st.loading_stage = Some(ListStage::FetchingRefs);
+        let mut term = Terminal::new(TestBackend::new(80, 10)).unwrap();
+        let now: DateTime<Utc> = "2026-05-06T00:00:00Z".parse().unwrap();
+        term.draw(|f| {
+            let area = f.area();
+            render(f, area, &st, now)
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        // Body is centered around row 5 in an 80x10 area; just scan all rows.
+        let all: String = (0..buf.area.height)
+            .map(|y| buffer_line(buf, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            all.contains("fetching branches (git)"),
+            "body should show the FetchingRefs label; got:\n{all}"
+        );
+    }
+
+    #[test]
+    fn refresh_footer_shows_current_stage_label() {
+        let mut st = fixture_state();
+        st.loading = true;
+        st.loading_stage = Some(ListStage::FetchingList);
+        let mut term = Terminal::new(TestBackend::new(80, 10)).unwrap();
+        let now: DateTime<Utc> = "2026-05-06T00:00:00Z".parse().unwrap();
+        term.draw(|f| {
+            let area = f.area();
+            render(f, area, &st, now)
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let bottom = buffer_line(buf, 9);
+        assert!(
+            bottom.contains("fetching PR list (gh)"),
+            "footer should show the FetchingList label; got: {bottom:?}"
+        );
+        // Generic "refreshing…" must not appear when a stage is known.
+        assert!(
+            !bottom.contains("refreshing"),
+            "footer should not fall back to generic refreshing; got: {bottom:?}"
+        );
     }
 
     #[test]
