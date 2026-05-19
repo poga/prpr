@@ -565,8 +565,8 @@ fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) 
             if let (Some(num), Some(r)) = (st.current_pr, st.review.as_ref())
                 && let Some(pkg) = app.cache.get(num)
             {
-                let paths: Vec<String> = pkg.files.iter().map(|f| f.path.clone()).collect();
-                let current = pkg.files.get(r.file_index).map(|f| f.path.as_str());
+                let paths: Vec<String> = pkg.file_paths().into_iter().map(String::from).collect();
+                let current = pkg.file_paths().get(r.file_index).copied();
                 st.picker = Some(FilePickerState::new(paths, current));
                 st.focused = FocusedView::FilePicker;
             }
@@ -681,7 +681,7 @@ fn cycle_file(app: &App, st: &mut AppState, delta: i32) {
     let Some(pkg) = app.cache.get(num) else {
         return;
     };
-    let n = pkg.files.len() as i32;
+    let n = pkg.file_count() as i32;
     if n == 0 {
         return;
     }
@@ -736,12 +736,13 @@ fn handle_file_picker(app: &App, st: &mut AppState, ev: crossterm::event::KeyEve
             let chosen = picker.matches().get(picker.selected).map(|s| (*s).clone());
             if let (Some(path), Some(num)) = (chosen, st.current_pr)
                 && let Some(pkg) = app.cache.get(num)
-                && let Some(idx) = pkg.files.iter().position(|f| f.path == path)
-                && let Some(r) = st.review.as_mut()
             {
-                r.file_index = idx;
-                r.cursor_line = 0;
-                r.scroll = 0;
+                let idx = pkg.file_paths().iter().position(|p| *p == path.as_str());
+                if let (Some(idx), Some(r)) = (idx, st.review.as_mut()) {
+                    r.file_index = idx;
+                    r.cursor_line = 0;
+                    r.scroll = 0;
+                }
             }
             st.picker = None;
             st.focused = FocusedView::Review;
@@ -864,6 +865,57 @@ mod tests {
     use crate::data::cache::Cache;
     use crate::data::pr::{Author, Pr, PrEnrichment, PrState, StatusCheck};
     use crate::data::worker::Response;
+
+    #[test]
+    fn cycle_file_uses_detail_files_count_when_files_empty() {
+        let mut st = dummy_app_state();
+        let mut cache = Cache::new();
+        let json = include_str!("../../../../tests/fixtures/pr_view.json");
+        let detail: crate::data::pr::PrDetail = serde_json::from_str(json).unwrap();
+        let n_detail_files = detail.files.len();
+        let number = detail.number;
+        cache.insert_partial(detail);
+        let mut app = test_app_for_state(&mut cache);
+        st.current_pr = Some(number);
+        st.review = Some(PrReviewState {
+            file_index: 0,
+            cursor_line: 0,
+            scroll: 0,
+            show_sha_margin: false,
+            status: String::new(),
+        });
+
+        cycle_file(&app, &mut st, 1);
+        assert_eq!(st.review.as_ref().unwrap().file_index, 1 % n_detail_files);
+
+        // Wrap to last.
+        cycle_file(&app, &mut st, -2);
+        let expected = ((1i32 - 2).rem_euclid(n_detail_files as i32)) as usize;
+        assert_eq!(st.review.as_ref().unwrap().file_index, expected);
+    }
+
+    #[test]
+    fn move_review_is_noop_when_pkg_files_empty() {
+        let mut st = dummy_app_state();
+        let mut cache = Cache::new();
+        let json = include_str!("../../../../tests/fixtures/pr_view.json");
+        let detail: crate::data::pr::PrDetail = serde_json::from_str(json).unwrap();
+        let number = detail.number;
+        cache.insert_partial(detail);
+        let mut app = test_app_for_state(&mut cache);
+        st.current_pr = Some(number);
+        st.review = Some(PrReviewState {
+            file_index: 0,
+            cursor_line: 0,
+            scroll: 0,
+            show_sha_margin: false,
+            status: String::new(),
+        });
+        move_review(&app, &mut st, 10);
+        let r = st.review.as_ref().unwrap();
+        assert_eq!(r.cursor_line, 0);
+        assert_eq!(r.scroll, 0);
+    }
 
     fn dummy_app_state() -> AppState {
         AppState::new("repo".into(), "main".into())
