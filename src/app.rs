@@ -34,7 +34,7 @@ use crate::view::merge_modal::{MergeMethod, MergeModalState, MergingState};
 use crate::view::pr_list::PrListState;
 use crate::view::pr_review::PrReviewState;
 
-const AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+const AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
 fn should_auto_refresh(
     focused: FocusedView,
