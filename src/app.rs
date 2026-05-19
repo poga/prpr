@@ -178,7 +178,7 @@ fn send_refresh(app: &App, st: &mut AppState, silent: bool) {
     if !silent {
         st.list.loading = true;
     }
-    app.request(Request::RefreshList { r#gen: 0 });
+    app.request(Request::RefreshList { generation: 0 });
 }
 
 pub fn run(term: &mut Term, app: &mut App, st: &mut AppState) -> Result<()> {
@@ -223,7 +223,7 @@ pub fn run(term: &mut Term, app: &mut App, st: &mut AppState) -> Result<()> {
 
 fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
     match resp {
-        Response::ListFast { r#gen: _, result: Ok(prs) } => {
+        Response::ListFast { generation: _, result: Ok(prs) } => {
             st.list_refresh_in_flight = false;
             let prev_selected = st
                 .list
@@ -243,12 +243,12 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
             st.list.selected =
                 reselect_by_number(prev_selected, &new_numbers, st.list.selected);
         }
-        Response::ListFast { r#gen: _, result: Err(e) } => {
+        Response::ListFast { generation: _, result: Err(e) } => {
             st.list_refresh_in_flight = false;
             st.list.loading = false;
             st.list.status = format!("refresh failed: {e}");
         }
-        Response::ListEnriched { r#gen: _, result: Ok(es) } => {
+        Response::ListEnriched { generation: _, result: Ok(es) } => {
             // Merge by number. Selection is preserved because rows are
             // mutated, not replaced.
             for e in &es {
@@ -257,7 +257,7 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
                 }
             }
         }
-        Response::ListEnriched { r#gen: _, result: Err(_) } => {
+        Response::ListEnriched { generation: _, result: Err(_) } => {
             // Enrichment failure is non-fatal: rows already render with
             // light-fields-only glyphs. Keep silent for now; Task 5 may
             // surface this if we decide it's user-visible.

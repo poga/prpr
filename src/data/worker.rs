@@ -28,9 +28,9 @@ use crate::render::attribution::{CommitStats, LineColors, attribute_file, commit
 
 #[derive(Debug)]
 pub enum Request {
-    /// Refresh the PR list. `gen` is echoed in both responses so the UI
+    /// Refresh the PR list. `generation` is echoed in both responses so the UI
     /// can drop stale results from a superseded refresh cycle.
-    RefreshList { r#gen: u32 },
+    RefreshList { generation: u32 },
     /// Build the streaming PR data set for one PR.
     LoadPr(u32),
     /// Run `gh pr merge <number> --<method>`.
@@ -43,11 +43,11 @@ pub enum Request {
 #[derive(Debug)]
 pub enum Response {
     ListFast {
-        r#gen: u32,
+        generation: u32,
         result: anyhow::Result<Vec<crate::data::pr::Pr>>,
     },
     ListEnriched {
-        r#gen: u32,
+        generation: u32,
         result: anyhow::Result<Vec<crate::data::pr::PrEnrichment>>,
     },
     /// Granular PR-load events (see worker pipeline).
@@ -138,10 +138,10 @@ fn run_worker(
 ) {
     while let Ok(req) = req_rx.recv() {
         match req {
-            Request::RefreshList { r#gen } => {
+            Request::RefreshList { generation } => {
                 let fast = gh.list_prs_fast(&repo_root);
                 if res_tx
-                    .send(Response::ListFast { r#gen, result: fast })
+                    .send(Response::ListFast { generation, result: fast })
                     .is_err()
                 {
                     break;
@@ -149,7 +149,7 @@ fn run_worker(
                 let enriched = gh.list_prs_enriched(&repo_root);
                 if res_tx
                     .send(Response::ListEnriched {
-                        r#gen,
+                        generation,
                         result: enriched,
                     })
                     .is_err()
@@ -439,25 +439,25 @@ mod tests {
         let git = FakeGit::new("/tmp/repo");
         let worker = Worker::spawn("/tmp/repo".into(), Arc::new(gh), Arc::new(git), 7);
 
-        worker.send(Request::RefreshList { r#gen: 42 });
+        worker.send(Request::RefreshList { generation: 42 });
 
         let resp1 = worker.rx.recv().unwrap();
         match resp1 {
-            Response::ListFast { r#gen: 42, result: Ok(prs) } => {
+            Response::ListFast { generation: 42, result: Ok(prs) } => {
                 assert_eq!(prs.len(), 1);
                 assert_eq!(prs[0].number, 7);
             }
-            other => panic!("expected ListFast{{gen:42}}, got {:?}", other),
+            other => panic!("expected ListFast{{generation:42}}, got {:?}", other),
         }
 
         let resp2 = worker.rx.recv().unwrap();
         match resp2 {
-            Response::ListEnriched { r#gen: 42, result: Ok(e) } => {
+            Response::ListEnriched { generation: 42, result: Ok(e) } => {
                 assert_eq!(e.len(), 1);
                 assert_eq!(e[0].number, 7);
                 assert_eq!(e[0].status_check_rollup.len(), 1);
             }
-            other => panic!("expected ListEnriched{{gen:42}}, got {:?}", other),
+            other => panic!("expected ListEnriched{{generation:42}}, got {:?}", other),
         }
     }
 }
