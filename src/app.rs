@@ -965,6 +965,37 @@ mod tests {
     }
 
     #[test]
+    fn stale_list_enriched_is_dropped() {
+        let mut st = dummy_app_state();
+        let mut cache = Cache::new();
+        let mut app = test_app_for_state(&mut cache);
+        st.list_gen = 5;
+        st.list_refresh_in_flight = true;
+        st.list.enriching = true;
+        // Seed a row so we'd notice if enrichment was applied.
+        st.list.prs = vec![open_pr(7)];
+        let stale = Response::ListEnriched {
+            generation: 1,
+            result: Ok(vec![PrEnrichment {
+                number: 7,
+                status_check_rollup: vec![StatusCheck {
+                    status: Some("COMPLETED".into()),
+                    conclusion: Some("FAILURE".into()),
+                }],
+                review_decision: None,
+                mergeable: Some("CONFLICTING".into()),
+            }]),
+        };
+        handle_response(&mut app, &mut st, stale);
+        // Row not enriched (stale generation dropped).
+        assert!(st.list.prs[0].status_check_rollup.is_empty());
+        assert!(st.list.prs[0].mergeable.is_none());
+        // In-flight flags not cleared either.
+        assert!(st.list_refresh_in_flight);
+        assert!(st.list.enriching);
+    }
+
+    #[test]
     fn enrichment_merges_by_number() {
         let mut st = dummy_app_state();
         let mut cache = Cache::new();

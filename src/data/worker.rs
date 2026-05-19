@@ -307,9 +307,8 @@ fn run_load(
     });
 }
 
-/// Blame + log-patches for one file. Mirrors the inner loop of the old
-/// `parallel_per_file` worker. Returns the file's `LineColors` and its
-/// per-commit `CommitStats` contribution.
+/// Blame + log-patches for one file. Returns the file's `LineColors`
+/// and its per-commit `CommitStats` contribution.
 fn blame_file(
     git: &dyn GitClient,
     repo_root: &Path,
