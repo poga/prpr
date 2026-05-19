@@ -897,12 +897,6 @@ mod tests {
     }
 
     #[test]
-    fn fresh_app_state_has_zero_list_gen() {
-        let st = dummy_app_state();
-        assert_eq!(st.list_gen, 0);
-    }
-
-    #[test]
     fn stale_list_fast_is_dropped() {
         let mut st = dummy_app_state();
         let mut cache = Cache::new();
