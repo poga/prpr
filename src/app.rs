@@ -594,7 +594,11 @@ fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) 
                     app.config.window_size,
                     Utc::now(),
                 );
-                st.commits = Some(CommitsModalState { rows, selected: 0 });
+                st.commits = Some(CommitsModalState {
+                    rows,
+                    selected: 0,
+                    ..Default::default()
+                });
                 st.focused = FocusedView::CommitsModal;
             }
         }
@@ -727,15 +731,16 @@ fn handle_mouse(app: &mut App, st: &mut AppState, ev: crossterm::event::MouseEve
 }
 
 fn handle_file_picker(app: &App, st: &mut AppState, ev: crossterm::event::KeyEvent) {
-    use crossterm::event::KeyCode;
+    use crossterm::event::{KeyCode, KeyModifiers};
     let Some(picker) = st.picker.as_mut() else {
         return;
     };
+
+    // Keys that work the same in vim mode and filter mode: directional keys
+    // and confirm/quit on Enter. We handle those first so the per-mode
+    // branches don't have to repeat them.
+    let n = picker.matches().len();
     match ev.code {
-        KeyCode::Esc => {
-            st.picker = None;
-            st.focused = FocusedView::Review;
-        }
         KeyCode::Enter => {
             let chosen = picker.matches().get(picker.selected).map(|s| (*s).clone());
             if let (Some(path), Some(num)) = (chosen, st.current_pr)
@@ -750,39 +755,96 @@ fn handle_file_picker(app: &App, st: &mut AppState, ev: crossterm::event::KeyEve
             }
             st.picker = None;
             st.focused = FocusedView::Review;
+            return;
         }
         KeyCode::Down => {
-            let n = picker.matches().len();
-            if picker.selected + 1 < n {
-                picker.selected += 1;
-            }
+            picker.move_down(n);
+            picker.pending_g = false;
+            return;
         }
         KeyCode::Up => {
-            picker.selected = picker.selected.saturating_sub(1);
+            picker.move_up();
+            picker.pending_g = false;
+            return;
         }
         KeyCode::PageDown => {
-            let n = picker.matches().len();
             picker.page_down(10, n);
+            picker.pending_g = false;
+            return;
         }
         KeyCode::PageUp => {
             picker.page_up(10);
+            picker.pending_g = false;
+            return;
         }
         KeyCode::Home => {
             picker.to_top();
+            picker.pending_g = false;
+            return;
         }
         KeyCode::End => {
-            let n = picker.matches().len();
             picker.to_bottom(n);
+            picker.pending_g = false;
+            return;
         }
-        KeyCode::Backspace => {
-            picker.query.pop();
-            picker.selected = 0;
-        }
-        KeyCode::Char(c) => {
-            picker.query.push(c);
-            picker.selected = 0;
+        KeyCode::Char('d') | KeyCode::Char('u') if ev.modifiers.contains(KeyModifiers::CONTROL) => {
+            if ev.code == KeyCode::Char('d') {
+                picker.page_down(10, n);
+            } else {
+                picker.page_up(10);
+            }
+            picker.pending_g = false;
+            return;
         }
         _ => {}
+    }
+
+    if picker.filter_active {
+        match ev.code {
+            KeyCode::Esc => picker.exit_filter_reset(),
+            KeyCode::Backspace => {
+                picker.query.pop();
+                picker.selected = 0;
+            }
+            KeyCode::Char(c) => {
+                picker.query.push(c);
+                picker.selected = 0;
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    // Vim navigation mode.
+    match ev.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            st.picker = None;
+            st.focused = FocusedView::Review;
+        }
+        KeyCode::Char('/') => picker.enter_filter(),
+        KeyCode::Char('j') => {
+            picker.move_down(n);
+            picker.pending_g = false;
+        }
+        KeyCode::Char('k') => {
+            picker.move_up();
+            picker.pending_g = false;
+        }
+        KeyCode::Char('G') => {
+            picker.to_bottom(n);
+            picker.pending_g = false;
+        }
+        KeyCode::Char('g') => {
+            if picker.pending_g {
+                picker.to_top();
+                picker.pending_g = false;
+            } else {
+                picker.pending_g = true;
+            }
+        }
+        _ => {
+            picker.pending_g = false;
+        }
     }
 }
 
@@ -847,18 +909,103 @@ fn handle_commits_modal(st: &mut AppState, ev: crossterm::event::KeyEvent) {
     let Some(modal) = st.commits.as_mut() else {
         return;
     };
+
+    let n = modal.matches().len();
+    // Keys shared by both modes: directional input and Enter-as-close.
     match ev.code {
-        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('c') | KeyCode::Char('C') => {
+        KeyCode::Enter => {
+            st.commits = None;
+            st.focused = FocusedView::Review;
+            return;
+        }
+        KeyCode::Down => {
+            modal.move_down(n);
+            modal.pending_g = false;
+            return;
+        }
+        KeyCode::Up => {
+            modal.move_up();
+            modal.pending_g = false;
+            return;
+        }
+        KeyCode::PageDown => {
+            modal.page_down(10, n);
+            modal.pending_g = false;
+            return;
+        }
+        KeyCode::PageUp => {
+            modal.page_up(10);
+            modal.pending_g = false;
+            return;
+        }
+        KeyCode::Home => {
+            modal.to_top();
+            modal.pending_g = false;
+            return;
+        }
+        KeyCode::End => {
+            modal.to_bottom(n);
+            modal.pending_g = false;
+            return;
+        }
+        KeyCode::Char('d') | KeyCode::Char('u') if ev.modifiers.contains(KeyModifiers::CONTROL) => {
+            if ev.code == KeyCode::Char('d') {
+                modal.page_down(10, n);
+            } else {
+                modal.page_up(10);
+            }
+            modal.pending_g = false;
+            return;
+        }
+        _ => {}
+    }
+
+    if modal.filter_active {
+        match ev.code {
+            KeyCode::Esc => modal.exit_filter_reset(),
+            KeyCode::Backspace => {
+                modal.query.pop();
+                modal.selected = 0;
+            }
+            KeyCode::Char(c) => {
+                modal.query.push(c);
+                modal.selected = 0;
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    // Vim navigation mode.
+    match ev.code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('c') | KeyCode::Char('C') => {
             st.commits = None;
             st.focused = FocusedView::Review;
         }
-        KeyCode::Down | KeyCode::Char('j') => modal.move_down(),
-        KeyCode::Up | KeyCode::Char('k') => modal.move_up(),
-        KeyCode::PageDown => modal.page_down(10),
-        KeyCode::PageUp => modal.page_up(10),
-        KeyCode::Home => modal.to_top(),
-        KeyCode::End => modal.to_bottom(),
-        _ => {}
+        KeyCode::Char('/') => modal.enter_filter(),
+        KeyCode::Char('j') => {
+            modal.move_down(n);
+            modal.pending_g = false;
+        }
+        KeyCode::Char('k') => {
+            modal.move_up();
+            modal.pending_g = false;
+        }
+        KeyCode::Char('G') => {
+            modal.to_bottom(n);
+            modal.pending_g = false;
+        }
+        KeyCode::Char('g') => {
+            if modal.pending_g {
+                modal.to_top();
+                modal.pending_g = false;
+            } else {
+                modal.pending_g = true;
+            }
+        }
+        _ => {
+            modal.pending_g = false;
+        }
     }
 }
 
