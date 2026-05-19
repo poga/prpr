@@ -16,10 +16,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::{self, JoinHandle};
 
-use anyhow::{Context, Result};
+use anyhow::{Result, anyhow};
 
 use crate::data::blame::{Blame, parse_blame};
-use crate::data::cache::PrPackage;
 use crate::data::diff::parse_diff;
 use crate::data::gh::GhClient;
 use crate::data::git::GitClient;
@@ -158,41 +157,7 @@ fn run_worker(
                 }
             }
             Request::LoadPr(number) => {
-                // Streaming pipeline added in Task 7. For now keep the
-                // atomic build_package shape so the UI still works:
-                let result = build_package(&*gh, &*git, &repo_root, number, window_size);
-                match result {
-                    Ok(pkg) => {
-                        let head = pkg.detail.head_ref_oid.clone();
-                        let _ = res_tx.send(Response::PrDetail {
-                            number,
-                            result: Ok(pkg.detail.clone()),
-                        });
-                        let _ = res_tx.send(Response::PrDiff {
-                            number,
-                            result: Ok(pkg.files.clone()),
-                        });
-                        for (path, lc) in pkg.colors {
-                            let _ = res_tx.send(Response::PrFileColors {
-                                number,
-                                head_oid: head.clone(),
-                                path,
-                                colors: lc,
-                                stats: HashMap::new(),
-                            });
-                        }
-                        let _ = res_tx.send(Response::PrColorsDone {
-                            number,
-                            head_oid: head,
-                        });
-                    }
-                    Err(e) => {
-                        let _ = res_tx.send(Response::PrLoadError {
-                            number,
-                            error: e.to_string(),
-                        });
-                    }
-                }
+                run_load(&*gh, &*git, &repo_root, &res_tx, number, window_size);
             }
             Request::Merge { number, method } => {
                 let result = gh.merge_pr(&repo_root, number, &method);
@@ -207,132 +172,178 @@ fn run_worker(
     }
 }
 
-/// Build the full `PrPackage` (detail + parsed diff + per-line blame colors)
-/// for one PR. Pure orchestration: no shared state, safe to call from any
-/// thread.
-pub fn build_package(
+fn run_load(
     gh: &dyn GhClient,
     git: &dyn GitClient,
     repo_root: &Path,
+    res_tx: &Sender<Response>,
     number: u32,
     window_size: usize,
-) -> Result<PrPackage> {
-    // Phase 1: gh pr view, gh pr diff, and git fetch are all keyed only on
-    // `number` and don't depend on each other's output. Run them in parallel.
-    let (detail_res, fetch_res, diff_res) = thread::scope(|s| {
-        let detail_h = s.spawn(|| gh.view_pr(repo_root, number));
+) {
+    // Stage 1: kick off view, diff, fetch in parallel; emit detail and
+    // diff events as they complete.
+    let (detail_res, files_res, fetch_res) = thread::scope(|s| {
+        let view_tx = res_tx.clone();
+        let diff_tx = res_tx.clone();
+        let detail_h = s.spawn(move || {
+            let r = gh.view_pr(repo_root, number);
+            match &r {
+                Ok(d) => {
+                    let _ = view_tx.send(Response::PrDetail {
+                        number,
+                        result: Ok(d.clone()),
+                    });
+                }
+                Err(e) => {
+                    let _ = view_tx.send(Response::PrDetail {
+                        number,
+                        result: Err(anyhow!(e.to_string())),
+                    });
+                }
+            }
+            r
+        });
+        let diff_h = s.spawn(move || {
+            let raw = gh.diff_pr(repo_root, number);
+            let parsed = raw.and_then(|s| parse_diff(&s));
+            match &parsed {
+                Ok(f) => {
+                    let _ = diff_tx.send(Response::PrDiff {
+                        number,
+                        result: Ok(f.clone()),
+                    });
+                }
+                Err(e) => {
+                    let _ = diff_tx.send(Response::PrDiff {
+                        number,
+                        result: Err(anyhow!(e.to_string())),
+                    });
+                }
+            }
+            parsed
+        });
         let fetch_h = s.spawn(|| git.fetch_pr(repo_root, number));
-        let diff_h = s.spawn(|| gh.diff_pr(repo_root, number));
-        (
-            detail_h.join().unwrap(),
-            fetch_h.join().unwrap(),
-            diff_h.join().unwrap(),
-        )
+        (detail_h.join().unwrap(), diff_h.join().unwrap(), fetch_h.join().unwrap())
     });
-    let detail = detail_res?;
-    fetch_res.with_context(|| format!("fetching PR #{number}"))?;
-    let raw = diff_res?;
-    let files = parse_diff(&raw)?;
 
+    // If any prerequisite failed, surface PrLoadError and stop. The
+    // already-emitted PrDetail/PrDiff (if any) is harmless — the cache
+    // ignores stragglers.
+    let detail = match detail_res {
+        Ok(d) => d,
+        Err(e) => {
+            let _ = res_tx.send(Response::PrLoadError {
+                number,
+                error: e.to_string(),
+            });
+            return;
+        }
+    };
+    let files = match files_res {
+        Ok(f) => f,
+        Err(e) => {
+            let _ = res_tx.send(Response::PrLoadError {
+                number,
+                error: e.to_string(),
+            });
+            return;
+        }
+    };
+    if let Err(e) = fetch_res {
+        let _ = res_tx.send(Response::PrLoadError {
+            number,
+            error: format!("fetching PR #{number}: {e}"),
+        });
+        return;
+    }
+
+    let head_oid = detail.head_ref_oid.clone();
+    let base_oid = detail.base_ref_oid.clone();
     let commits: Vec<String> = detail.commits.iter().map(|c| c.oid.clone()).collect();
-    let mut commit_stats: HashMap<String, CommitStats> = commits
-        .iter()
-        .map(|oid| (oid.clone(), CommitStats::default()))
-        .collect();
 
-    // Phase 2: per-file blame + log_patches are independent across files.
-    // Fan out to a bounded pool of workers that pull file indexes off an
-    // atomic counter — gives work-stealing behavior without dragging in a
-    // dep, and caps the number of concurrent git subprocesses on huge PRs.
-    let per_file = parallel_per_file(
-        git,
-        repo_root,
-        &files,
-        &commits,
-        &detail.head_ref_oid,
-        &detail.base_ref_oid,
-        window_size,
-    );
-
-    let mut colors = HashMap::new();
-    for (path, lc, per) in per_file {
-        colors.insert(path, lc);
-        for (oid, s) in per {
-            let entry = commit_stats.entry(oid).or_default();
-            entry.adds += s.adds;
-            entry.dels += s.dels;
+    // Stage 2: blame files[0] synchronously and emit its colors first.
+    if let Some(f) = files.first() {
+        if !f.binary {
+            let (lc, per) = blame_file(git, repo_root, &commits, &head_oid, &base_oid, f, window_size);
+            let _ = res_tx.send(Response::PrFileColors {
+                number,
+                head_oid: head_oid.clone(),
+                path: f.path.clone(),
+                colors: lc,
+                stats: per,
+            });
         }
     }
 
-    Ok(PrPackage {
-        detail,
-        files,
-        colors,
-        commit_stats,
-    })
+    // Stage 3: parallel pool for the remainder.
+    let remainder: Vec<&crate::data::diff::FileDiff> = files.iter().skip(1).filter(|f| !f.binary).collect();
+    let n = remainder.len();
+    if n > 0 {
+        let n_workers = thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(4)
+            .min(n);
+        let next_idx = AtomicUsize::new(0);
+        thread::scope(|s| {
+            for _ in 0..n_workers {
+                let tx = res_tx.clone();
+                let head_oid = head_oid.clone();
+                let base_oid = base_oid.clone();
+                let commits = commits.clone();
+                let remainder = &remainder;
+                let next_idx = &next_idx;
+                s.spawn(move || {
+                    loop {
+                        let i = next_idx.fetch_add(1, Ordering::Relaxed);
+                        if i >= remainder.len() {
+                            break;
+                        }
+                        let f = remainder[i];
+                        let (lc, per) = blame_file(
+                            git, repo_root, &commits, &head_oid, &base_oid, f, window_size,
+                        );
+                        let _ = tx.send(Response::PrFileColors {
+                            number,
+                            head_oid: head_oid.clone(),
+                            path: f.path.clone(),
+                            colors: lc,
+                            stats: per,
+                        });
+                    }
+                });
+            }
+        });
+    }
+
+    let _ = res_tx.send(Response::PrColorsDone {
+        number,
+        head_oid,
+    });
 }
 
-type FileResult = (String, LineColors, HashMap<String, CommitStats>);
-
-fn parallel_per_file(
+/// Blame + log-patches for one file. Mirrors the inner loop of the old
+/// `parallel_per_file` worker. Returns the file's `LineColors` and its
+/// per-commit `CommitStats` contribution.
+fn blame_file(
     git: &dyn GitClient,
     repo_root: &Path,
-    files: &[crate::data::diff::FileDiff],
     commits: &[String],
     head_oid: &str,
     base_oid: &str,
+    f: &crate::data::diff::FileDiff,
     window_size: usize,
-) -> Vec<FileResult> {
-    let n = files.len();
-    if n == 0 {
-        return Vec::new();
-    }
-    let n_workers = thread::available_parallelism()
-        .map(|p| p.get())
-        .unwrap_or(4)
-        .min(n);
-    let next_idx = AtomicUsize::new(0);
-
-    thread::scope(|s| {
-        let workers: Vec<_> = (0..n_workers)
-            .map(|_| {
-                s.spawn(|| {
-                    let mut local: Vec<FileResult> = Vec::new();
-                    loop {
-                        let i = next_idx.fetch_add(1, Ordering::Relaxed);
-                        if i >= n {
-                            break;
-                        }
-                        let f = &files[i];
-                        if f.binary {
-                            continue;
-                        }
-                        let head = git
-                            .blame(repo_root, head_oid, &f.path)
-                            .map(|s| parse_blame(&s))
-                            .unwrap_or_else(|_| Blame { line_shas: vec![] });
-                        // Walk the PR commits' patches to find which commit's
-                        // diff contained each removed line. Deleted lines used
-                        // to be blamed against the base commit, which always
-                        // resolved to pre-PR commits (i.e., gray) — never the
-                        // PR commit that actually did the deletion.
-                        let log_out = git
-                            .log_patches(repo_root, base_oid, head_oid, &f.path)
-                            .unwrap_or_default();
-                        let deletes = parse_deletions(&log_out);
-                        let lc = attribute_file(commits, window_size, &head, &deletes);
-                        let per = commit_stats_for_file(commits, &head, &deletes);
-                        local.push((f.path.clone(), lc, per));
-                    }
-                    local
-                })
-            })
-            .collect();
-        workers
-            .into_iter()
-            .flat_map(|h| h.join().unwrap())
-            .collect()
-    })
+) -> (LineColors, HashMap<String, CommitStats>) {
+    let head = git
+        .blame(repo_root, head_oid, &f.path)
+        .map(|s| parse_blame(&s))
+        .unwrap_or_else(|_| Blame { line_shas: vec![] });
+    let log_out = git
+        .log_patches(repo_root, base_oid, head_oid, &f.path)
+        .unwrap_or_default();
+    let deletes = parse_deletions(&log_out);
+    let lc = attribute_file(commits, window_size, &head, &deletes);
+    let per = commit_stats_for_file(commits, &head, &deletes);
+    (lc, per)
 }
 
 #[cfg(test)]
@@ -349,64 +360,90 @@ mod tests {
     }
 
     #[test]
-    fn build_package_assembles_diff_and_colors() {
+    fn load_pr_streams_detail_diff_then_per_file_colors() {
         let detail = fixture_detail();
         let head_sha = detail.head_ref_oid.clone();
+        let number = detail.number;
 
         let mut gh = FakeGh::new();
-        gh.views.insert(detail.number, detail.clone());
+        gh.views.insert(number, detail.clone());
         gh.diffs.insert(
-            detail.number,
+            number,
             include_str!("../../tests/fixtures/diff_basic.patch").to_string(),
         );
 
         let mut git = FakeGit::new("/tmp/repo");
         let porcelain = include_str!("../../tests/fixtures/blame_porcelain.txt").to_string();
         git.blames
-            .insert((head_sha, "src/sched.rs".into()), porcelain.clone());
-        git.blames.insert(
-            (detail.base_ref_oid.clone(), "src/sched.rs".into()),
-            porcelain,
-        );
+            .insert((head_sha.clone(), "src/sched.rs".into()), porcelain.clone());
+        git.blames
+            .insert((head_sha.clone(), "README.md".into()), porcelain);
 
-        let pkg = build_package(&gh, &git, Path::new("/tmp/repo"), detail.number, 7).unwrap();
-        assert_eq!(pkg.files.len(), 2);
-        assert!(pkg.colors.contains_key("src/sched.rs"));
+        let worker = Worker::spawn("/tmp/repo".into(), Arc::new(gh), Arc::new(git), 7);
+        worker.send(Request::LoadPr(number));
+
+        // Drain everything until PrColorsDone, with a deadline so the test
+        // can't hang. Order between PrDetail and PrDiff is "whoever finishes
+        // first" but in the fake both are instant, so we accept either
+        // order. We assert by counting.
+        let mut got_detail = false;
+        let mut got_diff = false;
+        let mut color_paths: Vec<String> = vec![];
+        let mut done = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline && !done {
+            match worker.rx.recv_timeout(std::time::Duration::from_millis(500)) {
+                Ok(Response::PrDetail { number: n, result: Ok(_) }) if n == number => {
+                    got_detail = true;
+                }
+                Ok(Response::PrDiff { number: n, result: Ok(_) }) if n == number => {
+                    got_diff = true;
+                }
+                Ok(Response::PrFileColors {
+                    number: n,
+                    head_oid,
+                    path,
+                    ..
+                }) if n == number => {
+                    assert_eq!(head_oid, head_sha);
+                    color_paths.push(path);
+                }
+                Ok(Response::PrColorsDone { number: n, .. }) if n == number => {
+                    done = true;
+                }
+                Ok(Response::PrLoadError { error, .. }) => panic!("unexpected error: {error}"),
+                Ok(_) | Err(_) => {}
+            }
+        }
+        assert!(got_detail, "never received PrDetail");
+        assert!(got_diff, "never received PrDiff");
+        assert!(done, "never received PrColorsDone");
+        // First color event is for files[0] (the visible file).
+        assert_eq!(color_paths.first().map(String::as_str), Some("src/sched.rs"));
     }
 
     #[test]
-    fn build_package_populates_commit_stats() {
-        let detail = fixture_detail();
-        let head_sha = detail.head_ref_oid.clone();
-
+    fn load_pr_emits_load_error_when_view_fails() {
         let mut gh = FakeGh::new();
-        gh.views.insert(detail.number, detail.clone());
+        // No fixture inserted → fake returns an error.
         gh.diffs.insert(
-            detail.number,
+            1,
             include_str!("../../tests/fixtures/diff_basic.patch").to_string(),
         );
+        let git = FakeGit::new("/tmp/repo");
+        let worker = Worker::spawn("/tmp/repo".into(), Arc::new(gh), Arc::new(git), 7);
+        worker.send(Request::LoadPr(1));
 
-        let mut git = FakeGit::new("/tmp/repo");
-        let porcelain = include_str!("../../tests/fixtures/blame_porcelain.txt").to_string();
-        git.blames
-            .insert((head_sha, "src/sched.rs".into()), porcelain);
-
-        let pkg = build_package(&gh, &git, Path::new("/tmp/repo"), detail.number, 7).unwrap();
-
-        // Every PR commit gets an entry, even if it didn't touch any tracked file.
-        for c in &detail.commits {
-            assert!(
-                pkg.commit_stats.contains_key(&c.oid),
-                "missing stats entry for commit {}",
-                c.oid,
-            );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut saw_error = false;
+        while std::time::Instant::now() < deadline && !saw_error {
+            if let Ok(Response::PrLoadError { number: 1, .. }) =
+                worker.rx.recv_timeout(std::time::Duration::from_millis(500))
+            {
+                saw_error = true;
+            }
         }
-        // Sanity: at least one commit has nonzero adds (the basic fixture
-        // includes head-blame entries).
-        assert!(
-            pkg.commit_stats.values().any(|s| s.adds > 0),
-            "expected at least one commit with adds > 0",
-        );
+        assert!(saw_error, "did not receive PrLoadError");
     }
 
     #[test]
