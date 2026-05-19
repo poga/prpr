@@ -140,31 +140,44 @@ fn run_worker(
     while let Ok(req) = req_rx.recv() {
         match req {
             Request::RefreshList { generation } => {
-                // Run fast + enriched in parallel; each thread emits its
-                // own response as soon as it completes, so rows appear
-                // immediately while the heavier enrichment is still in
-                // flight. Also kick off a bulk fetch of every PR's head
-                // ref so subsequent diff/blame can be served from local
-                // refs without per-PR network round trips.
-                let gh_ref = &*gh;
-                let git_ref = &*git;
-                let repo_ref = &repo_root;
-                thread::scope(|s| {
-                    let tx1 = res_tx.clone();
-                    s.spawn(move || {
-                        let result = gh_ref.list_prs_fast(repo_ref);
-                        let _ = tx1.send(Response::ListFast { generation, result });
+                // The list renders only after every OPEN PR's head ref
+                // is locally fetched, so subsequent LoadPr is guaranteed
+                // zero-network. Sequence on the worker thread:
+                //   1. list_prs_fast — get the rows and their states.
+                //   2. fetch_pr_refs for open PR numbers (+ origin/*).
+                //   3. emit ListFast.
+                // list_prs_enriched is fired on a detached thread so it
+                // doesn't gate the fast path; its response carries the
+                // same generation and is merged when it arrives.
+                let gh_enr = Arc::clone(&gh);
+                let repo_enr = repo_root.clone();
+                let tx_enr = res_tx.clone();
+                let gen_enr = generation;
+                thread::spawn(move || {
+                    let result = gh_enr.list_prs_enriched(&repo_enr);
+                    let _ = tx_enr.send(Response::ListEnriched {
+                        generation: gen_enr,
+                        result,
                     });
-                    let tx2 = res_tx.clone();
-                    s.spawn(move || {
-                        let result = gh_ref.list_prs_enriched(repo_ref);
-                        let _ = tx2.send(Response::ListEnriched { generation, result });
-                    });
-                    s.spawn(move || {
-                        // Fire-and-forget: failure (network, auth) just
-                        // means subsequent LoadPr falls back to fetch_pr.
-                        let _ = git_ref.fetch_all_prs(repo_ref);
-                    });
+                });
+
+                let combined = match gh.list_prs_fast(&repo_root) {
+                    Err(e) => Err(e),
+                    Ok(prs) => {
+                        let open: Vec<u32> = prs
+                            .iter()
+                            .filter(|p| p.state == crate::data::pr::PrState::Open)
+                            .map(|p| p.number)
+                            .collect();
+                        match git.fetch_pr_refs(&repo_root, &open) {
+                            Ok(()) => Ok(prs),
+                            Err(e) => Err(anyhow::anyhow!("fetching open PR refs: {e:#}")),
+                        }
+                    }
+                };
+                let _ = res_tx.send(Response::ListFast {
+                    generation,
+                    result: combined,
                 });
             }
             Request::LoadPr(pr) => {
@@ -193,32 +206,21 @@ fn run_load(
 ) {
     let number = pr.number;
 
-    // Stage 1: resolve head/base from local refs. The bulk fetch from
-    // the most recent RefreshList primes these; on a cold start where
-    // it hasn't completed yet, fall back to a single-PR fetch.
+    // Stage 1: resolve head/base from local refs. RefreshList guarantees
+    // these are populated before the user can open a PR — no network
+    // fallback. If a ref is missing here, something went wrong with the
+    // most recent refresh; surface the error rather than papering over
+    // it with a slow per-PR fetch.
     let head_ref = format!("refs/prpr/pr-{number}");
     let base_ref = format!("origin/{}", pr.base_ref_name);
     let head_oid = match git.rev_parse(repo_root, &head_ref) {
         Ok(o) => o,
-        Err(_) => {
-            // Cold-start fallback. Single fetch, then retry.
-            if let Err(e) = git.fetch_pr(repo_root, number) {
-                let _ = res_tx.send(Response::PrLoadError {
-                    number,
-                    error: format!("fetching PR #{number}: {e:#}"),
-                });
-                return;
-            }
-            match git.rev_parse(repo_root, &head_ref) {
-                Ok(o) => o,
-                Err(e) => {
-                    let _ = res_tx.send(Response::PrLoadError {
-                        number,
-                        error: format!("resolving {head_ref}: {e:#}"),
-                    });
-                    return;
-                }
-            }
+        Err(e) => {
+            let _ = res_tx.send(Response::PrLoadError {
+                number,
+                error: format!("resolving {head_ref} (try `r` to refresh): {e:#}"),
+            });
+            return;
         }
     };
     let base_oid = match git.rev_parse(repo_root, &base_ref) {

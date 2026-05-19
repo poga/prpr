@@ -18,14 +18,11 @@ pub trait GitClient: Send + Sync {
     fn rev_parse(&self, repo_root: &Path, refname: &str) -> Result<String>;
     /// List commits in `base..head` (PR-only commits), oldest-first.
     fn log_commits(&self, repo_root: &Path, base: &str, head: &str) -> Result<Vec<Commit>>;
-    /// Single-ref fallback fetch used when bulk fetch hasn't completed
-    /// yet (cold start). Pulls `refs/pull/<n>/head` into `refs/prpr/pr-<n>`.
-    fn fetch_pr(&self, repo_root: &Path, number: u32) -> Result<()>;
-    /// Bulk-fetch every PR's head ref under `refs/prpr/pr-*`, and refresh
-    /// the standard `origin/*` heads in the same call. Used by list
-    /// refresh so subsequent PR opens can serve diffs purely from local
-    /// refs.
-    fn fetch_all_prs(&self, repo_root: &Path) -> Result<()>;
+    /// Fetch the given PR numbers' head refs (into `refs/prpr/pr-<n>`)
+    /// and refresh `origin/*` heads — all in one git invocation.
+    /// RefreshList waits for this before emitting `ListFast`, so any
+    /// subsequent `LoadPr` is zero-network.
+    fn fetch_pr_refs(&self, repo_root: &Path, numbers: &[u32]) -> Result<()>;
     /// Three-dot diff between `base` and `head` against local refs.
     /// Mirrors `gh pr diff` but is offline once both oids are fetched.
     fn diff(&self, repo_root: &Path, base: &str, head: &str) -> Result<String>;
@@ -127,26 +124,18 @@ impl GitClient for GitCli {
         Ok(commits)
     }
 
-    fn fetch_pr(&self, repo_root: &Path, number: u32) -> Result<()> {
-        let refspec = format!("+refs/pull/{number}/head:refs/prpr/pr-{number}");
-        run(Command::new("git")
-            .current_dir(repo_root)
-            .args(["fetch", "--quiet", "origin", &refspec]))?;
-        Ok(())
-    }
-
-    fn fetch_all_prs(&self, repo_root: &Path) -> Result<()> {
-        // One round trip refreshes both PR heads and the standard
-        // origin/* branch heads, so `origin/<base>` is current for the
-        // local diff in run_load.
-        run(Command::new("git").current_dir(repo_root).args([
-            "fetch",
-            "--quiet",
-            "--prune",
-            "origin",
-            "+refs/pull/*/head:refs/prpr/pr-*",
-            "+refs/heads/*:refs/remotes/origin/*",
-        ]))?;
+    fn fetch_pr_refs(&self, repo_root: &Path, numbers: &[u32]) -> Result<()> {
+        // Build one fetch with explicit refspecs for the given PRs plus
+        // `origin/*` so the base ref is current. Skipping all-PR refs
+        // means closed/merged PRs aren't fetched on every refresh —
+        // a big saving on repos with hundreds of historical PRs.
+        let mut args: Vec<String> =
+            vec!["fetch".into(), "--quiet".into(), "origin".into()];
+        for n in numbers {
+            args.push(format!("+refs/pull/{n}/head:refs/prpr/pr-{n}"));
+        }
+        args.push("+refs/heads/*:refs/remotes/origin/*".into());
+        run(Command::new("git").current_dir(repo_root).args(&args))?;
         Ok(())
     }
 
@@ -244,10 +233,7 @@ pub(crate) mod fakes {
                 .cloned()
                 .unwrap_or_default())
         }
-        fn fetch_pr(&self, _root: &Path, _n: u32) -> Result<()> {
-            Ok(())
-        }
-        fn fetch_all_prs(&self, _root: &Path) -> Result<()> {
+        fn fetch_pr_refs(&self, _root: &Path, _numbers: &[u32]) -> Result<()> {
             Ok(())
         }
         fn diff(&self, _root: &Path, base: &str, head: &str) -> Result<String> {
