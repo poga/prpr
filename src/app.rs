@@ -870,7 +870,7 @@ mod tests {
     fn cycle_file_uses_detail_files_count_when_files_empty() {
         let mut st = dummy_app_state();
         let mut cache = Cache::new();
-        let json = include_str!("../../../../tests/fixtures/pr_view.json");
+        let json = include_str!("../tests/fixtures/pr_view.json");
         let detail: crate::data::pr::PrDetail = serde_json::from_str(json).unwrap();
         let n_detail_files = detail.files.len();
         let number = detail.number;
@@ -898,7 +898,7 @@ mod tests {
     fn move_review_is_noop_when_pkg_files_empty() {
         let mut st = dummy_app_state();
         let mut cache = Cache::new();
-        let json = include_str!("../../../../tests/fixtures/pr_view.json");
+        let json = include_str!("../tests/fixtures/pr_view.json");
         let detail: crate::data::pr::PrDetail = serde_json::from_str(json).unwrap();
         let number = detail.number;
         cache.insert_partial(detail);
