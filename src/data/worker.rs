@@ -138,23 +138,24 @@ fn run_worker(
     while let Ok(req) = req_rx.recv() {
         match req {
             Request::RefreshList { generation } => {
-                let fast = gh.list_prs_fast(&repo_root);
-                if res_tx
-                    .send(Response::ListFast { generation, result: fast })
-                    .is_err()
-                {
-                    break;
-                }
-                let enriched = gh.list_prs_enriched(&repo_root);
-                if res_tx
-                    .send(Response::ListEnriched {
-                        generation,
-                        result: enriched,
-                    })
-                    .is_err()
-                {
-                    break;
-                }
+                // Run fast + enriched in parallel; each thread emits its
+                // own response as soon as it completes, so rows appear
+                // immediately while the heavier enrichment is still in
+                // flight.
+                let gh_ref = &*gh;
+                let repo_ref = &repo_root;
+                thread::scope(|s| {
+                    let tx1 = res_tx.clone();
+                    s.spawn(move || {
+                        let result = gh_ref.list_prs_fast(repo_ref);
+                        let _ = tx1.send(Response::ListFast { generation, result });
+                    });
+                    let tx2 = res_tx.clone();
+                    s.spawn(move || {
+                        let result = gh_ref.list_prs_enriched(repo_ref);
+                        let _ = tx2.send(Response::ListEnriched { generation, result });
+                    });
+                });
             }
             Request::LoadPr(number) => {
                 run_load(&*gh, &*git, &repo_root, &res_tx, number, window_size);
@@ -180,41 +181,24 @@ fn run_load(
     number: u32,
     window_size: usize,
 ) {
-    // Stage 1: kick off view, diff, fetch in parallel; emit detail and
-    // diff events as they complete.
+    // Stage 1: run view, diff, fetch in parallel. Emit responses in a
+    // deterministic order AFTER the scope joins so the UI cache always
+    // has a partial entry (from PrDetail) before PrDiff arrives — the
+    // PrDiff handler keys writes off that entry's head_oid.
     let (detail_res, files_res, fetch_res) = thread::scope(|s| {
-        let view_tx = res_tx.clone();
-        let diff_tx = res_tx.clone();
-        let detail_h = s.spawn(move || {
-            let r = gh.view_pr(repo_root, number);
-            if let Ok(d) = &r {
-                let _ = view_tx.send(Response::PrDetail {
-                    number,
-                    result: Ok(d.clone()),
-                });
-            }
-            // On error, run_load surfaces PrLoadError after join; no need
-            // to emit a redundant PrDetail{Err}.
-            r
-        });
-        let diff_h = s.spawn(move || {
+        let detail_h = s.spawn(|| gh.view_pr(repo_root, number));
+        let diff_h = s.spawn(|| {
             let raw = gh.diff_pr(repo_root, number);
-            let parsed = raw.and_then(|s| parse_diff(&s));
-            if let Ok(f) = &parsed {
-                let _ = diff_tx.send(Response::PrDiff {
-                    number,
-                    result: Ok(f.clone()),
-                });
-            }
-            parsed
+            raw.and_then(|s| parse_diff(&s))
         });
         let fetch_h = s.spawn(|| git.fetch_pr(repo_root, number));
-        (detail_h.join().unwrap(), diff_h.join().unwrap(), fetch_h.join().unwrap())
+        (
+            detail_h.join().unwrap(),
+            diff_h.join().unwrap(),
+            fetch_h.join().unwrap(),
+        )
     });
 
-    // If any prerequisite failed, surface PrLoadError and stop. The
-    // already-emitted PrDetail/PrDiff (if any) is harmless — the cache
-    // ignores stragglers.
     let detail = match detail_res {
         Ok(d) => d,
         Err(e) => {
@@ -225,6 +209,11 @@ fn run_load(
             return;
         }
     };
+    let _ = res_tx.send(Response::PrDetail {
+        number,
+        result: Ok(detail.clone()),
+    });
+
     let files = match files_res {
         Ok(f) => f,
         Err(e) => {
@@ -235,6 +224,11 @@ fn run_load(
             return;
         }
     };
+    let _ = res_tx.send(Response::PrDiff {
+        number,
+        result: Ok(files.clone()),
+    });
+
     if let Err(e) = fetch_res {
         let _ = res_tx.send(Response::PrLoadError {
             number,
