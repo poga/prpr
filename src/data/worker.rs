@@ -30,8 +30,10 @@ pub enum Request {
     /// Refresh the PR list. `generation` is echoed in both responses so the UI
     /// can drop stale results from a superseded refresh cycle.
     RefreshList { generation: u32 },
-    /// Build the streaming PR data set for one PR.
-    LoadPr(u32),
+    /// Build the streaming PR data set for one PR. Carries the cached
+    /// `Pr` row so the worker can compute everything (oids, commits,
+    /// diff) from local git refs — no `gh pr view` round trip.
+    LoadPr(crate::data::pr::Pr),
     /// Run `gh pr merge <number> --<method>`.
     Merge { number: u32, method: String },
 }
@@ -165,8 +167,8 @@ fn run_worker(
                     });
                 });
             }
-            Request::LoadPr(number) => {
-                run_load(&*gh, &*git, &repo_root, &res_tx, number, window_size);
+            Request::LoadPr(pr) => {
+                run_load(&*gh, &*git, &repo_root, &res_tx, pr, window_size);
             }
             Request::Merge { number, method } => {
                 let result = gh.merge_pr(&repo_root, number, &method);
@@ -182,24 +184,65 @@ fn run_worker(
 }
 
 fn run_load(
-    gh: &dyn GhClient,
+    _gh: &dyn GhClient,
     git: &dyn GitClient,
     repo_root: &Path,
     res_tx: &Sender<Response>,
-    number: u32,
+    pr: crate::data::pr::Pr,
     window_size: usize,
 ) {
-    // Stage 1: view + fetch in parallel. (The bulk fetch in
-    // RefreshList may already have populated refs/prpr/pr-N, in which
-    // case this fetch is a fast no-op.)
-    let (detail_res, fetch_res) = thread::scope(|s| {
-        let detail_h = s.spawn(|| gh.view_pr(repo_root, number));
-        let fetch_h = s.spawn(|| git.fetch_pr(repo_root, number));
-        (detail_h.join().unwrap(), fetch_h.join().unwrap())
-    });
+    let number = pr.number;
 
-    let detail = match detail_res {
-        Ok(d) => d,
+    // Stage 1: resolve head/base from local refs. The bulk fetch from
+    // the most recent RefreshList primes these; on a cold start where
+    // it hasn't completed yet, fall back to a single-PR fetch.
+    let head_ref = format!("refs/prpr/pr-{number}");
+    let base_ref = format!("origin/{}", pr.base_ref_name);
+    let head_oid = match git.rev_parse(repo_root, &head_ref) {
+        Ok(o) => o,
+        Err(_) => {
+            // Cold-start fallback. Single fetch, then retry.
+            if let Err(e) = git.fetch_pr(repo_root, number) {
+                let _ = res_tx.send(Response::PrLoadError {
+                    number,
+                    error: format!("fetching PR #{number}: {e:#}"),
+                });
+                return;
+            }
+            match git.rev_parse(repo_root, &head_ref) {
+                Ok(o) => o,
+                Err(e) => {
+                    let _ = res_tx.send(Response::PrLoadError {
+                        number,
+                        error: format!("resolving {head_ref}: {e:#}"),
+                    });
+                    return;
+                }
+            }
+        }
+    };
+    let base_oid = match git.rev_parse(repo_root, &base_ref) {
+        Ok(o) => o,
+        Err(e) => {
+            let _ = res_tx.send(Response::PrLoadError {
+                number,
+                error: format!("resolving {base_ref}: {e:#}"),
+            });
+            return;
+        }
+    };
+
+    // Stage 2: pull commits + diff in parallel (both local).
+    let (commits_res, diff_res) = thread::scope(|s| {
+        let commits_h = s.spawn(|| git.log_commits(repo_root, &base_oid, &head_oid));
+        let diff_h = s.spawn(|| {
+            git.diff(repo_root, &base_oid, &head_oid)
+                .and_then(|s| parse_diff(&s))
+        });
+        (commits_h.join().unwrap(), diff_h.join().unwrap())
+    });
+    let commits = match commits_res {
+        Ok(c) => c,
         Err(e) => {
             let _ = res_tx.send(Response::PrLoadError {
                 number,
@@ -208,25 +251,7 @@ fn run_load(
             return;
         }
     };
-    let _ = res_tx.send(Response::PrDetail {
-        number,
-        result: Ok(detail.clone()),
-    });
-
-    if let Err(e) = fetch_res {
-        let _ = res_tx.send(Response::PrLoadError {
-            number,
-            error: format!("fetching PR #{number}: {e}"),
-        });
-        return;
-    }
-
-    // Stage 1b: compute diff locally now that head+base oids are known
-    // and the head ref is fetched. No network round trip.
-    let files = match git
-        .diff(repo_root, &detail.base_ref_oid, &detail.head_ref_oid)
-        .and_then(|s| parse_diff(&s))
-    {
+    let files = match diff_res {
         Ok(f) => f,
         Err(e) => {
             let _ = res_tx.send(Response::PrLoadError {
@@ -236,14 +261,42 @@ fn run_load(
             return;
         }
     };
+
+    // Build PrDetail from cached Pr + locally-derived data. No gh round
+    // trip — `gh pr view` is no longer in the hot path.
+    let detail = crate::data::pr::PrDetail {
+        number: pr.number,
+        title: pr.title.clone(),
+        is_draft: pr.is_draft,
+        state: pr.state,
+        author: pr.author.clone(),
+        base_ref_name: pr.base_ref_name.clone(),
+        base_ref_oid: base_oid.clone(),
+        head_ref_name: pr.head_ref_name.clone(),
+        head_ref_oid: head_oid.clone(),
+        mergeable: pr.mergeable.clone(),
+        status_check_rollup: pr.status_check_rollup.clone(),
+        review_decision: pr.review_decision,
+        commits: commits.clone(),
+        files: files
+            .iter()
+            .map(|f| crate::data::pr::FileMeta {
+                path: f.path.clone(),
+                additions: 0,
+                deletions: 0,
+            })
+            .collect(),
+    };
+    let _ = res_tx.send(Response::PrDetail {
+        number,
+        result: Ok(detail),
+    });
     let _ = res_tx.send(Response::PrDiff {
         number,
         result: Ok(files.clone()),
     });
 
-    let head_oid = detail.head_ref_oid.clone();
-    let base_oid = detail.base_ref_oid.clone();
-    let commits: Vec<String> = detail.commits.iter().map(|c| c.oid.clone()).collect();
+    let commits: Vec<String> = commits.iter().map(|c| c.oid.clone()).collect();
 
     // Stage 2: blame files[0] synchronously and emit its colors first.
     if let Some(f) = files.first() {
@@ -342,17 +395,40 @@ mod tests {
         serde_json::from_str(json).unwrap()
     }
 
+    fn pr_from_fixture(detail: &crate::data::pr::PrDetail) -> crate::data::pr::Pr {
+        crate::data::pr::Pr {
+            number: detail.number,
+            title: detail.title.clone(),
+            is_draft: detail.is_draft,
+            state: detail.state,
+            author: detail.author.clone(),
+            created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            updated_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            base_ref_name: detail.base_ref_name.clone(),
+            head_ref_name: detail.head_ref_name.clone(),
+            labels: vec![],
+            status_check_rollup: detail.status_check_rollup.clone(),
+            review_decision: detail.review_decision,
+            mergeable: detail.mergeable.clone(),
+        }
+    }
+
     #[test]
     fn load_pr_streams_detail_diff_then_per_file_colors() {
         let detail = fixture_detail();
         let head_sha = detail.head_ref_oid.clone();
         let base_sha = detail.base_ref_oid.clone();
         let number = detail.number;
+        let pr = pr_from_fixture(&detail);
 
-        let mut gh = FakeGh::new();
-        gh.views.insert(number, detail.clone());
-
+        let gh = FakeGh::new();
         let mut git = FakeGit::new("/tmp/repo");
+        git.refs
+            .insert(format!("refs/prpr/pr-{number}"), head_sha.clone());
+        git.refs
+            .insert(format!("origin/{}", pr.base_ref_name), base_sha.clone());
+        git.commits
+            .insert((base_sha.clone(), head_sha.clone()), detail.commits.clone());
         git.diffs.insert(
             (base_sha.clone(), head_sha.clone()),
             include_str!("../../tests/fixtures/diff_basic.patch").to_string(),
@@ -364,12 +440,10 @@ mod tests {
             .insert((head_sha.clone(), "README.md".into()), porcelain);
 
         let worker = Worker::spawn("/tmp/repo".into(), Arc::new(gh), Arc::new(git), 7);
-        worker.send(Request::LoadPr(number));
+        worker.send(Request::LoadPr(pr));
 
         // Drain everything until PrColorsDone, with a deadline so the test
-        // can't hang. Order between PrDetail and PrDiff is "whoever finishes
-        // first" but in the fake both are instant, so we accept either
-        // order. We assert by counting.
+        // can't hang.
         let mut got_detail = false;
         let mut got_diff = false;
         let mut color_paths: Vec<String> = vec![];
@@ -407,12 +481,28 @@ mod tests {
     }
 
     #[test]
-    fn load_pr_emits_load_error_when_view_fails() {
-        // No view fixture inserted → fake returns an error from gh.view_pr.
+    fn load_pr_emits_load_error_when_refs_missing() {
+        // FakeGit.refs empty → rev_parse fails → cold-start fallback
+        // also can't populate (FakeGit.fetch_pr is a no-op) → PrLoadError.
         let gh = FakeGh::new();
         let git = FakeGit::new("/tmp/repo");
         let worker = Worker::spawn("/tmp/repo".into(), Arc::new(gh), Arc::new(git), 7);
-        worker.send(Request::LoadPr(1));
+        let pr = crate::data::pr::Pr {
+            number: 1,
+            title: "t".into(),
+            is_draft: false,
+            state: crate::data::pr::PrState::Open,
+            author: crate::data::pr::Author { login: "a".into() },
+            created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            updated_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            base_ref_name: "main".into(),
+            head_ref_name: "feature".into(),
+            labels: vec![],
+            status_check_rollup: vec![],
+            review_decision: None,
+            mergeable: None,
+        };
+        worker.send(Request::LoadPr(pr));
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut saw_error = false;
@@ -439,6 +529,8 @@ mod tests {
             author: Author { login: "a".into() },
             created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
             updated_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            base_ref_name: "main".into(),
+            head_ref_name: "feature".into(),
             labels: vec![Label { name: "bug".into() }],
             status_check_rollup: vec![],
             review_decision: None,

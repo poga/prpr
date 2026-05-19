@@ -26,6 +26,13 @@ pub struct Pr {
     pub created_at: DateTime<Utc>,
     #[serde(rename = "updatedAt")]
     pub updated_at: DateTime<Utc>,
+    /// Branch names from the fast list pass. Used by the worker to do
+    /// `git rev-parse origin/<base>` / `refs/prpr/pr-<n>` locally and
+    /// compute the diff without a `gh pr view` round trip.
+    #[serde(rename = "baseRefName", default)]
+    pub base_ref_name: String,
+    #[serde(rename = "headRefName", default)]
+    pub head_ref_name: String,
     #[serde(default)]
     pub labels: Vec<Label>,
     #[serde(rename = "statusCheckRollup", default)]
@@ -219,6 +226,8 @@ mod tests {
             author: Author { login: "a".into() },
             created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
             updated_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            base_ref_name: String::new(),
+            head_ref_name: String::new(),
             labels: vec![],
             status_check_rollup: vec![],
             review_decision: None,
@@ -315,6 +324,8 @@ mod tests {
             author: Author { login: "a".into() },
             created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
             updated_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            base_ref_name: String::new(),
+            head_ref_name: String::new(),
             labels: vec![Label { name: "bug".into() }],
             status_check_rollup: vec![],
             review_decision: None,

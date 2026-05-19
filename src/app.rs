@@ -509,7 +509,12 @@ fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) 
             st.list.selected = n.saturating_sub(1);
         }
         Action::ListOpen => {
-            if let Some(pr) = st.list.visible_prs().get(st.list.selected).copied() {
+            if let Some(pr) = st
+                .list
+                .visible_prs()
+                .get(st.list.selected)
+                .map(|p| (*p).clone())
+            {
                 let num = pr.number;
                 st.current_pr = Some(num);
                 st.review = Some(PrReviewState {
@@ -521,7 +526,7 @@ fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) 
                 });
                 st.focused = FocusedView::Review;
                 if app.cache.get(num).is_none() {
-                    app.request(Request::LoadPr(num));
+                    app.request(Request::LoadPr(pr));
                 }
             }
         }
@@ -611,11 +616,13 @@ fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) 
             st.focused = FocusedView::HelpOverlay;
         }
         Action::Refresh => {
-            if let Some(num) = st.current_pr {
+            if let Some(num) = st.current_pr
+                && let Some(pr) = st.list.prs.iter().find(|p| p.number == num).cloned()
+            {
                 if let Some(r) = st.review.as_mut() {
                     r.status = "loading…".into();
                 }
-                app.request(Request::LoadPr(num));
+                app.request(Request::LoadPr(pr));
             }
         }
         Action::Nothing => {}
@@ -930,6 +937,8 @@ mod tests {
             author: Author { login: "a".into() },
             created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
             updated_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            base_ref_name: "main".into(),
+            head_ref_name: format!("feature-{n}"),
             labels: vec![],
             status_check_rollup: vec![],
             review_decision: None,
@@ -1210,10 +1219,14 @@ mod tests {
         let head_sha = detail.head_ref_oid.clone();
         let base_sha = detail.base_ref_oid.clone();
 
-        let mut gh = FakeGh::new();
-        gh.views.insert(number, detail.clone());
-
+        let gh = FakeGh::new();
         let mut git = FakeGit::new("/tmp/repo");
+        git.refs
+            .insert(format!("refs/prpr/pr-{number}"), head_sha.clone());
+        git.refs
+            .insert(format!("origin/{}", detail.base_ref_name), base_sha.clone());
+        git.commits
+            .insert((base_sha.clone(), head_sha.clone()), detail.commits.clone());
         git.diffs.insert(
             (base_sha, head_sha.clone()),
             include_str!("../tests/fixtures/diff_basic.patch").to_string(),
@@ -1240,7 +1253,22 @@ mod tests {
             status: "loading…".into(),
         });
 
-        app.request(Request::LoadPr(number));
+        let pr = crate::data::pr::Pr {
+            number: detail.number,
+            title: detail.title.clone(),
+            is_draft: detail.is_draft,
+            state: detail.state,
+            author: detail.author.clone(),
+            created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            updated_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            base_ref_name: detail.base_ref_name.clone(),
+            head_ref_name: detail.head_ref_name.clone(),
+            labels: vec![],
+            status_check_rollup: detail.status_check_rollup.clone(),
+            review_decision: detail.review_decision,
+            mergeable: detail.mergeable.clone(),
+        };
+        app.request(Request::LoadPr(pr));
 
         // Drain until we see PrColorsDone, feeding events through.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);

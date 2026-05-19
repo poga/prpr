@@ -6,14 +6,13 @@ use std::process::{Command, Output};
 
 use anyhow::{Context, Result, anyhow};
 
-use crate::data::pr::{Pr, PrDetail, PrEnrichment};
+use crate::data::pr::{Pr, PrEnrichment};
 
 pub trait GhClient: Send + Sync {
     /// First pass: light fields, no `statusCheckRollup`/`mergeable`/`reviewDecision`.
     fn list_prs_fast(&self, repo_root: &std::path::Path) -> Result<Vec<Pr>>;
     /// Second pass: only the heavy fields, keyed by `number` for merge.
     fn list_prs_enriched(&self, repo_root: &std::path::Path) -> Result<Vec<PrEnrichment>>;
-    fn view_pr(&self, repo_root: &std::path::Path, number: u32) -> Result<PrDetail>;
     /// `method` is one of "merge", "squash", "rebase".
     fn merge_pr(&self, repo_root: &std::path::Path, number: u32, method: &str) -> Result<()>;
 }
@@ -21,10 +20,9 @@ pub trait GhClient: Send + Sync {
 pub struct GhCli;
 
 const PR_LIST_FAST_FIELDS: &str =
-    "number,title,author,isDraft,state,createdAt,updatedAt,labels";
+    "number,title,author,isDraft,state,createdAt,updatedAt,labels,baseRefName,headRefName";
 const PR_LIST_ENRICHED_FIELDS: &str =
     "number,statusCheckRollup,reviewDecision,mergeable";
-const PR_VIEW_FIELDS: &str = "number,title,author,isDraft,state,createdAt,baseRefName,baseRefOid,headRefName,headRefOid,mergeable,labels,statusCheckRollup,reviewDecision,commits,files";
 
 fn run(cmd: &mut Command) -> Result<Output> {
     let out = cmd
@@ -70,20 +68,6 @@ impl GhClient for GhCli {
         Ok(v)
     }
 
-    fn view_pr(&self, repo_root: &std::path::Path, number: u32) -> Result<PrDetail> {
-        let n = number.to_string();
-        let out = run(Command::new("gh").current_dir(repo_root).args([
-            "pr",
-            "view",
-            &n,
-            "--json",
-            PR_VIEW_FIELDS,
-        ]))?;
-        let pr: PrDetail = serde_json::from_slice(&out.stdout)
-            .with_context(|| "parsing `gh pr view --json` output")?;
-        Ok(pr)
-    }
-
     fn merge_pr(&self, repo_root: &std::path::Path, number: u32, method: &str) -> Result<()> {
         let n = number.to_string();
         let flag = match method {
@@ -103,14 +87,12 @@ impl GhClient for GhCli {
 pub(crate) mod fakes {
     use super::*;
     use crate::data::pr::PrEnrichment;
-    use std::collections::HashMap;
     use std::sync::Mutex;
 
     /// In-memory fake. Tests load JSON fixtures and stuff them into this.
     pub struct FakeGh {
         pub prs_fast: Vec<Pr>,
         pub enrichments: Vec<PrEnrichment>,
-        pub views: HashMap<u32, PrDetail>,
         pub merges: Mutex<Vec<(u32, String)>>,
     }
 
@@ -119,7 +101,6 @@ pub(crate) mod fakes {
             Self {
                 prs_fast: vec![],
                 enrichments: vec![],
-                views: HashMap::new(),
                 merges: Mutex::new(vec![]),
             }
         }
@@ -131,12 +112,6 @@ pub(crate) mod fakes {
         }
         fn list_prs_enriched(&self, _root: &std::path::Path) -> Result<Vec<PrEnrichment>> {
             Ok(self.enrichments.clone())
-        }
-        fn view_pr(&self, _root: &std::path::Path, n: u32) -> Result<PrDetail> {
-            self.views
-                .get(&n)
-                .cloned()
-                .ok_or_else(|| anyhow!("no fake view for #{n}"))
         }
         fn merge_pr(&self, _root: &std::path::Path, n: u32, m: &str) -> Result<()> {
             self.merges.lock().unwrap().push((n, m.to_string()));
@@ -172,6 +147,8 @@ mod tests {
             author: Author { login: "a".into() },
             created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
             updated_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            base_ref_name: "main".into(),
+            head_ref_name: "feature".into(),
             labels: vec![Label { name: "bug".into() }],
             status_check_rollup: vec![],
             review_decision: None,
