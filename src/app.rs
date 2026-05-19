@@ -35,7 +35,6 @@ use crate::view::pr_list::PrListState;
 use crate::view::pr_review::PrReviewState;
 
 const AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
-const RETURN_REFRESH_STALE_AFTER: Duration = Duration::from_secs(30);
 
 fn should_auto_refresh(
     focused: FocusedView,
@@ -340,6 +339,14 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
             st.list.status = format!("load #{number} failed: {error}");
         }
         Response::MergeDone { number, result: Ok(()) } => {
+            // Remove the merged PR locally. No network refresh — fresh data
+            // only arrives via startup, manual refresh, or auto-refresh.
+            let prev_selected = st
+                .list
+                .visible_prs()
+                .get(st.list.selected)
+                .map(|p| p.number);
+            let prev_idx = st.list.selected;
             st.focused = FocusedView::List;
             st.review = None;
             st.current_pr = None;
@@ -347,9 +354,10 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
             st.merging = None;
             st.picker = None;
             st.list.status = format!("merged #{number}");
-            st.list.prs.clear();
-            st.list.selected = 0;
-            send_refresh(app, st, false);
+            st.list.prs.retain(|p| p.number != number);
+            let new_numbers: Vec<u32> =
+                st.list.visible_prs().iter().map(|p| p.number).collect();
+            st.list.selected = reselect_by_number(prev_selected, &new_numbers, prev_idx);
         }
         Response::MergeDone { number, result: Err(e) } => {
             st.merging = None;
@@ -600,17 +608,6 @@ fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) 
             st.focused = FocusedView::List;
             st.review = None;
             st.current_pr = None;
-            // If the cached list is older than RETURN_REFRESH_STALE_AFTER,
-            // kick off a silent refresh so the user lands on fresh data.
-            // Bouncing in/out of a PR review within the threshold reuses
-            // the existing rows. Skip if a refresh is already in flight.
-            let stale = !st.list_refresh_in_flight
-                && st
-                    .last_refresh_at
-                    .is_none_or(|t| t.elapsed() >= RETURN_REFRESH_STALE_AFTER);
-            if stale {
-                send_refresh(app, st, true);
-            }
         }
         Action::Help => {
             st.focused = FocusedView::HelpOverlay;
@@ -1311,5 +1308,86 @@ mod tests {
             }
         }
         assert!(saw_detail && saw_diff && done, "missed an event");
+    }
+
+    #[test]
+    fn merge_done_ok_removes_pr_locally_without_refresh() {
+        let mut st = dummy_app_state();
+        let mut cache = Cache::new();
+        let mut app = test_app_for_state(&mut cache);
+        st.list_gen = 1;
+        st.list.prs = vec![open_pr(5), open_pr(7), open_pr(8)];
+        st.list.selected = 1; // pointing at #7
+        st.current_pr = Some(7);
+        let prior_gen = st.list_gen;
+        let prior_last_refresh = st.last_refresh_at;
+
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::MergeDone { number: 7, result: Ok(()) },
+        );
+
+        let nums: Vec<u32> = st.list.prs.iter().map(|p| p.number).collect();
+        assert_eq!(nums, vec![5, 8], "merged PR removed locally");
+        // No network refresh triggered.
+        assert!(!st.list_refresh_in_flight);
+        assert!(!st.list.loading);
+        assert!(!st.list.enriching);
+        assert_eq!(st.list_gen, prior_gen, "no new refresh generation");
+        assert_eq!(st.last_refresh_at, prior_last_refresh);
+        // UI returns to list, transient state cleared.
+        assert_eq!(st.focused, FocusedView::List);
+        assert!(st.review.is_none());
+        assert!(st.current_pr.is_none());
+        assert!(st.merge.is_none());
+        assert!(st.merging.is_none());
+        assert!(st.list.status.contains("merged #7"));
+        // Selection follows: was on #7, falls onto next visible row (#8 at idx 1).
+        assert_eq!(st.list.selected, 1);
+    }
+
+    #[test]
+    fn merge_done_clamps_selection_when_last_row_merged() {
+        let mut st = dummy_app_state();
+        let mut cache = Cache::new();
+        let mut app = test_app_for_state(&mut cache);
+        st.list_gen = 1;
+        st.list.prs = vec![open_pr(5), open_pr(7), open_pr(8)];
+        st.list.selected = 2; // pointing at #8 (last)
+
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::MergeDone { number: 8, result: Ok(()) },
+        );
+
+        let nums: Vec<u32> = st.list.prs.iter().map(|p| p.number).collect();
+        assert_eq!(nums, vec![5, 7]);
+        assert_eq!(st.list.selected, 1, "selection clamped to last remaining row");
+    }
+
+    #[test]
+    fn merge_done_keeps_selection_when_other_pr_merged() {
+        // Merge initiated from a review of a non-selected PR. The list
+        // selection should follow its PR by number, not by index.
+        let mut st = dummy_app_state();
+        let mut cache = Cache::new();
+        let mut app = test_app_for_state(&mut cache);
+        st.list_gen = 1;
+        st.list.prs = vec![open_pr(5), open_pr(7), open_pr(8)];
+        st.list.selected = 0; // pointing at #5
+        st.current_pr = Some(7); // but viewing #7 in review
+
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::MergeDone { number: 7, result: Ok(()) },
+        );
+
+        let nums: Vec<u32> = st.list.prs.iter().map(|p| p.number).collect();
+        assert_eq!(nums, vec![5, 8]);
+        // #5 is still at index 0.
+        assert_eq!(st.list.selected, 0);
     }
 }
