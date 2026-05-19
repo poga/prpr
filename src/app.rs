@@ -5,6 +5,7 @@
 //! `Worker` thread and round-trips through channels (see `data::worker`).
 //! The UI drains worker responses each loop iteration.
 
+use std::collections::HashMap;
 use std::io::{self, Stdout};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -257,16 +258,12 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
             result: Ok(pkg),
         } => {
             let files_count = pkg.files.len();
-            app.cache.insert_partial(pkg.detail.clone());
-            app.cache.update_diff(number, &pkg.detail.head_ref_oid, pkg.files);
+            let detail = pkg.detail;
+            let head = detail.head_ref_oid.clone();
+            app.cache.insert_partial(detail);
+            app.cache.update_diff(number, &head, pkg.files);
             for (path, lc) in pkg.colors {
-                app.cache.add_file_colors(
-                    number,
-                    &pkg.detail.head_ref_oid,
-                    path,
-                    lc,
-                    std::collections::HashMap::new(),
-                );
+                app.cache.add_file_colors(number, &head, path, lc, HashMap::new());
             }
             if let Some(r) = st.review.as_mut()
                 && st.current_pr == Some(number)

@@ -101,7 +101,7 @@ impl Cache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::diff::{DiffLine, DiffOp, FileDiff};
+    use crate::data::diff::FileDiff;
     use crate::render::attribution::{CommitStats, LineColors};
     use pretty_assertions::assert_eq;
 
