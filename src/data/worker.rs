@@ -112,7 +112,7 @@ fn run_worker(
 ) {
     while let Ok(req) = req_rx.recv() {
         let response = match req {
-            Request::RefreshList => Response::ListLoaded(gh.list_prs(&repo_root)),
+            Request::RefreshList => Response::ListLoaded(gh.list_prs_fast(&repo_root)),
             Request::LoadPr(number) => {
                 let result = build_package(&*gh, &*git, &repo_root, number, window_size);
                 Response::PrLoaded { number, result }
@@ -335,7 +335,7 @@ mod tests {
     fn worker_round_trip() {
         // Spawn the worker, send a refresh, receive the result.
         let mut gh = FakeGh::new();
-        gh.prs = {
+        gh.prs_fast = {
             let json = include_str!("../../tests/fixtures/pr_list.json");
             serde_json::from_str(json).unwrap()
         };
