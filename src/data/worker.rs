@@ -187,38 +187,24 @@ fn run_load(
         let diff_tx = res_tx.clone();
         let detail_h = s.spawn(move || {
             let r = gh.view_pr(repo_root, number);
-            match &r {
-                Ok(d) => {
-                    let _ = view_tx.send(Response::PrDetail {
-                        number,
-                        result: Ok(d.clone()),
-                    });
-                }
-                Err(e) => {
-                    let _ = view_tx.send(Response::PrDetail {
-                        number,
-                        result: Err(anyhow!(e.to_string())),
-                    });
-                }
+            if let Ok(d) = &r {
+                let _ = view_tx.send(Response::PrDetail {
+                    number,
+                    result: Ok(d.clone()),
+                });
             }
+            // On error, run_load surfaces PrLoadError after join; no need
+            // to emit a redundant PrDetail{Err}.
             r
         });
         let diff_h = s.spawn(move || {
             let raw = gh.diff_pr(repo_root, number);
             let parsed = raw.and_then(|s| parse_diff(&s));
-            match &parsed {
-                Ok(f) => {
-                    let _ = diff_tx.send(Response::PrDiff {
-                        number,
-                        result: Ok(f.clone()),
-                    });
-                }
-                Err(e) => {
-                    let _ = diff_tx.send(Response::PrDiff {
-                        number,
-                        result: Err(anyhow!(e.to_string())),
-                    });
-                }
+            if let Ok(f) = &parsed {
+                let _ = diff_tx.send(Response::PrDiff {
+                    number,
+                    result: Ok(f.clone()),
+                });
             }
             parsed
         });
@@ -234,7 +220,7 @@ fn run_load(
         Err(e) => {
             let _ = res_tx.send(Response::PrLoadError {
                 number,
-                error: e.to_string(),
+                error: format!("{e:#}"),
             });
             return;
         }
@@ -244,7 +230,7 @@ fn run_load(
         Err(e) => {
             let _ = res_tx.send(Response::PrLoadError {
                 number,
-                error: e.to_string(),
+                error: format!("{e:#}"),
             });
             return;
         }
