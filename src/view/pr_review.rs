@@ -54,13 +54,10 @@ fn render_header(f: &mut Frame, area: Rect, pkg: &PrPackage) {
 }
 
 fn render_file_bar(f: &mut Frame, area: Rect, pkg: &PrPackage, st: &PrReviewState) {
-    let total = pkg.files.len();
-    let path = pkg
-        .files
-        .get(st.file_index)
-        .map(|f| f.path.as_str())
-        .unwrap_or("");
-    let counter = format!("file {}/{}", st.file_index + 1, total);
+    let paths = pkg.file_paths();
+    let total = paths.len();
+    let path = paths.get(st.file_index).copied().unwrap_or("");
+    let counter = format!("file {}/{}", st.file_index + 1, total.max(1));
     let pad = 40_usize.saturating_sub(path.len()) + 46;
     let line = Line::from(vec![
         Span::raw("  "),
@@ -84,6 +81,17 @@ fn render_file_bar(f: &mut Frame, area: Rect, pkg: &PrPackage, st: &PrReviewStat
 }
 
 fn render_diff_body(f: &mut Frame, area: Rect, pkg: &PrPackage, st: &PrReviewState) {
+    if pkg.files.is_empty() {
+        f.render_widget(
+            Paragraph::new(format!(
+                "  {} loading diff…",
+                crate::render::spinner::glyph()
+            ))
+            .style(Style::default().fg(OVERLAY1)),
+            area,
+        );
+        return;
+    }
     let Some(file) = pkg.files.get(st.file_index) else {
         return;
     };
@@ -242,6 +250,43 @@ mod tests {
                 "row {y} unexpectedly rendered the commit strip: {row:?}",
             );
         }
+    }
+
+    #[test]
+    fn file_bar_uses_detail_files_when_pkg_files_empty() {
+        let mut pkg = fixture_pkg();
+        pkg.files = vec![];
+        let st = PrReviewState::default();
+        // Use a wide terminal so the counter (right-hand side) isn't clipped.
+        let mut term = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        term.draw(|f| {
+            let area = f.area();
+            render(f, area, &pkg, &st);
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        // File bar is at row 2 (header row 0; spacer row 1; file bar rows 2-3).
+        let bar = buffer_line(buf, 2);
+        // First detail.files entry from fixture is "src/sched.rs".
+        assert!(bar.contains("src/sched.rs"), "bar was: {bar:?}");
+        // Counter shows detail.files count.
+        assert!(bar.contains(&format!("file 1/{}", pkg.detail.files.len())), "bar was: {bar:?}");
+    }
+
+    #[test]
+    fn diff_body_shows_loading_when_pkg_files_empty() {
+        let mut pkg = fixture_pkg();
+        pkg.files = vec![];
+        let st = PrReviewState::default();
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| {
+            let area = f.area();
+            render(f, area, &pkg, &st);
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let body = buffer_line(buf, 4);
+        assert!(body.contains("loading diff"), "body was: {body:?}");
     }
 
     #[test]

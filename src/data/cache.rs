@@ -19,6 +19,28 @@ pub struct PrPackage {
     pub commit_stats: HashMap<String, CommitStats>,
 }
 
+impl PrPackage {
+    /// Path list with fallback. While `gh pr diff` is still in flight,
+    /// `files` is empty and we use `detail.files` so the file bar and
+    /// picker can render immediately.
+    pub fn file_paths(&self) -> Vec<&str> {
+        if self.files.is_empty() {
+            self.detail.files.iter().map(|f| f.path.as_str()).collect()
+        } else {
+            self.files.iter().map(|f| f.path.as_str()).collect()
+        }
+    }
+
+    /// Total file count with the same fallback as `file_paths`.
+    pub fn file_count(&self) -> usize {
+        if self.files.is_empty() {
+            self.detail.files.len()
+        } else {
+            self.files.len()
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct Cache {
     pub list: Option<Vec<Pr>>,
@@ -222,5 +244,38 @@ mod tests {
     fn get_returns_none_for_unknown_pr() {
         let cache = Cache::new();
         assert!(cache.get(999).is_none());
+    }
+
+    #[test]
+    fn pr_package_file_count_uses_detail_when_files_empty() {
+        let detail = fixture_detail("h");
+        let n = detail.files.len();
+        let mut cache = Cache::new();
+        let number = detail.number;
+        cache.insert_partial(detail);
+        let pkg = cache.get(number).unwrap();
+        assert_eq!(pkg.file_count(), n);
+        assert!(pkg.file_paths().len() == n);
+    }
+
+    #[test]
+    fn pr_package_file_count_uses_files_when_populated() {
+        let detail = fixture_detail("h");
+        let mut cache = Cache::new();
+        let number = detail.number;
+        let head = detail.head_ref_oid.clone();
+        cache.insert_partial(detail);
+        cache.update_diff(
+            number,
+            &head,
+            vec![FileDiff {
+                path: "only.rs".into(),
+                lines: vec![],
+                binary: false,
+            }],
+        );
+        let pkg = cache.get(number).unwrap();
+        assert_eq!(pkg.file_count(), 1);
+        assert_eq!(pkg.file_paths(), vec!["only.rs"]);
     }
 }
