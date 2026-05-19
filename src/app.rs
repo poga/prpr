@@ -5,7 +5,6 @@
 //! `Worker` thread and round-trips through channels (see `data::worker`).
 //! The UI drains worker responses each loop iteration.
 
-use std::collections::HashMap;
 use std::io::{self, Stdout};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -179,7 +178,7 @@ fn send_refresh(app: &App, st: &mut AppState, silent: bool) {
     if !silent {
         st.list.loading = true;
     }
-    app.request(Request::RefreshList);
+    app.request(Request::RefreshList { r#gen: 0 });
 }
 
 pub fn run(term: &mut Term, app: &mut App, st: &mut AppState) -> Result<()> {
@@ -224,12 +223,8 @@ pub fn run(term: &mut Term, app: &mut App, st: &mut AppState) -> Result<()> {
 
 fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
     match resp {
-        Response::ListLoaded(Ok(prs)) => {
+        Response::ListFast { r#gen: _, result: Ok(prs) } => {
             st.list_refresh_in_flight = false;
-            // Preserve the user's selected PR across refreshes: capture the
-            // previously-selected PR's number, replace rows, then re-find the
-            // same number in the new visible list. Falls back to a clamped
-            // index if the PR is gone (e.g. closed/merged out of the filter).
             let prev_selected = st
                 .list
                 .visible_prs()
@@ -248,33 +243,34 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
             st.list.selected =
                 reselect_by_number(prev_selected, &new_numbers, st.list.selected);
         }
-        Response::ListLoaded(Err(e)) => {
+        Response::ListFast { r#gen: _, result: Err(e) } => {
             st.list_refresh_in_flight = false;
             st.list.loading = false;
             st.list.status = format!("refresh failed: {e}");
         }
-        Response::PrLoaded {
-            number,
-            result: Ok(pkg),
-        } => {
-            let files_count = pkg.files.len();
-            let detail = pkg.detail;
-            let head = detail.head_ref_oid.clone();
-            app.cache.insert_partial(detail);
-            app.cache.update_diff(number, &head, pkg.files);
-            for (path, lc) in pkg.colors {
-                app.cache.add_file_colors(number, &head, path, lc, HashMap::new());
+        Response::ListEnriched { r#gen: _, result: Ok(es) } => {
+            // Merge by number. Selection is preserved because rows are
+            // mutated, not replaced.
+            for e in &es {
+                if let Some(p) = st.list.prs.iter_mut().find(|p| p.number == e.number) {
+                    p.apply_enrichment(e);
+                }
             }
+        }
+        Response::ListEnriched { r#gen: _, result: Err(_) } => {
+            // Enrichment failure is non-fatal: rows already render with
+            // light-fields-only glyphs. Keep silent for now; Task 5 may
+            // surface this if we decide it's user-visible.
+        }
+        Response::PrDetail { number, result: Ok(detail) } => {
+            app.cache.insert_partial(detail);
             if let Some(r) = st.review.as_mut()
                 && st.current_pr == Some(number)
             {
-                r.status = format!("{} files", files_count);
+                r.status = "loading diff…".into();
             }
         }
-        Response::PrLoaded {
-            number,
-            result: Err(e),
-        } => {
+        Response::PrDetail { number, result: Err(e) } => {
             if let Some(r) = st.review.as_mut()
                 && st.current_pr == Some(number)
             {
@@ -282,17 +278,54 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
             }
             st.list.status = format!("load #{number} failed: {e}");
         }
-        Response::MergeDone {
+        Response::PrDiff { number, result: Ok(files) } => {
+            let head_oid = app
+                .cache
+                .get(number)
+                .map(|p| p.detail.head_ref_oid.clone());
+            if let Some(head) = head_oid {
+                app.cache.update_diff(number, &head, files);
+            }
+            if let Some(r) = st.review.as_mut()
+                && st.current_pr == Some(number)
+                && let Some(pkg) = app.cache.get(number)
+            {
+                r.status = format!("coloring {} files…", pkg.files.len());
+            }
+        }
+        Response::PrDiff { number, result: Err(e) } => {
+            if let Some(r) = st.review.as_mut()
+                && st.current_pr == Some(number)
+            {
+                r.status = format!("diff failed: {e}");
+            }
+        }
+        Response::PrFileColors {
             number,
-            result: Ok(()),
+            head_oid,
+            path,
+            colors,
+            stats,
         } => {
-            // Drop the user back into the PR list. The cached rows still
-            // include the just-merged PR, so clear them — the loading
-            // placeholder is shown until the auto-refresh repopulates the
-            // list with the new PR states. Manual `r` refreshes from the
-            // list deliberately keep rows visible (see pr_list::render_rows);
-            // post-merge is different because the visible data is known
-            // stale, not just possibly outdated.
+            app.cache.add_file_colors(number, &head_oid, path, colors, stats);
+        }
+        Response::PrColorsDone { number, head_oid: _ } => {
+            if let Some(r) = st.review.as_mut()
+                && st.current_pr == Some(number)
+                && let Some(pkg) = app.cache.get(number)
+            {
+                r.status = format!("{} files", pkg.files.len());
+            }
+        }
+        Response::PrLoadError { number, error } => {
+            if let Some(r) = st.review.as_mut()
+                && st.current_pr == Some(number)
+            {
+                r.status = format!("load failed: {error}");
+            }
+            st.list.status = format!("load #{number} failed: {error}");
+        }
+        Response::MergeDone { number, result: Ok(()) } => {
             st.focused = FocusedView::List;
             st.review = None;
             st.current_pr = None;
@@ -304,10 +337,7 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
             st.list.selected = 0;
             send_refresh(app, st, false);
         }
-        Response::MergeDone {
-            number,
-            result: Err(e),
-        } => {
+        Response::MergeDone { number, result: Err(e) } => {
             st.merging = None;
             st.list.status = format!("merge #{number} failed: {e}");
         }

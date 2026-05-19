@@ -24,29 +24,55 @@ use crate::data::diff::parse_diff;
 use crate::data::gh::GhClient;
 use crate::data::git::GitClient;
 use crate::data::log_patches::parse_deletions;
-use crate::data::pr::Pr;
 use crate::render::attribution::{CommitStats, LineColors, attribute_file, commit_stats_for_file};
 
 #[derive(Debug)]
 pub enum Request {
-    /// Refresh the PR list.
-    RefreshList,
-    /// Build the PrPackage for one PR (view + diff + blame + attribution).
+    /// Refresh the PR list. `gen` is echoed in both responses so the UI
+    /// can drop stale results from a superseded refresh cycle.
+    RefreshList { r#gen: u32 },
+    /// Build the streaming PR data set for one PR.
     LoadPr(u32),
     /// Run `gh pr merge <number> --<method>`.
     Merge { number: u32, method: String },
 }
 
-// PrPackage is much larger than the other variants. The channel is
-// low-volume (one response per UI action), so the size disparity isn't
-// worth boxing for.
+// PrPackage-derived variants are larger than the others. The channel
+// is low-volume per cycle so the size disparity isn't worth boxing for.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum Response {
-    ListLoaded(Result<Vec<Pr>>),
-    PrLoaded {
+    ListFast {
+        r#gen: u32,
+        result: anyhow::Result<Vec<crate::data::pr::Pr>>,
+    },
+    ListEnriched {
+        r#gen: u32,
+        result: anyhow::Result<Vec<crate::data::pr::PrEnrichment>>,
+    },
+    /// Granular PR-load events (see worker pipeline).
+    PrDetail {
         number: u32,
-        result: Result<PrPackage>,
+        result: anyhow::Result<crate::data::pr::PrDetail>,
+    },
+    PrDiff {
+        number: u32,
+        result: anyhow::Result<Vec<crate::data::diff::FileDiff>>,
+    },
+    PrFileColors {
+        number: u32,
+        head_oid: String,
+        path: String,
+        colors: crate::render::attribution::LineColors,
+        stats: HashMap<String, crate::render::attribution::CommitStats>,
+    },
+    PrColorsDone {
+        number: u32,
+        head_oid: String,
+    },
+    PrLoadError {
+        number: u32,
+        error: String,
     },
     MergeDone {
         number: u32,
@@ -111,20 +137,72 @@ fn run_worker(
     window_size: usize,
 ) {
     while let Ok(req) = req_rx.recv() {
-        let response = match req {
-            Request::RefreshList => Response::ListLoaded(gh.list_prs_fast(&repo_root)),
+        match req {
+            Request::RefreshList { r#gen } => {
+                let fast = gh.list_prs_fast(&repo_root);
+                if res_tx
+                    .send(Response::ListFast { r#gen, result: fast })
+                    .is_err()
+                {
+                    break;
+                }
+                let enriched = gh.list_prs_enriched(&repo_root);
+                if res_tx
+                    .send(Response::ListEnriched {
+                        r#gen,
+                        result: enriched,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
             Request::LoadPr(number) => {
+                // Streaming pipeline added in Task 7. For now keep the
+                // atomic build_package shape so the UI still works:
                 let result = build_package(&*gh, &*git, &repo_root, number, window_size);
-                Response::PrLoaded { number, result }
+                match result {
+                    Ok(pkg) => {
+                        let head = pkg.detail.head_ref_oid.clone();
+                        let _ = res_tx.send(Response::PrDetail {
+                            number,
+                            result: Ok(pkg.detail.clone()),
+                        });
+                        let _ = res_tx.send(Response::PrDiff {
+                            number,
+                            result: Ok(pkg.files.clone()),
+                        });
+                        for (path, lc) in pkg.colors {
+                            let _ = res_tx.send(Response::PrFileColors {
+                                number,
+                                head_oid: head.clone(),
+                                path,
+                                colors: lc,
+                                stats: HashMap::new(),
+                            });
+                        }
+                        let _ = res_tx.send(Response::PrColorsDone {
+                            number,
+                            head_oid: head,
+                        });
+                    }
+                    Err(e) => {
+                        let _ = res_tx.send(Response::PrLoadError {
+                            number,
+                            error: e.to_string(),
+                        });
+                    }
+                }
             }
             Request::Merge { number, method } => {
                 let result = gh.merge_pr(&repo_root, number, &method);
-                Response::MergeDone { number, result }
+                if res_tx
+                    .send(Response::MergeDone { number, result })
+                    .is_err()
+                {
+                    break;
+                }
             }
-        };
-        if res_tx.send(response).is_err() {
-            // UI dropped the receiver; nothing left to do.
-            break;
         }
     }
 }
@@ -332,24 +410,54 @@ mod tests {
     }
 
     #[test]
-    fn worker_round_trip() {
-        // Spawn the worker, send a refresh, receive the result.
+    fn worker_emits_list_fast_then_enriched_with_matching_gen() {
+        use crate::data::pr::{Author, Label, Pr, PrEnrichment, PrState, StatusCheck};
+
         let mut gh = FakeGh::new();
-        gh.prs_fast = {
-            let json = include_str!("../../tests/fixtures/pr_list.json");
-            serde_json::from_str(json).unwrap()
-        };
+        gh.prs_fast = vec![Pr {
+            number: 7,
+            title: "t".into(),
+            is_draft: false,
+            state: PrState::Open,
+            author: Author { login: "a".into() },
+            created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            updated_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            labels: vec![Label { name: "bug".into() }],
+            status_check_rollup: vec![],
+            review_decision: None,
+            mergeable: None,
+        }];
+        gh.enrichments = vec![PrEnrichment {
+            number: 7,
+            status_check_rollup: vec![StatusCheck {
+                status: Some("COMPLETED".into()),
+                conclusion: Some("SUCCESS".into()),
+            }],
+            review_decision: None,
+            mergeable: Some("MERGEABLE".into()),
+        }];
         let git = FakeGit::new("/tmp/repo");
         let worker = Worker::spawn("/tmp/repo".into(), Arc::new(gh), Arc::new(git), 7);
 
-        worker.send(Request::RefreshList);
-        let resp = worker.rx.recv().unwrap();
-        match resp {
-            Response::ListLoaded(Ok(prs)) => {
-                assert_eq!(prs.len(), 2);
-                assert_eq!(prs[0].number, 482);
+        worker.send(Request::RefreshList { r#gen: 42 });
+
+        let resp1 = worker.rx.recv().unwrap();
+        match resp1 {
+            Response::ListFast { r#gen: 42, result: Ok(prs) } => {
+                assert_eq!(prs.len(), 1);
+                assert_eq!(prs[0].number, 7);
             }
-            other => panic!("unexpected response: {:?}", other),
+            other => panic!("expected ListFast{{gen:42}}, got {:?}", other),
+        }
+
+        let resp2 = worker.rx.recv().unwrap();
+        match resp2 {
+            Response::ListEnriched { r#gen: 42, result: Ok(e) } => {
+                assert_eq!(e.len(), 1);
+                assert_eq!(e[0].number, 7);
+                assert_eq!(e[0].status_check_rollup.len(), 1);
+            }
+            other => panic!("expected ListEnriched{{gen:42}}, got {:?}", other),
         }
     }
 }
