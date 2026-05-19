@@ -129,6 +129,7 @@ impl AppState {
                 loading: false,
                 enriching: false,
                 loading_stage: None,
+                manual_refresh_in_flight: false,
             },
             review: None,
             current_pr: None,
@@ -183,6 +184,7 @@ fn send_refresh(app: &App, st: &mut AppState, silent: bool) {
     st.list.enriching = false;
     if !silent {
         st.list.loading = true;
+        st.list.manual_refresh_in_flight = true;
     }
     // Seed the stage so the very first frame after a manual `r` already
     // shows what step is running. The worker's own ListProgress arrives a
@@ -266,6 +268,7 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
                 st.list.enriching = false;
                 st.list.loading = false;
                 st.list.loading_stage = None;
+                st.list.manual_refresh_in_flight = false;
                 st.list.status = format!("refresh failed: {e}");
             }
         },
@@ -274,6 +277,7 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
             st.list_refresh_in_flight = false;
             st.list.enriching = false;
             st.list.loading_stage = None;
+            st.list.manual_refresh_in_flight = false;
             if let Ok(es) = result {
                 for e in &es {
                     if let Some(p) =
@@ -441,6 +445,21 @@ fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) 
     // Ctrl-C is the one escape hatch — if the subprocess hangs, the
     // user must still be able to quit.
     if st.merging.is_some() {
+        if ev.code == crossterm::event::KeyCode::Char('c')
+            && ev
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL)
+        {
+            st.running = false;
+        }
+        return;
+    }
+
+    // While the user-initiated list refresh is in flight, the view is
+    // blocked — rows are hidden behind a loading placeholder and acting
+    // on stale state would be confusing. Keep the same Ctrl-C escape
+    // hatch as the merge-in-flight branch above.
+    if st.list.manual_refresh_in_flight {
         if ev.code == crossterm::event::KeyCode::Char('c')
             && ev
                 .modifiers

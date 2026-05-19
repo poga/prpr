@@ -31,6 +31,12 @@ pub struct PrListState {
     /// Renderer prefers this label over the generic "loading PRs…" so the
     /// user sees whether `gh` or `git fetch` is the slow step.
     pub loading_stage: Option<ListStage>,
+    /// True from when the user presses `r` (or the initial load fires) until
+    /// the full refresh — fast list **and** enrichment — completes. The
+    /// renderer hides rows behind a full-area loading placeholder and the
+    /// input layer ignores keys other than quit so the user can't act on
+    /// stale data mid-refresh.
+    pub manual_refresh_in_flight: bool,
 }
 
 impl PrListState {
@@ -80,10 +86,11 @@ fn render_header(f: &mut Frame, area: Rect, st: &PrListState) {
 }
 
 fn render_rows(f: &mut Frame, area: Rect, st: &PrListState, now: DateTime<Utc>) {
-    // Only blank the body on a cold load (no prior rows). For refreshes,
-    // keep the existing rows visible and let the footer carry the spinner —
-    // otherwise the user loses their place every time they press `r`.
-    if st.loading && st.prs.is_empty() {
+    // Manual refresh (initial load or pressing `r`) blocks the view: the
+    // rows are replaced with a centered loading placeholder until the fast
+    // list AND enrichment have both arrived. Silent auto-refresh keeps the
+    // rows visible — only the user-initiated path is intentionally modal.
+    if st.manual_refresh_in_flight {
         let body = st
             .loading_stage
             .map(|s| s.label())
@@ -284,6 +291,7 @@ mod tests {
             enriching: false,
             loading_stage: None,
             status: String::new(),
+            manual_refresh_in_flight: false,
         }
     }
 
@@ -338,6 +346,7 @@ mod tests {
         let mut st = fixture_state();
         st.prs.clear();
         st.loading = true;
+        st.manual_refresh_in_flight = true;
         st.loading_stage = Some(ListStage::FetchingRefs);
         let mut term = Terminal::new(TestBackend::new(80, 10)).unwrap();
         let now: DateTime<Utc> = "2026-05-06T00:00:00Z".parse().unwrap();
@@ -380,6 +389,42 @@ mod tests {
         assert!(
             !bottom.contains("refreshing"),
             "footer should not fall back to generic refreshing; got: {bottom:?}"
+        );
+    }
+
+    #[test]
+    fn manual_refresh_hides_existing_rows() {
+        let mut st = fixture_state();
+        // Rows are present (warm refresh), but a user-initiated `r` is in
+        // flight — body must be replaced with a loading placeholder so the
+        // user cannot act on stale data mid-refresh.
+        assert!(!st.prs.is_empty(), "fixture should have rows");
+        st.manual_refresh_in_flight = true;
+        st.loading = true;
+        st.loading_stage = Some(ListStage::FetchingList);
+        let mut term = Terminal::new(TestBackend::new(80, 10)).unwrap();
+        let now: DateTime<Utc> = "2026-05-06T00:00:00Z".parse().unwrap();
+        term.draw(|f| {
+            let area = f.area();
+            render(f, area, &st, now)
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let all: String = (0..buf.area.height)
+            .map(|y| buffer_line(buf, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // No PR rows leaked through the placeholder.
+        for pr in &st.prs {
+            let needle = format!("#{}", pr.number);
+            assert!(
+                !all.contains(&needle),
+                "row {needle} should be hidden while manual refresh is in flight; got:\n{all}"
+            );
+        }
+        assert!(
+            all.contains("fetching PR list (gh)"),
+            "body should show stage label; got:\n{all}"
         );
     }
 
