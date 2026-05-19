@@ -127,6 +127,12 @@ fn render_footer(f: &mut Frame, area: Rect, st: &PrListState) {
                 .style(Style::default().fg(OVERLAY1)),
             chunks[1],
         );
+    } else if st.enriching {
+        f.render_widget(
+            Paragraph::new(format!("  {} enriching…", spinner::glyph()))
+                .style(Style::default().fg(OVERLAY1)),
+            chunks[1],
+        );
     } else {
         f.render_widget(
             Paragraph::new(
@@ -295,5 +301,36 @@ mod tests {
         (0..buf.area.width)
             .map(|x| buf[(x, y)].symbol().to_string())
             .collect::<String>()
+    }
+
+    #[test]
+    fn footer_shows_enriching_when_flag_set() {
+        let mut st = fixture_state();
+        st.enriching = true;
+        let mut term = Terminal::new(TestBackend::new(80, 10)).unwrap();
+        let now: DateTime<Utc> = "2026-05-06T00:00:00Z".parse().unwrap();
+        term.draw(|f| {
+            let area = f.area();
+            render(f, area, &st, now)
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let bottom = buffer_line(buf, 9);
+        assert!(bottom.contains("enriching"), "footer was: {bottom:?}");
+    }
+
+    #[test]
+    fn footer_omits_enriching_when_flag_clear() {
+        let st = fixture_state();
+        let mut term = Terminal::new(TestBackend::new(80, 10)).unwrap();
+        let now: DateTime<Utc> = "2026-05-06T00:00:00Z".parse().unwrap();
+        term.draw(|f| {
+            let area = f.area();
+            render(f, area, &st, now)
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let bottom = buffer_line(buf, 9);
+        assert!(!bottom.contains("enriching"), "footer was: {bottom:?}");
     }
 }
