@@ -108,6 +108,14 @@ impl Pr {
             CiState::Pass
         }
     }
+
+    /// Copy the heavy-fetch fields from `e` into `self`. Light fields
+    /// (title, author, dates, labels, state) are left untouched.
+    pub fn apply_enrichment(&mut self, e: &PrEnrichment) {
+        self.status_check_rollup = e.status_check_rollup.clone();
+        self.review_decision = e.review_decision;
+        self.mergeable = e.mergeable.clone();
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,6 +124,23 @@ pub enum CiState {
     Fail,
     Pending,
     None,
+}
+
+/// Heavy-fetch fields returned by the second `gh pr list` pass. Used to
+/// enrich an existing `Pr` produced by the fast pass.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct PrEnrichment {
+    pub number: u32,
+    #[serde(rename = "statusCheckRollup", default)]
+    pub status_check_rollup: Vec<StatusCheck>,
+    #[serde(
+        rename = "reviewDecision",
+        default,
+        deserialize_with = "deser_review_decision"
+    )]
+    pub review_decision: Option<ReviewDecision>,
+    #[serde(default)]
+    pub mergeable: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -255,5 +280,60 @@ mod tests {
         let json = r#"{"oid":"a","messageHeadline":"x","authors":[]}"#;
         let c: Commit = serde_json::from_str(json).unwrap();
         assert_eq!(c.committed_date, None);
+    }
+
+    #[test]
+    fn parses_enrichment_with_minimal_fields() {
+        let json = r#"[{
+            "number": 7,
+            "statusCheckRollup": [{"status":"COMPLETED","conclusion":"FAILURE"}],
+            "reviewDecision": "APPROVED",
+            "mergeable": "CONFLICTING"
+        }]"#;
+        let v: Vec<PrEnrichment> = serde_json::from_str(json).unwrap();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].number, 7);
+        assert_eq!(v[0].status_check_rollup.len(), 1);
+        assert_eq!(v[0].review_decision, Some(ReviewDecision::Approved));
+        assert_eq!(v[0].mergeable.as_deref(), Some("CONFLICTING"));
+    }
+
+    #[test]
+    fn enrichment_empty_review_decision_is_none() {
+        let json = r#"{"number":1,"reviewDecision":""}"#;
+        let e: PrEnrichment = serde_json::from_str(json).unwrap();
+        assert_eq!(e.review_decision, None);
+    }
+
+    #[test]
+    fn apply_enrichment_overwrites_heavy_fields_only() {
+        let mut p = Pr {
+            number: 7,
+            title: "t".into(),
+            is_draft: false,
+            state: PrState::Open,
+            author: Author { login: "a".into() },
+            created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            updated_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            labels: vec![Label { name: "bug".into() }],
+            status_check_rollup: vec![],
+            review_decision: None,
+            mergeable: None,
+        };
+        let e = PrEnrichment {
+            number: 7,
+            status_check_rollup: vec![StatusCheck {
+                status: Some("COMPLETED".into()),
+                conclusion: Some("SUCCESS".into()),
+            }],
+            review_decision: Some(ReviewDecision::Approved),
+            mergeable: Some("MERGEABLE".into()),
+        };
+        p.apply_enrichment(&e);
+        assert_eq!(p.status_check_rollup.len(), 1);
+        assert_eq!(p.review_decision, Some(ReviewDecision::Approved));
+        assert_eq!(p.mergeable.as_deref(), Some("MERGEABLE"));
+        assert_eq!(p.title, "t");
+        assert_eq!(p.labels.len(), 1);
     }
 }
