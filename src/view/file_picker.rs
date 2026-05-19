@@ -13,6 +13,11 @@ pub struct FilePickerState {
     pub query: String,
     pub all_files: Vec<String>,
     pub selected: usize,
+    /// True once the user has pressed `/`. Until then, typing letters
+    /// moves through the list (vim) instead of building a filter.
+    pub filter_active: bool,
+    /// First `g` of a pending `gg` (top) sequence in vim mode.
+    pub pending_g: bool,
 }
 
 impl FilePickerState {
@@ -21,6 +26,8 @@ impl FilePickerState {
             query: String::new(),
             all_files,
             selected: 0,
+            filter_active: false,
+            pending_g: false,
         };
         if let Some(path) = current
             && let Some(idx) = st.matches().iter().position(|p| p.as_str() == path)
@@ -28,6 +35,32 @@ impl FilePickerState {
             st.selected = idx;
         }
         st
+    }
+
+    pub fn move_down(&mut self, match_count: usize) {
+        let last = match_count.saturating_sub(1);
+        if self.selected < last {
+            self.selected += 1;
+        }
+    }
+
+    pub fn move_up(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+    }
+
+    /// Enter filter mode. Any pending `gg` is dropped — `/` is the new
+    /// modal boundary.
+    pub fn enter_filter(&mut self) {
+        self.filter_active = true;
+        self.pending_g = false;
+    }
+
+    /// Leave filter mode AND clear the query so the list returns to
+    /// its unfiltered state. Selection resets to the top to stay in range.
+    pub fn exit_filter_reset(&mut self) {
+        self.filter_active = false;
+        self.query.clear();
+        self.selected = 0;
     }
 
     pub fn page_down(&mut self, page: usize, match_count: usize) {
@@ -85,13 +118,27 @@ pub fn render(f: &mut Frame, area: Rect, st: &FilePickerState) {
         .constraints([Constraint::Length(3), Constraint::Min(1)])
         .split(modal);
 
-    let query = Paragraph::new(format!("> {}", st.query))
+    let (title, body) = if st.filter_active {
+        (
+            " file · filter · Esc cancel ".to_string(),
+            format!("/ {}_", st.query),
+        )
+    } else {
+        let hint = " file · j/k move · / filter · q close ".to_string();
+        let body = if st.query.is_empty() {
+            "(type / to filter)".to_string()
+        } else {
+            format!("/ {}", st.query)
+        };
+        (hint, body)
+    };
+    let query = Paragraph::new(body)
         .style(Style::default().fg(TEXT))
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(SURFACE2))
-                .title(" file "),
+                .title(title),
         );
     f.render_widget(query, chunks[0]);
 
@@ -144,6 +191,8 @@ mod tests {
             query: query.into(),
             all_files: files.iter().map(|s| s.to_string()).collect(),
             selected: 0,
+            filter_active: false,
+            pending_g: false,
         }
     }
 
@@ -169,6 +218,33 @@ mod tests {
     fn new_with_unknown_current_file_starts_at_zero() {
         let files: Vec<String> = ["a", "b"].iter().map(|s| s.to_string()).collect();
         let st = FilePickerState::new(files, Some("nope"));
+        assert_eq!(st.selected, 0);
+    }
+
+    #[test]
+    fn new_defaults_to_vim_mode() {
+        let st = FilePickerState::new(vec!["a".into()], None);
+        assert!(!st.filter_active);
+        assert!(st.query.is_empty());
+    }
+
+    #[test]
+    fn enter_filter_sets_flag_and_clears_pending_g() {
+        let mut st = st_with(&["a", "b"], "");
+        st.pending_g = true;
+        st.enter_filter();
+        assert!(st.filter_active);
+        assert!(!st.pending_g);
+    }
+
+    #[test]
+    fn exit_filter_reset_clears_query_and_selection() {
+        let mut st = st_with(&["a", "b"], "abc");
+        st.filter_active = true;
+        st.selected = 1;
+        st.exit_filter_reset();
+        assert!(!st.filter_active);
+        assert!(st.query.is_empty());
         assert_eq!(st.selected, 0);
     }
 
@@ -256,6 +332,19 @@ mod tests {
     }
 
     #[test]
+    fn move_down_and_up_clamp() {
+        let mut st = st_with(&["a", "b", "c"], "");
+        st.move_down(3);
+        st.move_down(3);
+        st.move_down(3);
+        assert_eq!(st.selected, 2);
+        st.move_up();
+        st.move_up();
+        st.move_up();
+        assert_eq!(st.selected, 0);
+    }
+
+    #[test]
     fn selected_row_visible_when_past_viewport() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
@@ -265,6 +354,8 @@ mod tests {
             query: String::new(),
             all_files: files,
             selected: 40,
+            filter_active: false,
+            pending_g: false,
         };
 
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -288,5 +379,69 @@ mod tests {
             dump.contains("dir/file_40.rs"),
             "selected file not visible in rendered output:\n{dump}"
         );
+    }
+
+    #[test]
+    fn render_shows_vim_hint_when_not_filtering() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let st = FilePickerState {
+            query: String::new(),
+            all_files: vec!["a.rs".into()],
+            selected: 0,
+            filter_active: false,
+            pending_g: false,
+        };
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| {
+            let area = f.area();
+            render(f, area, &st);
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let dump: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+        assert!(
+            dump.contains("type / to filter"),
+            "expected vim hint, got:\n{dump}"
+        );
+    }
+
+    #[test]
+    fn render_shows_query_when_filter_active() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let st = FilePickerState {
+            query: "lib".into(),
+            all_files: vec!["a.rs".into(), "src/lib.rs".into()],
+            selected: 0,
+            filter_active: true,
+            pending_g: false,
+        };
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| {
+            let area = f.area();
+            render(f, area, &st);
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let dump: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+        assert!(dump.contains("/ lib"), "expected filter input, got:\n{dump}");
+        assert!(dump.contains("filter"), "expected filter title:\n{dump}");
     }
 }

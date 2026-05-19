@@ -1,13 +1,15 @@
 //! Commits modal: read-only vertical list of the PR's commits.
 //!
-//! Triggered by `c` from the review view. Display-only — selection is
-//! visual; Enter/Esc/c just close.
+//! Triggered by `c` from the review view. Vim navigation by default
+//! (j/k, g g/G, Ctrl-d/u). Press `/` to filter by commit headline.
+//! `q`/`Esc`/`Enter` close the modal in vim mode; in filter mode `Esc`
+//! exits filter and clears the query.
 
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
@@ -29,12 +31,17 @@ pub struct CommitRow {
 #[derive(Debug, Default)]
 pub struct CommitsModalState {
     pub rows: Vec<CommitRow>,
+    /// Index into `matches()`, not into `rows`.
     pub selected: usize,
+    pub query: String,
+    pub filter_active: bool,
+    /// First `g` of a pending `gg` (top) sequence in vim mode.
+    pub pending_g: bool,
 }
 
 impl CommitsModalState {
-    pub fn move_down(&mut self) {
-        let last = self.rows.len().saturating_sub(1);
+    pub fn move_down(&mut self, match_count: usize) {
+        let last = match_count.saturating_sub(1);
         if self.selected < last {
             self.selected += 1;
         }
@@ -44,8 +51,8 @@ impl CommitsModalState {
         self.selected = self.selected.saturating_sub(1);
     }
 
-    pub fn page_down(&mut self, page: usize) {
-        let last = self.rows.len().saturating_sub(1);
+    pub fn page_down(&mut self, page: usize, match_count: usize) {
+        let last = match_count.saturating_sub(1);
         self.selected = (self.selected + page).min(last);
     }
 
@@ -57,8 +64,33 @@ impl CommitsModalState {
         self.selected = 0;
     }
 
-    pub fn to_bottom(&mut self) {
-        self.selected = self.rows.len().saturating_sub(1);
+    pub fn to_bottom(&mut self, match_count: usize) {
+        self.selected = match_count.saturating_sub(1);
+    }
+
+    pub fn enter_filter(&mut self) {
+        self.filter_active = true;
+        self.pending_g = false;
+    }
+
+    pub fn exit_filter_reset(&mut self) {
+        self.filter_active = false;
+        self.query.clear();
+        self.selected = 0;
+    }
+
+    /// Returns rows whose headline contains the query (case-insensitive).
+    /// Empty query returns all rows in their original order. Ordering is
+    /// stable so the user's visual mental model isn't shuffled by typing.
+    pub fn matches(&self) -> Vec<&CommitRow> {
+        if self.query.is_empty() {
+            return self.rows.iter().collect();
+        }
+        let q = self.query.to_lowercase();
+        self.rows
+            .iter()
+            .filter(|r| r.headline.to_lowercase().contains(&q))
+            .collect()
     }
 }
 
@@ -67,8 +99,51 @@ pub fn render(f: &mut Frame, area: Rect, st: &CommitsModalState) {
     let modal = centered(area, 60, 60);
     f.render_widget(Clear, modal);
 
-    let lines: Vec<Line> = st
-        .rows
+    // Show a query row above the list whenever filtering is active OR a
+    // query was previously typed. In pure vim mode the list takes the
+    // full modal height.
+    let show_query_row = st.filter_active || !st.query.is_empty();
+
+    let chunks = if show_query_row {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Min(1)])
+            .split(modal)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1)])
+            .split(modal)
+    };
+
+    let list_rect = if show_query_row {
+        let (title, body) = if st.filter_active {
+            (
+                " commits · filter · Esc cancel ".to_string(),
+                format!("/ {}_", st.query),
+            )
+        } else {
+            (
+                " commits · / filter · Esc clear ".to_string(),
+                format!("/ {}", st.query),
+            )
+        };
+        let q = Paragraph::new(body)
+            .style(Style::default().fg(TEXT))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(SURFACE2))
+                    .title(title),
+            );
+        f.render_widget(q, chunks[0]);
+        chunks[1]
+    } else {
+        chunks[0]
+    };
+
+    let matches = st.matches();
+    let lines: Vec<Line> = matches
         .iter()
         .enumerate()
         .map(|(i, r)| {
@@ -92,19 +167,29 @@ pub fn render(f: &mut Frame, area: Rect, st: &CommitsModalState) {
         })
         .collect();
 
+    let title = if show_query_row {
+        "".to_string()
+    } else {
+        " commits · j/k move · / filter · q close ".to_string()
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(SURFACE2))
-        .title(" commits ");
+        .title(title);
     // -2 strips the top and bottom border rows.
-    let visible = modal.height.saturating_sub(2) as usize;
+    let visible = list_rect.height.saturating_sub(2) as usize;
     let scroll_offset = if visible == 0 {
         0
     } else {
         // Pin selected row at the bottom of the viewport once it would scroll off.
         st.selected.saturating_sub(visible.saturating_sub(1))
     };
-    f.render_widget(Paragraph::new(lines).scroll((scroll_offset as u16, 0)).block(block), modal);
+    f.render_widget(
+        Paragraph::new(lines)
+            .scroll((scroll_offset as u16, 0))
+            .block(block),
+        list_rect,
+    );
 }
 
 fn centered(area: Rect, pct_w: u16, pct_h: u16) -> Rect {
@@ -235,14 +320,12 @@ mod tests {
     #[test]
     fn move_down_clamps_at_bottom() {
         let mut st = CommitsModalState {
-            rows: vec![
-                dummy_row(),
-                dummy_row(),
-                dummy_row(),
-            ],
+            rows: vec![dummy_row(), dummy_row(), dummy_row()],
             selected: 2,
+            ..Default::default()
         };
-        st.move_down();
+        let n = st.matches().len();
+        st.move_down(n);
         assert_eq!(st.selected, 2);
     }
 
@@ -251,6 +334,7 @@ mod tests {
         let mut st = CommitsModalState {
             rows: vec![dummy_row()],
             selected: 0,
+            ..Default::default()
         };
         st.move_up();
         assert_eq!(st.selected, 0);
@@ -261,8 +345,10 @@ mod tests {
         let mut st = CommitsModalState {
             rows: (0..30).map(|_| dummy_row()).collect(),
             selected: 5,
+            ..Default::default()
         };
-        st.page_down(10);
+        let n = st.matches().len();
+        st.page_down(10, n);
         assert_eq!(st.selected, 15);
     }
 
@@ -271,8 +357,10 @@ mod tests {
         let mut st = CommitsModalState {
             rows: (0..10).map(|_| dummy_row()).collect(),
             selected: 5,
+            ..Default::default()
         };
-        st.page_down(20);
+        let n = st.matches().len();
+        st.page_down(20, n);
         assert_eq!(st.selected, 9);
     }
 
@@ -281,6 +369,7 @@ mod tests {
         let mut st = CommitsModalState {
             rows: (0..30).map(|_| dummy_row()).collect(),
             selected: 25,
+            ..Default::default()
         };
         st.page_up(10);
         assert_eq!(st.selected, 15);
@@ -291,6 +380,7 @@ mod tests {
         let mut st = CommitsModalState {
             rows: (0..30).map(|_| dummy_row()).collect(),
             selected: 3,
+            ..Default::default()
         };
         st.page_up(10);
         assert_eq!(st.selected, 0);
@@ -301,6 +391,7 @@ mod tests {
         let mut st = CommitsModalState {
             rows: (0..10).map(|_| dummy_row()).collect(),
             selected: 7,
+            ..Default::default()
         };
         st.to_top();
         assert_eq!(st.selected, 0);
@@ -311,15 +402,17 @@ mod tests {
         let mut st = CommitsModalState {
             rows: (0..10).map(|_| dummy_row()).collect(),
             selected: 2,
+            ..Default::default()
         };
-        st.to_bottom();
+        let n = st.matches().len();
+        st.to_bottom(n);
         assert_eq!(st.selected, 9);
     }
 
     #[test]
     fn to_bottom_on_empty_stays_at_zero() {
-        let mut st = CommitsModalState { rows: vec![], selected: 0 };
-        st.to_bottom();
+        let mut st = CommitsModalState::default();
+        st.to_bottom(0);
         assert_eq!(st.selected, 0);
     }
 
@@ -328,11 +421,64 @@ mod tests {
         let mut st = CommitsModalState {
             rows: vec![dummy_row(), dummy_row(), dummy_row()],
             selected: 1,
+            ..Default::default()
         };
-        st.move_down();
+        let n = st.matches().len();
+        st.move_down(n);
         assert_eq!(st.selected, 2);
         st.move_up();
         st.move_up();
+        assert_eq!(st.selected, 0);
+    }
+
+    #[test]
+    fn matches_returns_all_rows_when_query_empty() {
+        let st = CommitsModalState {
+            rows: vec![row_with_headline("first"), row_with_headline("second")],
+            ..Default::default()
+        };
+        let m = st.matches();
+        assert_eq!(m.len(), 2);
+    }
+
+    #[test]
+    fn matches_filters_by_headline_case_insensitive() {
+        let st = CommitsModalState {
+            rows: vec![
+                row_with_headline("Fix login bug"),
+                row_with_headline("Add logging"),
+                row_with_headline("Refactor router"),
+            ],
+            query: "log".into(),
+            ..Default::default()
+        };
+        let names: Vec<&str> = st.matches().iter().map(|r| r.headline.as_str()).collect();
+        assert_eq!(names, vec!["Fix login bug", "Add logging"]);
+    }
+
+    #[test]
+    fn enter_filter_sets_flag_and_clears_pending_g() {
+        let mut st = CommitsModalState {
+            pending_g: true,
+            ..Default::default()
+        };
+        st.enter_filter();
+        assert!(st.filter_active);
+        assert!(!st.pending_g);
+    }
+
+    #[test]
+    fn exit_filter_reset_clears_query_and_selection() {
+        let mut st = CommitsModalState {
+            rows: vec![dummy_row(), dummy_row()],
+            selected: 1,
+            query: "abc".into(),
+            filter_active: true,
+            pending_g: false,
+        };
+        st.exit_filter_reset();
+        assert!(!st.filter_active);
+        assert!(st.query.is_empty());
         assert_eq!(st.selected, 0);
     }
 
@@ -341,6 +487,18 @@ mod tests {
             color: Color::White,
             short_sha: "abc123".into(),
             headline: "x".into(),
+            author: "a".into(),
+            relative_date: "1d".into(),
+            adds: 0,
+            dels: 0,
+        }
+    }
+
+    fn row_with_headline(h: &str) -> CommitRow {
+        CommitRow {
+            color: Color::White,
+            short_sha: "abc123".into(),
+            headline: h.into(),
             author: "a".into(),
             relative_date: "1d".into(),
             adds: 0,
@@ -375,6 +533,7 @@ mod tests {
                 },
             ],
             selected: 1,
+            ..Default::default()
         };
 
         let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
@@ -421,7 +580,11 @@ mod tests {
         use ratatui::backend::TestBackend;
 
         let rows: Vec<CommitRow> = (0..50).map(|i| row_with_sha(&format!("c{:04}", i))).collect();
-        let st = CommitsModalState { rows, selected: 40 };
+        let st = CommitsModalState {
+            rows,
+            selected: 40,
+            ..Default::default()
+        };
 
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         term.draw(|f| {
@@ -448,13 +611,14 @@ mod tests {
 
     #[test]
     fn render_highlights_selected_row() {
+        use crate::render::style::SURFACE0;
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
-        use crate::render::style::SURFACE0;
 
         let st = CommitsModalState {
             rows: vec![dummy_row(), dummy_row()],
             selected: 1,
+            ..Default::default()
         };
         let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
         term.draw(|f| {
@@ -475,5 +639,59 @@ mod tests {
             }
         }
         assert!(found_highlighted, "no cell with SURFACE0 bg found");
+    }
+
+    #[test]
+    fn render_shows_query_bar_only_when_filtering_or_query_set() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // Vim mode, empty query: no query input row (just the title with
+        // hint). The body should not contain a "/ <query>" prompt line.
+        let st = CommitsModalState {
+            rows: vec![row_with_headline("hello world")],
+            ..Default::default()
+        };
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| render(f, f.area(), &st)).unwrap();
+        let dump = dump_buffer(term.backend().buffer());
+        // Find the body region of the modal; the vim-mode hint title
+        // appears once on the top border. A separate query input row
+        // would mean a second occurrence below the title.
+        let slash_lines = dump.lines().filter(|l| l.contains("/ ")).count();
+        assert_eq!(
+            slash_lines, 1,
+            "vim mode should only have one '/ ' occurrence (the title hint), got:\n{dump}"
+        );
+        assert!(
+            dump.contains("j/k move"),
+            "should show vim hint:\n{dump}"
+        );
+
+        // Filter mode: query bar is shown.
+        let st = CommitsModalState {
+            rows: vec![row_with_headline("hello world")],
+            query: "hel".into(),
+            filter_active: true,
+            ..Default::default()
+        };
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| render(f, f.area(), &st)).unwrap();
+        let dump = dump_buffer(term.backend().buffer());
+        assert!(
+            dump.contains("/ hel"),
+            "filter mode should show query:\n{dump}"
+        );
+    }
+
+    fn dump_buffer(buf: &ratatui::buffer::Buffer) -> String {
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect()
     }
 }

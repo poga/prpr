@@ -57,4 +57,10 @@ const HELP_TEXT: &[&str] = &[
     "    s            toggle SHA margin",
     "    q / Esc      back to list",
     "",
+    "  File picker / commits modal (vim mode)",
+    "    j/k          move          g g / G   top / bottom",
+    "    Ctrl-d/u     half-page     ↵         select / close",
+    "    /            start filter  q / Esc   close",
+    "    (in filter)  Esc clears query and returns to vim mode",
+    "",
 ];
