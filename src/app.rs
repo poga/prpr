@@ -1165,4 +1165,91 @@ mod tests {
         let new = [101u32, 99, 7];
         assert_eq!(reselect_by_number(None, &new, 5), 2);
     }
+
+    #[test]
+    fn end_to_end_load_pr_progresses_through_partial_states() {
+        use crate::data::gh::fakes::FakeGh;
+        use crate::data::git::fakes::FakeGit;
+        use crate::data::pr::PrDetail;
+        use crate::data::worker::Request;
+
+        let detail: PrDetail =
+            serde_json::from_str(include_str!("../tests/fixtures/pr_view.json")).unwrap();
+        let number = detail.number;
+        let head_sha = detail.head_ref_oid.clone();
+
+        let mut gh = FakeGh::new();
+        gh.views.insert(number, detail.clone());
+        gh.diffs.insert(
+            number,
+            include_str!("../tests/fixtures/diff_basic.patch").to_string(),
+        );
+
+        let mut git = FakeGit::new("/tmp/repo");
+        let porcelain = include_str!("../tests/fixtures/blame_porcelain.txt").to_string();
+        git.blames
+            .insert((head_sha.clone(), "src/sched.rs".into()), porcelain.clone());
+        git.blames
+            .insert((head_sha.clone(), "README.md".into()), porcelain);
+
+        let mut app = App::new(
+            "/tmp/repo".into(),
+            std::sync::Arc::new(gh),
+            std::sync::Arc::new(git),
+            crate::config::Config::default(),
+        );
+        let mut st = AppState::new("repo".into(), "main".into());
+        st.current_pr = Some(number);
+        st.review = Some(PrReviewState {
+            file_index: 0,
+            cursor_line: 0,
+            scroll: 0,
+            show_sha_margin: false,
+            status: "loading…".into(),
+        });
+
+        app.request(Request::LoadPr(number));
+
+        // Drain until we see PrColorsDone, feeding events through.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut saw_detail = false;
+        let mut saw_diff = false;
+        let mut done = false;
+        while std::time::Instant::now() < deadline && !done {
+            match app
+                .worker
+                .rx
+                .recv_timeout(std::time::Duration::from_millis(500))
+            {
+                Ok(resp) => {
+                    let is_detail = matches!(resp, crate::data::worker::Response::PrDetail { .. });
+                    let is_diff = matches!(resp, crate::data::worker::Response::PrDiff { .. });
+                    let is_done =
+                        matches!(resp, crate::data::worker::Response::PrColorsDone { .. });
+                    handle_response(&mut app, &mut st, resp);
+                    if is_detail {
+                        saw_detail = true;
+                        assert!(app.cache.get(number).is_some(), "cache should have partial");
+                        assert_eq!(st.review.as_ref().unwrap().status, "loading diff…");
+                    }
+                    if is_diff {
+                        saw_diff = true;
+                        assert!(!app.cache.get(number).unwrap().files.is_empty());
+                        assert!(
+                            st.review.as_ref().unwrap().status.starts_with("coloring "),
+                            "status was: {}",
+                            st.review.as_ref().unwrap().status,
+                        );
+                    }
+                    if is_done {
+                        done = true;
+                        let n = app.cache.get(number).unwrap().files.len();
+                        assert_eq!(st.review.as_ref().unwrap().status, format!("{n} files"));
+                    }
+                }
+                Err(_) => continue,
+            }
+        }
+        assert!(saw_detail && saw_diff && done, "missed an event");
+    }
 }
