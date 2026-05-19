@@ -39,6 +39,7 @@ const HELP_TEXT: &[&str] = &[
     "    j/k or ↓/↑   move",
     "    g g / G      top / bottom",
     "    ↵            open PR",
+    "    o            open PR in browser",
     "    m            merge modal",
     "    /            search",
     "    f            cycle filter",
