@@ -14,6 +14,7 @@ pub enum Action {
     ListTop,
     ListBottom,
     ListOpen,
+    ListOpenInBrowser,
     ListMerge,
     ListRefresh,
     ListSearch,
@@ -74,6 +75,7 @@ fn list(ev: KeyEvent) -> Action {
         KeyCode::Char('G') => Action::ListBottom,
         KeyCode::Char('g') => Action::ListTop, // second `g` handled by stateful caller
         KeyCode::Enter => Action::ListOpen,
+        KeyCode::Char('o') => Action::ListOpenInBrowser,
         KeyCode::Char('m') => Action::ListMerge,
         KeyCode::Char('/') => Action::ListSearch,
         KeyCode::Char('f') => Action::ListCycleFilter,
@@ -216,6 +218,11 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
         assert_eq!(mouse_dispatch(ev), MouseAction::ClickAt { col: 12, row: 7 });
+    }
+
+    #[test]
+    fn list_o_opens_pr_in_browser() {
+        assert_eq!(dispatch(FocusedView::List, k('o')), Action::ListOpenInBrowser);
     }
 
     #[test]

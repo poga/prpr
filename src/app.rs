@@ -74,6 +74,7 @@ pub struct App {
     pub cache: Cache,
     pub config: Config,
     pub worker: Worker,
+    pub repo_root: std::path::PathBuf,
 }
 
 impl App {
@@ -83,11 +84,12 @@ impl App {
         git: Arc<dyn GitClient>,
         config: Config,
     ) -> Self {
-        let worker = Worker::spawn(repo_root, gh, git, config.window_size);
+        let worker = Worker::spawn(repo_root.clone(), gh, git, config.window_size);
         Self {
             cache: Cache::new(),
             config,
             worker,
+            repo_root,
         }
     }
 
@@ -569,6 +571,16 @@ fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) 
                 }
             }
         }
+        Action::ListOpenInBrowser => {
+            if let Some(num) = st
+                .list
+                .visible_prs()
+                .get(st.list.selected)
+                .map(|p| p.number)
+            {
+                open_pr_in_browser(&app.repo_root, num);
+            }
+        }
         Action::ListMerge => open_merge(st),
         Action::ListRefresh => {
             send_refresh(app, st, false);
@@ -659,6 +671,15 @@ fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) 
         }
         Action::Nothing => {}
     }
+}
+
+fn open_pr_in_browser(repo_root: &std::path::Path, number: u32) {
+    let _ = std::process::Command::new("gh")
+        .current_dir(repo_root)
+        .args(["pr", "view", "--web", &number.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
 }
 
 fn open_merge(st: &mut AppState) {
