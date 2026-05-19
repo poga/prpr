@@ -23,6 +23,9 @@ pub struct PrListState {
     /// True while the initial `gh pr list` is in flight. The renderer
     /// shows a centered "loading…" placeholder instead of an empty body.
     pub loading: bool,
+    /// True between `ListFast` and `ListEnriched` arrivals. Footer shows
+    /// `enriching…` so background work is never silent.
+    pub enriching: bool,
 }
 
 impl PrListState {
@@ -259,6 +262,7 @@ mod tests {
             filter_open_only: true,
             search: None,
             loading: false,
+            enriching: false,
             status: String::new(),
         }
     }

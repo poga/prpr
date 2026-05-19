@@ -110,6 +110,9 @@ pub struct AppState {
     pub running: bool,
     pub last_refresh_at: Option<Instant>,
     pub list_refresh_in_flight: bool,
+    /// Monotonically-incrementing refresh cycle id. Used to drop stale
+    /// `ListFast`/`ListEnriched` responses from a superseded refresh.
+    pub list_gen: u32,
 }
 
 impl AppState {
@@ -125,6 +128,7 @@ impl AppState {
                 search: None,
                 status: String::new(),
                 loading: false,
+                enriching: false,
             },
             review: None,
             current_pr: None,
@@ -136,6 +140,7 @@ impl AppState {
             running: true,
             last_refresh_at: None,
             list_refresh_in_flight: false,
+            list_gen: 0,
         }
     }
 }
@@ -175,10 +180,13 @@ pub fn restore_terminal() -> Result<()> {
 fn send_refresh(app: &App, st: &mut AppState, silent: bool) {
     st.last_refresh_at = Some(Instant::now());
     st.list_refresh_in_flight = true;
+    st.list.enriching = false;
     if !silent {
         st.list.loading = true;
     }
-    app.request(Request::RefreshList { generation: 0 });
+    st.list_gen = st.list_gen.wrapping_add(1);
+    let g = st.list_gen;
+    app.request(Request::RefreshList { generation: g });
 }
 
 pub fn run(term: &mut Term, app: &mut App, st: &mut AppState) -> Result<()> {
@@ -223,45 +231,51 @@ pub fn run(term: &mut Term, app: &mut App, st: &mut AppState) -> Result<()> {
 
 fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
     match resp {
-        Response::ListFast { generation: _, result: Ok(prs) } => {
+        Response::ListFast { generation, result } if generation == st.list_gen => match result {
+            Ok(prs) => {
+                let prev_selected = st
+                    .list
+                    .visible_prs()
+                    .get(st.list.selected)
+                    .map(|p| p.number);
+                st.list.prs = prs.clone();
+                app.cache.set_list(prs);
+                st.list.loading = false;
+                st.list.enriching = true;
+                st.list.status = String::new();
+                let new_numbers: Vec<u32> = st
+                    .list
+                    .visible_prs()
+                    .iter()
+                    .map(|p| p.number)
+                    .collect();
+                st.list.selected =
+                    reselect_by_number(prev_selected, &new_numbers, st.list.selected);
+            }
+            Err(e) => {
+                st.list_refresh_in_flight = false;
+                st.list.enriching = false;
+                st.list.loading = false;
+                st.list.status = format!("refresh failed: {e}");
+            }
+        },
+        Response::ListFast { .. } => { /* stale; drop */ }
+        Response::ListEnriched { generation, result } if generation == st.list_gen => {
             st.list_refresh_in_flight = false;
-            let prev_selected = st
-                .list
-                .visible_prs()
-                .get(st.list.selected)
-                .map(|p| p.number);
-            st.list.prs = prs.clone();
-            app.cache.set_list(prs);
-            st.list.loading = false;
-            st.list.status = String::new();
-            let new_numbers: Vec<u32> = st
-                .list
-                .visible_prs()
-                .iter()
-                .map(|p| p.number)
-                .collect();
-            st.list.selected =
-                reselect_by_number(prev_selected, &new_numbers, st.list.selected);
-        }
-        Response::ListFast { generation: _, result: Err(e) } => {
-            st.list_refresh_in_flight = false;
-            st.list.loading = false;
-            st.list.status = format!("refresh failed: {e}");
-        }
-        Response::ListEnriched { generation: _, result: Ok(es) } => {
-            // Merge by number. Selection is preserved because rows are
-            // mutated, not replaced.
-            for e in &es {
-                if let Some(p) = st.list.prs.iter_mut().find(|p| p.number == e.number) {
-                    p.apply_enrichment(e);
+            st.list.enriching = false;
+            if let Ok(es) = result {
+                for e in &es {
+                    if let Some(p) =
+                        st.list.prs.iter_mut().find(|p| p.number == e.number)
+                    {
+                        p.apply_enrichment(e);
+                    }
                 }
             }
+            // Enrichment errors are non-fatal: rows already render with
+            // light-fields-only glyphs.
         }
-        Response::ListEnriched { generation: _, result: Err(_) } => {
-            // Enrichment failure is non-fatal: rows already render with
-            // light-fields-only glyphs. Keep silent for now; Task 5 may
-            // surface this if we decide it's user-visible.
-        }
+        Response::ListEnriched { .. } => { /* stale; drop */ }
         Response::PrDetail { number, result: Ok(detail) } => {
             app.cache.insert_partial(detail);
             if let Some(r) = st.review.as_mut()
@@ -847,6 +861,134 @@ fn handle_commits_modal(st: &mut AppState, ev: crossterm::event::KeyEvent) {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+    use crate::data::cache::Cache;
+    use crate::data::pr::{Author, Pr, PrEnrichment, PrState, StatusCheck};
+    use crate::data::worker::Response;
+
+    fn dummy_app_state() -> AppState {
+        AppState::new("repo".into(), "main".into())
+    }
+
+    fn open_pr(n: u32) -> Pr {
+        Pr {
+            number: n,
+            title: format!("#{n}"),
+            is_draft: false,
+            state: PrState::Open,
+            author: Author { login: "a".into() },
+            created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            updated_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            labels: vec![],
+            status_check_rollup: vec![],
+            review_decision: None,
+            mergeable: None,
+        }
+    }
+
+    fn test_app_for_state(cache: &mut Cache) -> App {
+        use crate::data::gh::fakes::FakeGh;
+        use crate::data::git::fakes::FakeGit;
+        let gh: std::sync::Arc<dyn crate::data::gh::GhClient> = std::sync::Arc::new(FakeGh::new());
+        let git: std::sync::Arc<dyn crate::data::git::GitClient> =
+            std::sync::Arc::new(FakeGit::new("/tmp/repo"));
+        let mut app = App::new("/tmp/repo".into(), gh, git, Config::default());
+        std::mem::swap(&mut app.cache, cache);
+        app
+    }
+
+    #[test]
+    fn fresh_app_state_has_zero_list_gen() {
+        let st = dummy_app_state();
+        assert_eq!(st.list_gen, 0);
+    }
+
+    #[test]
+    fn stale_list_fast_is_dropped() {
+        let mut st = dummy_app_state();
+        let mut cache = Cache::new();
+        let mut app = test_app_for_state(&mut cache);
+        st.list_gen = 5;
+        // A response from a much older generation arrives.
+        let stale = Response::ListFast {
+            generation: 1,
+            result: Ok(vec![open_pr(1)]),
+        };
+        handle_response(&mut app, &mut st, stale);
+        // Nothing applied: rows still empty.
+        assert!(st.list.prs.is_empty());
+    }
+
+    #[test]
+    fn enrichment_merges_by_number() {
+        let mut st = dummy_app_state();
+        let mut cache = Cache::new();
+        let mut app = test_app_for_state(&mut cache);
+        st.list_gen = 1;
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::ListFast {
+                generation: 1,
+                result: Ok(vec![open_pr(7), open_pr(8)]),
+            },
+        );
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::ListEnriched {
+                generation: 1,
+                result: Ok(vec![PrEnrichment {
+                    number: 7,
+                    status_check_rollup: vec![StatusCheck {
+                        status: Some("COMPLETED".into()),
+                        conclusion: Some("FAILURE".into()),
+                    }],
+                    review_decision: None,
+                    mergeable: Some("CONFLICTING".into()),
+                }]),
+            },
+        );
+        let by_num: std::collections::HashMap<u32, &Pr> = st
+            .list
+            .prs
+            .iter()
+            .map(|p| (p.number, p))
+            .collect();
+        assert_eq!(by_num[&7].status_check_rollup.len(), 1);
+        assert_eq!(by_num[&7].mergeable.as_deref(), Some("CONFLICTING"));
+        assert!(by_num[&8].status_check_rollup.is_empty());
+    }
+
+    #[test]
+    fn list_refresh_in_flight_clears_only_after_enriched() {
+        let mut st = dummy_app_state();
+        let mut cache = Cache::new();
+        let mut app = test_app_for_state(&mut cache);
+        st.list_gen = 1;
+        st.list_refresh_in_flight = true;
+        st.list.enriching = true;
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::ListFast {
+                generation: 1,
+                result: Ok(vec![]),
+            },
+        );
+        // After fast, still in flight, still enriching.
+        assert!(st.list_refresh_in_flight);
+        assert!(st.list.enriching);
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::ListEnriched {
+                generation: 1,
+                result: Ok(vec![]),
+            },
+        );
+        assert!(!st.list_refresh_in_flight);
+        assert!(!st.list.enriching);
+    }
 
     #[test]
     fn auto_refresh_blocked_when_not_on_list() {
