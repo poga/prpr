@@ -141,8 +141,11 @@ fn run_worker(
                 // Run fast + enriched in parallel; each thread emits its
                 // own response as soon as it completes, so rows appear
                 // immediately while the heavier enrichment is still in
-                // flight.
+                // flight. Also kick off a bulk fetch of every PR's head
+                // ref so subsequent diff/blame can be served from local
+                // refs without per-PR network round trips.
                 let gh_ref = &*gh;
+                let git_ref = &*git;
                 let repo_ref = &repo_root;
                 thread::scope(|s| {
                     let tx1 = res_tx.clone();
@@ -154,6 +157,11 @@ fn run_worker(
                     s.spawn(move || {
                         let result = gh_ref.list_prs_enriched(repo_ref);
                         let _ = tx2.send(Response::ListEnriched { generation, result });
+                    });
+                    s.spawn(move || {
+                        // Fire-and-forget: failure (network, auth) just
+                        // means subsequent LoadPr falls back to fetch_pr.
+                        let _ = git_ref.fetch_all_prs(repo_ref);
                     });
                 });
             }
@@ -181,22 +189,13 @@ fn run_load(
     number: u32,
     window_size: usize,
 ) {
-    // Stage 1: run view, diff, fetch in parallel. Emit responses in a
-    // deterministic order AFTER the scope joins so the UI cache always
-    // has a partial entry (from PrDetail) before PrDiff arrives — the
-    // PrDiff handler keys writes off that entry's head_oid.
-    let (detail_res, files_res, fetch_res) = thread::scope(|s| {
+    // Stage 1: view + fetch in parallel. (The bulk fetch in
+    // RefreshList may already have populated refs/prpr/pr-N, in which
+    // case this fetch is a fast no-op.)
+    let (detail_res, fetch_res) = thread::scope(|s| {
         let detail_h = s.spawn(|| gh.view_pr(repo_root, number));
-        let diff_h = s.spawn(|| {
-            let raw = gh.diff_pr(repo_root, number);
-            raw.and_then(|s| parse_diff(&s))
-        });
         let fetch_h = s.spawn(|| git.fetch_pr(repo_root, number));
-        (
-            detail_h.join().unwrap(),
-            diff_h.join().unwrap(),
-            fetch_h.join().unwrap(),
-        )
+        (detail_h.join().unwrap(), fetch_h.join().unwrap())
     });
 
     let detail = match detail_res {
@@ -214,7 +213,20 @@ fn run_load(
         result: Ok(detail.clone()),
     });
 
-    let files = match files_res {
+    if let Err(e) = fetch_res {
+        let _ = res_tx.send(Response::PrLoadError {
+            number,
+            error: format!("fetching PR #{number}: {e}"),
+        });
+        return;
+    }
+
+    // Stage 1b: compute diff locally now that head+base oids are known
+    // and the head ref is fetched. No network round trip.
+    let files = match git
+        .diff(repo_root, &detail.base_ref_oid, &detail.head_ref_oid)
+        .and_then(|s| parse_diff(&s))
+    {
         Ok(f) => f,
         Err(e) => {
             let _ = res_tx.send(Response::PrLoadError {
@@ -228,14 +240,6 @@ fn run_load(
         number,
         result: Ok(files.clone()),
     });
-
-    if let Err(e) = fetch_res {
-        let _ = res_tx.send(Response::PrLoadError {
-            number,
-            error: format!("fetching PR #{number}: {e}"),
-        });
-        return;
-    }
 
     let head_oid = detail.head_ref_oid.clone();
     let base_oid = detail.base_ref_oid.clone();
@@ -342,16 +346,17 @@ mod tests {
     fn load_pr_streams_detail_diff_then_per_file_colors() {
         let detail = fixture_detail();
         let head_sha = detail.head_ref_oid.clone();
+        let base_sha = detail.base_ref_oid.clone();
         let number = detail.number;
 
         let mut gh = FakeGh::new();
         gh.views.insert(number, detail.clone());
-        gh.diffs.insert(
-            number,
-            include_str!("../../tests/fixtures/diff_basic.patch").to_string(),
-        );
 
         let mut git = FakeGit::new("/tmp/repo");
+        git.diffs.insert(
+            (base_sha.clone(), head_sha.clone()),
+            include_str!("../../tests/fixtures/diff_basic.patch").to_string(),
+        );
         let porcelain = include_str!("../../tests/fixtures/blame_porcelain.txt").to_string();
         git.blames
             .insert((head_sha.clone(), "src/sched.rs".into()), porcelain.clone());
@@ -403,12 +408,8 @@ mod tests {
 
     #[test]
     fn load_pr_emits_load_error_when_view_fails() {
-        let mut gh = FakeGh::new();
-        // No fixture inserted → fake returns an error.
-        gh.diffs.insert(
-            1,
-            include_str!("../../tests/fixtures/diff_basic.patch").to_string(),
-        );
+        // No view fixture inserted → fake returns an error from gh.view_pr.
+        let gh = FakeGh::new();
         let git = FakeGit::new("/tmp/repo");
         let worker = Worker::spawn("/tmp/repo".into(), Arc::new(gh), Arc::new(git), 7);
         worker.send(Request::LoadPr(1));

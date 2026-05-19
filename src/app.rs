@@ -1208,15 +1208,16 @@ mod tests {
             serde_json::from_str(include_str!("../tests/fixtures/pr_view.json")).unwrap();
         let number = detail.number;
         let head_sha = detail.head_ref_oid.clone();
+        let base_sha = detail.base_ref_oid.clone();
 
         let mut gh = FakeGh::new();
         gh.views.insert(number, detail.clone());
-        gh.diffs.insert(
-            number,
-            include_str!("../tests/fixtures/diff_basic.patch").to_string(),
-        );
 
         let mut git = FakeGit::new("/tmp/repo");
+        git.diffs.insert(
+            (base_sha, head_sha.clone()),
+            include_str!("../tests/fixtures/diff_basic.patch").to_string(),
+        );
         let porcelain = include_str!("../tests/fixtures/blame_porcelain.txt").to_string();
         git.blames
             .insert((head_sha.clone(), "src/sched.rs".into()), porcelain.clone());

@@ -14,7 +14,6 @@ pub trait GhClient: Send + Sync {
     /// Second pass: only the heavy fields, keyed by `number` for merge.
     fn list_prs_enriched(&self, repo_root: &std::path::Path) -> Result<Vec<PrEnrichment>>;
     fn view_pr(&self, repo_root: &std::path::Path, number: u32) -> Result<PrDetail>;
-    fn diff_pr(&self, repo_root: &std::path::Path, number: u32) -> Result<String>;
     /// `method` is one of "merge", "squash", "rebase".
     fn merge_pr(&self, repo_root: &std::path::Path, number: u32, method: &str) -> Result<()>;
 }
@@ -85,16 +84,6 @@ impl GhClient for GhCli {
         Ok(pr)
     }
 
-    fn diff_pr(&self, repo_root: &std::path::Path, number: u32) -> Result<String> {
-        let n = number.to_string();
-        let out = run(Command::new("gh")
-            .current_dir(repo_root)
-            .args(["pr", "diff", &n]))?;
-        let s = String::from_utf8(out.stdout)
-            .with_context(|| "`gh pr diff` produced non-UTF-8 output")?;
-        Ok(s)
-    }
-
     fn merge_pr(&self, repo_root: &std::path::Path, number: u32, method: &str) -> Result<()> {
         let n = number.to_string();
         let flag = match method {
@@ -122,7 +111,6 @@ pub(crate) mod fakes {
         pub prs_fast: Vec<Pr>,
         pub enrichments: Vec<PrEnrichment>,
         pub views: HashMap<u32, PrDetail>,
-        pub diffs: HashMap<u32, String>,
         pub merges: Mutex<Vec<(u32, String)>>,
     }
 
@@ -132,7 +120,6 @@ pub(crate) mod fakes {
                 prs_fast: vec![],
                 enrichments: vec![],
                 views: HashMap::new(),
-                diffs: HashMap::new(),
                 merges: Mutex::new(vec![]),
             }
         }
@@ -150,12 +137,6 @@ pub(crate) mod fakes {
                 .get(&n)
                 .cloned()
                 .ok_or_else(|| anyhow!("no fake view for #{n}"))
-        }
-        fn diff_pr(&self, _root: &std::path::Path, n: u32) -> Result<String> {
-            self.diffs
-                .get(&n)
-                .cloned()
-                .ok_or_else(|| anyhow!("no fake diff for #{n}"))
         }
         fn merge_pr(&self, _root: &std::path::Path, n: u32, m: &str) -> Result<()> {
             self.merges.lock().unwrap().push((n, m.to_string()));

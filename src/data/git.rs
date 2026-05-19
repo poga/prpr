@@ -12,6 +12,13 @@ pub trait GitClient: Send + Sync {
     fn has_github_remote(&self, repo_root: &Path) -> Result<bool>;
     /// Fetch `refs/pull/<num>/head` so `head_oid` is locally available.
     fn fetch_pr(&self, repo_root: &Path, number: u32) -> Result<()>;
+    /// Bulk-fetch every PR's head ref under `refs/prpr/pr-*`. Used by the
+    /// list refresh so subsequent PR opens can serve diffs purely from
+    /// local refs.
+    fn fetch_all_prs(&self, repo_root: &Path) -> Result<()>;
+    /// Three-dot diff between `base` and `head` against local refs.
+    /// Mirrors `gh pr diff` but is offline once both oids are fetched.
+    fn diff(&self, repo_root: &Path, base: &str, head: &str) -> Result<String>;
     /// Run `git blame --porcelain <commit> -- <file>`. Returns raw stdout.
     fn blame(&self, repo_root: &Path, commit: &str, file: &str) -> Result<String>;
     /// Run `git log --reverse -p <base>..<head> -- <file>` with a SHA marker
@@ -62,6 +69,27 @@ impl GitClient for GitCli {
         Ok(())
     }
 
+    fn fetch_all_prs(&self, repo_root: &Path) -> Result<()> {
+        run(Command::new("git").current_dir(repo_root).args([
+            "fetch",
+            "--quiet",
+            "--prune",
+            "origin",
+            "+refs/pull/*/head:refs/prpr/pr-*",
+        ]))?;
+        Ok(())
+    }
+
+    fn diff(&self, repo_root: &Path, base: &str, head: &str) -> Result<String> {
+        let range = format!("{base}...{head}");
+        let out = run(Command::new("git").current_dir(repo_root).args([
+            "diff", "--no-color", &range,
+        ]))?;
+        let s = String::from_utf8(out.stdout)
+            .with_context(|| "`git diff` produced non-UTF-8 output")?;
+        Ok(s)
+    }
+
     fn blame(&self, repo_root: &Path, commit: &str, file: &str) -> Result<String> {
         let out = run(Command::new("git").current_dir(repo_root).args([
             "blame",
@@ -101,6 +129,8 @@ pub(crate) mod fakes {
         pub root: PathBuf,
         pub has_gh: bool,
         pub blames: HashMap<(String, String), String>,
+        /// Keyed by (base, head) → diff output.
+        pub diffs: HashMap<(String, String), String>,
         /// Keyed by (base, head, file) → log_patches output. Missing keys
         /// resolve to empty (no PR-commit deletions for that file).
         pub log_patches: HashMap<(String, String, String), String>,
@@ -112,6 +142,7 @@ pub(crate) mod fakes {
                 root: root.into(),
                 has_gh: true,
                 blames: HashMap::new(),
+                diffs: HashMap::new(),
                 log_patches: HashMap::new(),
             }
         }
@@ -126,6 +157,15 @@ pub(crate) mod fakes {
         }
         fn fetch_pr(&self, _root: &Path, _n: u32) -> Result<()> {
             Ok(())
+        }
+        fn fetch_all_prs(&self, _root: &Path) -> Result<()> {
+            Ok(())
+        }
+        fn diff(&self, _root: &Path, base: &str, head: &str) -> Result<String> {
+            self.diffs
+                .get(&(base.into(), head.into()))
+                .cloned()
+                .ok_or_else(|| anyhow!("no fake diff for {base}...{head}"))
         }
         fn blame(&self, _root: &Path, c: &str, f: &str) -> Result<String> {
             self.blames
