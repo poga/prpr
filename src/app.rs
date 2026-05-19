@@ -257,7 +257,17 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
             result: Ok(pkg),
         } => {
             let files_count = pkg.files.len();
-            app.cache.insert(pkg);
+            app.cache.insert_partial(pkg.detail.clone());
+            app.cache.update_diff(number, &pkg.detail.head_ref_oid, pkg.files);
+            for (path, lc) in pkg.colors {
+                app.cache.add_file_colors(
+                    number,
+                    &pkg.detail.head_ref_oid,
+                    path,
+                    lc,
+                    std::collections::HashMap::new(),
+                );
+            }
             if let Some(r) = st.review.as_mut()
                 && st.current_pr == Some(number)
             {
