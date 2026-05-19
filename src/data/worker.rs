@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::{self, JoinHandle};
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 
 use crate::data::blame::{Blame, parse_blame};
 use crate::data::diff::parse_diff;
