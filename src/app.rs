@@ -237,6 +237,23 @@ pub fn run(term: &mut Term, app: &mut App, st: &mut AppState) -> Result<()> {
     Ok(())
 }
 
+fn ensure_blame(app: &App, st: &mut AppState, number: u32, path: &str) {
+    let Some(r) = st.review.as_mut() else { return };
+    let Some(d) = r.detail.as_ref() else { return };
+    if r.colors.contains_key(path) { return; }
+    let commits: Vec<String> = d.commits.iter().map(|c| c.oid.clone()).collect();
+    let head_oid = d.head_ref_oid.clone();
+    let base_oid = d.base_ref_oid.clone();
+    r.colors.insert(path.to_string(), crate::view::pr_review::ColorState::Loading);
+    app.request(Request::BlameFile {
+        number,
+        head_oid,
+        base_oid,
+        path: path.to_string(),
+        commits,
+    });
+}
+
 fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
     match resp {
         Response::ListProgress { generation, stage } if generation == st.list_gen => {
@@ -294,10 +311,16 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
         }
         Response::ListEnriched { .. } => { /* stale; drop */ }
         Response::PrDetail { number, result: Ok(detail) } => {
-            app.cache.insert_partial(detail);
             if let Some(r) = st.review.as_mut()
                 && st.current_pr == Some(number)
             {
+                let zero_stats = detail
+                    .commits
+                    .iter()
+                    .map(|c| (c.oid.clone(), crate::render::attribution::CommitStats::default()))
+                    .collect();
+                r.detail = Some(detail);
+                r.commit_stats = zero_stats;
                 r.status = "loading diff…".into();
             }
         }
@@ -310,18 +333,17 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
             st.list.status = format!("load #{number} failed: {e}");
         }
         Response::PrDiff { number, result: Ok(files) } => {
-            let head_oid = app
-                .cache
-                .get(number)
-                .map(|p| p.detail.head_ref_oid.clone());
-            if let Some(head) = head_oid {
-                app.cache.update_diff(number, &head, files);
-            }
-            if let Some(r) = st.review.as_mut()
-                && st.current_pr == Some(number)
-                && let Some(pkg) = app.cache.get(number)
-            {
-                r.status = format!("coloring {} files…", pkg.files.len());
+            if st.current_pr == Some(number) {
+                let path = if let Some(r) = st.review.as_mut() {
+                    r.files = files;
+                    r.status = format!("{} files", r.files.len());
+                    r.files.get(r.file_index).map(|f| f.path.clone())
+                } else {
+                    None
+                };
+                if let Some(path) = path {
+                    ensure_blame(app, st, number, &path);
+                }
             }
         }
         Response::PrDiff { number, result: Err(e) } => {
@@ -333,19 +355,20 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
         }
         Response::PrFileColors {
             number,
-            head_oid,
+            head_oid: _,
             path,
             colors,
             stats,
         } => {
-            app.cache.add_file_colors(number, &head_oid, path, colors, stats);
-        }
-        Response::PrColorsDone { number, head_oid: _ } => {
             if let Some(r) = st.review.as_mut()
                 && st.current_pr == Some(number)
-                && let Some(pkg) = app.cache.get(number)
             {
-                r.status = format!("{} files", pkg.files.len());
+                r.colors.insert(path, crate::view::pr_review::ColorState::Ready(colors));
+                for (oid, s) in stats {
+                    let entry = r.commit_stats.entry(oid).or_default();
+                    entry.adds += s.adds;
+                    entry.dels += s.dels;
+                }
             }
         }
         Response::PrLoadError { number, error } => {
@@ -384,7 +407,7 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
     }
 }
 
-fn draw(f: &mut ratatui::Frame, app: &App, st: &AppState) {
+fn draw(f: &mut ratatui::Frame, _app: &App, st: &AppState) {
     let area = f.area();
     if area.width < 80 || area.height < 24 {
         let msg = ratatui::widgets::Paragraph::new("terminal too small (need ≥80×24)")
@@ -400,15 +423,16 @@ fn draw(f: &mut ratatui::Frame, app: &App, st: &AppState) {
         | FocusedView::FilePicker
         | FocusedView::MergeModal
         | FocusedView::CommitsModal => {
-            let pkg = st.current_pr.and_then(|n| app.cache.get(n));
-            if let (Some(pkg), Some(review)) = (pkg, st.review.as_ref()) {
-                crate::view::pr_review::render(f, area, pkg, review);
-            } else {
-                let text = format!("{} loading…", crate::render::spinner::glyph());
-                let msg = ratatui::widgets::Paragraph::new(text)
-                    .style(ratatui::style::Style::default().fg(crate::render::style::OVERLAY1))
-                    .alignment(ratatui::layout::Alignment::Center);
-                f.render_widget(msg, area);
+            if let Some(review) = st.review.as_ref() {
+                if review.detail.is_some() {
+                    crate::view::pr_review::render(f, area, review);
+                } else {
+                    let text = format!("{} loading…", crate::render::spinner::glyph());
+                    let msg = ratatui::widgets::Paragraph::new(text)
+                        .style(ratatui::style::Style::default().fg(crate::render::style::OVERLAY1))
+                        .alignment(ratatui::layout::Alignment::Center);
+                    f.render_widget(msg, area);
+                }
             }
         }
     }
@@ -529,6 +553,10 @@ fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) 
     }
 
     let action = dispatch(st.focused, ev);
+    handle_action(app, st, action);
+}
+
+fn handle_action(app: &mut App, st: &mut AppState, action: Action) {
     match action {
         Action::Quit => st.running = false,
         Action::ListUp => {
@@ -564,11 +592,10 @@ fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) 
                     scroll: 0,
                     show_sha_margin: app.config.show_sha_margin,
                     status: "loading…".into(),
+                    ..Default::default()
                 });
                 st.focused = FocusedView::Review;
-                if app.cache.get(num).is_none() {
-                    app.request(Request::LoadPr(pr));
-                }
+                app.request(Request::OpenPr(pr));
             }
         }
         Action::ListOpenInBrowser => {
@@ -607,9 +634,8 @@ fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) 
             }
         }
         Action::Bottom => {
-            if let Some((num, r)) = st.current_pr.zip(st.review.as_mut())
-                && let Some(pkg) = app.cache.get(num)
-                && let Some(file) = pkg.files.get(r.file_index)
+            if let Some(r) = st.review.as_mut()
+                && let Some(file) = r.files.get(r.file_index)
             {
                 r.scroll = max_scroll(file.lines.len());
                 r.cursor_line = max_cursor_line(file);
@@ -618,22 +644,21 @@ fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) 
         Action::NextFile => cycle_file(app, st, 1),
         Action::PrevFile => cycle_file(app, st, -1),
         Action::OpenFilePicker => {
-            if let (Some(num), Some(r)) = (st.current_pr, st.review.as_ref())
-                && let Some(pkg) = app.cache.get(num)
-            {
-                let paths: Vec<String> = pkg.file_paths().into_iter().map(String::from).collect();
-                let current = pkg.file_paths().get(r.file_index).copied();
+            if let Some(r) = st.review.as_ref() {
+                let paths_vec = crate::view::pr_review::file_paths(r);
+                let current = paths_vec.get(r.file_index).copied();
+                let paths: Vec<String> = paths_vec.into_iter().map(String::from).collect();
                 st.picker = Some(FilePickerState::new(paths, current));
                 st.focused = FocusedView::FilePicker;
             }
         }
         Action::OpenCommitsModal => {
-            if let (Some(num), Some(_)) = (st.current_pr, st.review.as_ref())
-                && let Some(pkg) = app.cache.get(num)
+            if let Some(r) = st.review.as_ref()
+                && let Some(d) = r.detail.as_ref()
             {
                 let rows = commits_modal::build_rows(
-                    &pkg.detail.commits,
-                    &pkg.commit_stats,
+                    &d.commits,
+                    &r.commit_stats,
                     app.config.window_size,
                     Utc::now(),
                 );
@@ -664,9 +689,13 @@ fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) 
                 && let Some(pr) = st.list.prs.iter().find(|p| p.number == num).cloned()
             {
                 if let Some(r) = st.review.as_mut() {
+                    r.detail = None;
+                    r.files.clear();
+                    r.colors.clear();
+                    r.commit_stats.clear();
                     r.status = "loading…".into();
                 }
-                app.request(Request::LoadPr(pr));
+                app.request(Request::OpenPr(pr));
             }
         }
         Action::Nothing => {}
@@ -719,15 +748,9 @@ fn max_cursor_line(file: &crate::data::diff::FileDiff) -> usize {
 
 /// Move the review cursor + scroll by `delta` lines, clamping at both ends so
 /// scrolling can't blank out the buffer.
-fn move_review(app: &App, st: &mut AppState, delta: i32) {
-    let Some(num) = st.current_pr else { return };
-    let Some(pkg) = app.cache.get(num) else {
-        return;
-    };
+fn move_review(_app: &App, st: &mut AppState, delta: i32) {
     let Some(r) = st.review.as_mut() else { return };
-    let Some(file) = pkg.files.get(r.file_index) else {
-        return;
-    };
+    let Some(file) = r.files.get(r.file_index) else { return };
     let max_scr = max_scroll(file.lines.len()) as i64;
     let max_cur = max_cursor_line(file) as i64;
     let new_scroll = (r.scroll as i64 + delta as i64).clamp(0, max_scr);
@@ -738,18 +761,18 @@ fn move_review(app: &App, st: &mut AppState, delta: i32) {
 
 fn cycle_file(app: &App, st: &mut AppState, delta: i32) {
     let Some(num) = st.current_pr else { return };
-    let Some(pkg) = app.cache.get(num) else {
-        return;
-    };
-    let n = pkg.file_count() as i32;
-    if n == 0 {
-        return;
-    }
-    if let Some(r) = st.review.as_mut() {
+    let path_for_blame = {
+        let Some(r) = st.review.as_mut() else { return };
+        let n = crate::view::pr_review::file_count(r) as i32;
+        if n == 0 { return; }
         let new_idx = ((r.file_index as i32 + delta).rem_euclid(n)) as usize;
         r.file_index = new_idx;
         r.cursor_line = 0;
         r.scroll = 0;
+        r.files.get(new_idx).map(|f| f.path.clone())
+    };
+    if let Some(path) = path_for_blame {
+        ensure_blame(app, st, num, &path);
     }
 }
 
@@ -795,15 +818,19 @@ fn handle_file_picker(app: &App, st: &mut AppState, ev: crossterm::event::KeyEve
     match ev.code {
         KeyCode::Enter => {
             let chosen = picker.matches().get(picker.selected).map(|s| (*s).clone());
-            if let (Some(path), Some(num)) = (chosen, st.current_pr)
-                && let Some(pkg) = app.cache.get(num)
-            {
-                let idx = pkg.file_paths().iter().position(|p| *p == path.as_str());
-                if let (Some(idx), Some(r)) = (idx, st.review.as_mut()) {
+            let blame_target = if let (Some(path), Some(r)) = (chosen, st.review.as_mut()) {
+                let idx = crate::view::pr_review::file_paths(r)
+                    .iter()
+                    .position(|p| *p == path.as_str());
+                if let Some(idx) = idx {
                     r.file_index = idx;
                     r.cursor_line = 0;
                     r.scroll = 0;
-                }
+                    r.files.get(idx).map(|f| f.path.clone())
+                } else { None }
+            } else { None };
+            if let (Some(path), Some(num)) = (blame_target, st.current_pr) {
+                ensure_blame(app, st, num, &path);
             }
             st.picker = None;
             st.focused = FocusedView::Review;
@@ -1077,15 +1104,16 @@ mod tests {
         let detail: crate::data::pr::PrDetail = serde_json::from_str(json).unwrap();
         let n_detail_files = detail.files.len();
         let number = detail.number;
-        cache.insert_partial(detail);
-        let mut app = test_app_for_state(&mut cache);
+        let app = test_app_for_state(&mut cache);
         st.current_pr = Some(number);
         st.review = Some(PrReviewState {
+            detail: Some(detail),
             file_index: 0,
             cursor_line: 0,
             scroll: 0,
             show_sha_margin: false,
             status: String::new(),
+            ..Default::default()
         });
 
         cycle_file(&app, &mut st, 1);
@@ -1098,21 +1126,22 @@ mod tests {
     }
 
     #[test]
-    fn move_review_is_noop_when_pkg_files_empty() {
+    fn move_review_is_noop_when_files_not_yet_parsed() {
         let mut st = dummy_app_state();
         let mut cache = Cache::new();
         let json = include_str!("../tests/fixtures/pr_view.json");
         let detail: crate::data::pr::PrDetail = serde_json::from_str(json).unwrap();
         let number = detail.number;
-        cache.insert_partial(detail);
-        let mut app = test_app_for_state(&mut cache);
+        let app = test_app_for_state(&mut cache);
         st.current_pr = Some(number);
         st.review = Some(PrReviewState {
+            detail: Some(detail),
             file_index: 0,
             cursor_line: 0,
             scroll: 0,
             show_sha_margin: false,
             status: String::new(),
+            ..Default::default()
         });
         move_review(&app, &mut st, 10);
         let r = st.review.as_ref().unwrap();
@@ -1120,8 +1149,38 @@ mod tests {
         assert_eq!(r.scroll, 0);
     }
 
+    #[test]
+    fn cycle_file_reads_files_from_review_state_not_cache() {
+        let detail = fixture_pr_detail();
+        let number = detail.number;
+        let files = crate::data::diff::parse_diff(
+            include_str!("../tests/fixtures/diff_basic.patch")
+        ).unwrap();
+        assert!(files.len() >= 2, "fixture needs at least 2 files for this test");
+
+        let mut st = dummy_app_state();
+        st.current_pr = Some(number);
+        st.review = Some(PrReviewState {
+            detail: Some(detail.clone()),
+            files: files.clone(),
+            file_index: 0,
+            ..Default::default()
+        });
+        let mut cache = Cache::new();
+        let app = test_app_for_state(&mut cache);
+
+        cycle_file(&app, &mut st, 1);
+
+        assert_eq!(st.review.as_ref().unwrap().file_index, 1);
+    }
+
     fn dummy_app_state() -> AppState {
         AppState::new("repo".into(), "main".into())
+    }
+
+    fn fixture_pr_detail() -> crate::data::pr::PrDetail {
+        let json = include_str!("../tests/fixtures/pr_view.json");
+        serde_json::from_str(json).unwrap()
     }
 
     fn open_pr(n: u32) -> Pr {
@@ -1487,35 +1546,21 @@ mod tests {
     }
 
     #[test]
-    fn end_to_end_load_pr_progresses_through_partial_states() {
-        use crate::data::gh::fakes::FakeGh;
-        use crate::data::git::fakes::FakeGit;
-        use crate::data::pr::PrDetail;
-        use crate::data::worker::Request;
-
-        let detail: PrDetail =
-            serde_json::from_str(include_str!("../tests/fixtures/pr_view.json")).unwrap();
+    fn end_to_end_open_pr_progresses_through_partial_states() {
+        let detail = fixture_pr_detail();
         let number = detail.number;
         let head_sha = detail.head_ref_oid.clone();
         let base_sha = detail.base_ref_oid.clone();
 
-        let gh = FakeGh::new();
-        let mut git = FakeGit::new("/tmp/repo");
-        git.refs
-            .insert(format!("refs/prpr/pr-{number}"), head_sha.clone());
-        git.refs
-            .insert(format!("origin/{}", detail.base_ref_name), base_sha.clone());
-        git.commits
-            .insert((base_sha.clone(), head_sha.clone()), detail.commits.clone());
+        let gh = crate::data::gh::fakes::FakeGh::new();
+        let mut git = crate::data::git::fakes::FakeGit::new("/tmp/repo");
+        git.refs.insert(format!("refs/prpr/pr-{number}"), head_sha.clone());
+        git.refs.insert(format!("origin/{}", detail.base_ref_name), base_sha.clone());
+        git.commits.insert((base_sha.clone(), head_sha.clone()), detail.commits.clone());
         git.diffs.insert(
-            (base_sha, head_sha.clone()),
+            (base_sha.clone(), head_sha.clone()),
             include_str!("../tests/fixtures/diff_basic.patch").to_string(),
         );
-        let porcelain = include_str!("../tests/fixtures/blame_porcelain.txt").to_string();
-        git.blames
-            .insert((head_sha.clone(), "src/sched.rs".into()), porcelain.clone());
-        git.blames
-            .insert((head_sha.clone(), "README.md".into()), porcelain);
 
         let mut app = App::new(
             "/tmp/repo".into(),
@@ -1526,11 +1571,8 @@ mod tests {
         let mut st = AppState::new("repo".into(), "main".into());
         st.current_pr = Some(number);
         st.review = Some(PrReviewState {
-            file_index: 0,
-            cursor_line: 0,
-            scroll: 0,
-            show_sha_margin: false,
             status: "loading…".into(),
+            ..Default::default()
         });
 
         let pr = crate::data::pr::Pr {
@@ -1548,49 +1590,31 @@ mod tests {
             review_decision: detail.review_decision,
             mergeable: detail.mergeable.clone(),
         };
-        app.request(Request::LoadPr(pr));
+        app.request(Request::OpenPr(pr));
 
-        // Drain until we see PrColorsDone, feeding events through.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         let mut saw_detail = false;
         let mut saw_diff = false;
-        let mut done = false;
-        while std::time::Instant::now() < deadline && !done {
-            match app
-                .worker
-                .rx
-                .recv_timeout(std::time::Duration::from_millis(500))
-            {
-                Ok(resp) => {
-                    let is_detail = matches!(resp, crate::data::worker::Response::PrDetail { .. });
-                    let is_diff = matches!(resp, crate::data::worker::Response::PrDiff { .. });
-                    let is_done =
-                        matches!(resp, crate::data::worker::Response::PrColorsDone { .. });
-                    handle_response(&mut app, &mut st, resp);
-                    if is_detail {
-                        saw_detail = true;
-                        assert!(app.cache.get(number).is_some(), "cache should have partial");
-                        assert_eq!(st.review.as_ref().unwrap().status, "loading diff…");
-                    }
-                    if is_diff {
-                        saw_diff = true;
-                        assert!(!app.cache.get(number).unwrap().files.is_empty());
-                        assert!(
-                            st.review.as_ref().unwrap().status.starts_with("coloring "),
-                            "status was: {}",
-                            st.review.as_ref().unwrap().status,
-                        );
-                    }
-                    if is_done {
-                        done = true;
-                        let n = app.cache.get(number).unwrap().files.len();
-                        assert_eq!(st.review.as_ref().unwrap().status, format!("{n} files"));
-                    }
+        while std::time::Instant::now() < deadline && !(saw_detail && saw_diff) {
+            if let Ok(resp) = app.worker.rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                let is_detail = matches!(resp, Response::PrDetail { .. });
+                let is_diff = matches!(resp, Response::PrDiff { .. });
+                handle_response(&mut app, &mut st, resp);
+                if is_detail {
+                    saw_detail = true;
+                    let r = st.review.as_ref().unwrap();
+                    assert!(r.detail.is_some());
+                    assert_eq!(r.status, "loading diff…");
                 }
-                Err(_) => continue,
+                if is_diff {
+                    saw_diff = true;
+                    let r = st.review.as_ref().unwrap();
+                    assert!(!r.files.is_empty());
+                    assert_eq!(r.status, format!("{} files", r.files.len()));
+                }
             }
         }
-        assert!(saw_detail && saw_diff && done, "missed an event");
+        assert!(saw_detail && saw_diff, "missed an event");
     }
 
     #[test]
@@ -1672,5 +1696,238 @@ mod tests {
         assert_eq!(nums, vec![5, 8]);
         // #5 is still at index 0.
         assert_eq!(st.list.selected, 0);
+    }
+
+    #[test]
+    fn pr_detail_response_populates_review_state_detail() {
+        let detail = fixture_pr_detail();
+        let number = detail.number;
+        let mut st = dummy_app_state();
+        st.current_pr = Some(number);
+        st.review = Some(PrReviewState {
+            status: "loading…".into(),
+            ..Default::default()
+        });
+        let mut cache = Cache::new();
+        let mut app = test_app_for_state(&mut cache);
+
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::PrDetail { number, result: Ok(detail.clone()) },
+        );
+
+        let r = st.review.as_ref().unwrap();
+        assert_eq!(r.detail.as_ref().unwrap().number, number);
+        assert_eq!(r.commit_stats.len(), detail.commits.len(),
+            "commit_stats zero-filled for every PR commit");
+    }
+
+    #[test]
+    fn pr_diff_response_populates_review_state_files() {
+        let detail = fixture_pr_detail();
+        let number = detail.number;
+        let files = crate::data::diff::parse_diff(
+            include_str!("../tests/fixtures/diff_basic.patch")
+        ).unwrap();
+        let mut st = dummy_app_state();
+        st.current_pr = Some(number);
+        st.review = Some(PrReviewState {
+            detail: Some(detail.clone()),
+            status: "loading diff…".into(),
+            ..Default::default()
+        });
+        let mut cache = Cache::new();
+        let mut app = test_app_for_state(&mut cache);
+
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::PrDiff { number, result: Ok(files.clone()) },
+        );
+
+        let r = st.review.as_ref().unwrap();
+        assert_eq!(r.files.len(), files.len());
+    }
+
+    #[test]
+    fn pr_diff_response_dispatches_blame_file_for_current_file_and_marks_loading() {
+        let detail = fixture_pr_detail();
+        let number = detail.number;
+        let files = crate::data::diff::parse_diff(
+            include_str!("../tests/fixtures/diff_basic.patch")
+        ).unwrap();
+        let first_path = files[0].path.clone();
+
+        let mut st = dummy_app_state();
+        st.current_pr = Some(number);
+        st.review = Some(PrReviewState {
+            detail: Some(detail.clone()),
+            ..Default::default()
+        });
+        let mut cache = Cache::new();
+        let mut app = test_app_for_state(&mut cache);
+
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::PrDiff { number, result: Ok(files.clone()) },
+        );
+
+        let r = st.review.as_ref().unwrap();
+        assert!(matches!(
+            r.colors.get(&first_path),
+            Some(crate::view::pr_review::ColorState::Loading)
+        ));
+    }
+
+    #[test]
+    fn cycle_file_marks_new_file_loading_when_not_yet_blamed() {
+        let detail = fixture_pr_detail();
+        let number = detail.number;
+        let files = crate::data::diff::parse_diff(
+            include_str!("../tests/fixtures/diff_basic.patch")
+        ).unwrap();
+        assert!(files.len() >= 2);
+        let second_path = files[1].path.clone();
+
+        let mut st = dummy_app_state();
+        st.current_pr = Some(number);
+        st.review = Some(PrReviewState {
+            detail: Some(detail),
+            files: files.clone(),
+            file_index: 0,
+            ..Default::default()
+        });
+        let mut cache = Cache::new();
+        let app = test_app_for_state(&mut cache);
+
+        cycle_file(&app, &mut st, 1);
+
+        let r = st.review.as_ref().unwrap();
+        assert_eq!(r.file_index, 1);
+        assert!(matches!(
+            r.colors.get(&second_path),
+            Some(crate::view::pr_review::ColorState::Loading)
+        ));
+    }
+
+    #[test]
+    fn cycle_file_does_not_remark_loading_or_ready_file() {
+        use crate::render::attribution::LineColors;
+        let detail = fixture_pr_detail();
+        let number = detail.number;
+        let files = crate::data::diff::parse_diff(
+            include_str!("../tests/fixtures/diff_basic.patch")
+        ).unwrap();
+        assert!(files.len() >= 2);
+        let second_path = files[1].path.clone();
+
+        let ready = crate::view::pr_review::ColorState::Ready(LineColors {
+            head: vec![], delete: std::collections::HashMap::new(),
+        });
+        let mut colors = std::collections::HashMap::new();
+        colors.insert(second_path.clone(), ready);
+
+        let mut st = dummy_app_state();
+        st.current_pr = Some(number);
+        st.review = Some(PrReviewState {
+            detail: Some(detail),
+            files,
+            colors,
+            file_index: 0,
+            ..Default::default()
+        });
+        let mut cache = Cache::new();
+        let app = test_app_for_state(&mut cache);
+
+        cycle_file(&app, &mut st, 1);
+
+        let r = st.review.as_ref().unwrap();
+        assert!(matches!(
+            r.colors.get(&second_path),
+            Some(crate::view::pr_review::ColorState::Ready(_))
+        ), "ready entry must not be reset to Loading");
+    }
+
+    #[test]
+    fn refresh_action_in_review_clears_data_and_dispatches_open_pr() {
+        use crate::render::attribution::LineColors;
+        let detail = fixture_pr_detail();
+        let number = detail.number;
+        let pr = crate::data::pr::Pr {
+            number, title: detail.title.clone(), is_draft: detail.is_draft,
+            state: detail.state, author: detail.author.clone(),
+            created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            updated_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            base_ref_name: detail.base_ref_name.clone(),
+            head_ref_name: detail.head_ref_name.clone(),
+            labels: vec![], status_check_rollup: detail.status_check_rollup.clone(),
+            review_decision: detail.review_decision, mergeable: detail.mergeable.clone(),
+        };
+
+        let mut st = dummy_app_state();
+        st.current_pr = Some(number);
+        st.list.prs = vec![pr.clone()];
+        let mut colors = std::collections::HashMap::new();
+        colors.insert("src/sched.rs".into(), crate::view::pr_review::ColorState::Ready(
+            LineColors { head: vec![], delete: std::collections::HashMap::new() }
+        ));
+        st.review = Some(PrReviewState {
+            detail: Some(detail.clone()),
+            files: vec![crate::data::diff::FileDiff {
+                path: "src/sched.rs".into(),
+                lines: vec![], binary: false,
+            }],
+            colors,
+            ..Default::default()
+        });
+        let mut cache = Cache::new();
+        let mut app = test_app_for_state(&mut cache);
+
+        handle_action(&mut app, &mut st, Action::Refresh);
+
+        let r = st.review.as_ref().unwrap();
+        assert!(r.detail.is_none());
+        assert!(r.files.is_empty());
+        assert!(r.colors.is_empty());
+        assert!(r.commit_stats.is_empty());
+        assert_eq!(r.status, "loading…");
+    }
+
+    #[test]
+    fn pr_file_colors_response_marks_path_ready_in_review() {
+        use crate::render::attribution::LineColors;
+        let detail = fixture_pr_detail();
+        let number = detail.number;
+        let head_oid = detail.head_ref_oid.clone();
+        let files = crate::data::diff::parse_diff(
+            include_str!("../tests/fixtures/diff_basic.patch")
+        ).unwrap();
+        let path = files[0].path.clone();
+        let mut st = dummy_app_state();
+        st.current_pr = Some(number);
+        st.review = Some(PrReviewState {
+            detail: Some(detail.clone()),
+            files: files.clone(),
+            ..Default::default()
+        });
+        let mut cache = Cache::new();
+        let mut app = test_app_for_state(&mut cache);
+
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::PrFileColors {
+                number,
+                head_oid: head_oid.clone(),
+                path: path.clone(),
+                colors: LineColors { head: vec![], delete: std::collections::HashMap::new() },
+                stats: std::collections::HashMap::new(),
+            },
+        );
+
+        let r = st.review.as_ref().unwrap();
+        assert!(matches!(r.colors.get(&path), Some(crate::view::pr_review::ColorState::Ready(_))));
     }
 }

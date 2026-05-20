@@ -21,7 +21,7 @@ pub trait GitClient: Send + Sync {
     /// Fetch the given PR numbers' head refs (into `refs/prpr/pr-<n>`)
     /// and refresh `origin/*` heads — all in one git invocation.
     /// RefreshList waits for this before emitting `ListFast`, so any
-    /// subsequent `LoadPr` is zero-network.
+    /// subsequent `OpenPr` is zero-network.
     fn fetch_pr_refs(&self, repo_root: &Path, numbers: &[u32]) -> Result<()>;
     /// Three-dot diff between `base` and `head` against local refs.
     /// Mirrors `gh pr diff` but is offline once both oids are fetched.

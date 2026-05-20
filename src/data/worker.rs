@@ -1,7 +1,7 @@
 //! Worker thread + request/response channels.
 //!
-//! All blocking subprocess work (`gh pr list`, `gh pr view`, `gh pr diff`,
-//! `git fetch`, `git blame`, `gh pr merge`) runs on a single worker thread.
+//! All blocking subprocess work (`gh pr list`, `git fetch`, `git diff`,
+//! `git blame`, `gh pr merge`) runs on a single worker thread.
 //! The UI thread sends `Request`s and drains `Response`s every iteration of
 //! its event loop, so the screen stays redraw-able while subprocess calls
 //! run.
@@ -12,7 +12,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::{self, JoinHandle};
 
@@ -23,18 +22,19 @@ use crate::data::diff::parse_diff;
 use crate::data::gh::GhClient;
 use crate::data::git::GitClient;
 use crate::data::log_patches::parse_deletions;
-use crate::render::attribution::{CommitStats, LineColors, attribute_file, commit_stats_for_file};
+use crate::render::attribution::{attribute_file, commit_stats_for_file};
 
 #[derive(Debug)]
 pub enum Request {
-    /// Refresh the PR list. `generation` is echoed in both responses so the UI
-    /// can drop stale results from a superseded refresh cycle.
     RefreshList { generation: u32 },
-    /// Build the streaming PR data set for one PR. Carries the cached
-    /// `Pr` row so the worker can compute everything (oids, commits,
-    /// diff) from local git refs — no `gh pr view` round trip.
-    LoadPr(crate::data::pr::Pr),
-    /// Run `gh pr merge <number> --<method>`.
+    OpenPr(crate::data::pr::Pr),
+    BlameFile {
+        number: u32,
+        head_oid: String,
+        base_oid: String,
+        path: String,
+        commits: Vec<String>,
+    },
     Merge { number: u32, method: String },
 }
 
@@ -59,8 +59,8 @@ impl ListStage {
     }
 }
 
-// PrPackage-derived variants are larger than the others. The channel
-// is low-volume per cycle so the size disparity isn't worth boxing for.
+// Some variants are larger than the others. The channel is low-volume
+// per cycle so the size disparity isn't worth boxing for.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum Response {
@@ -94,10 +94,6 @@ pub enum Response {
         path: String,
         colors: crate::render::attribution::LineColors,
         stats: HashMap<String, crate::render::attribution::CommitStats>,
-    },
-    PrColorsDone {
-        number: u32,
-        head_oid: String,
     },
     PrLoadError {
         number: u32,
@@ -169,7 +165,7 @@ fn run_worker(
         match req {
             Request::RefreshList { generation } => {
                 // The list renders only after every OPEN PR's head ref
-                // is locally fetched, so subsequent LoadPr is guaranteed
+                // is locally fetched, so subsequent OpenPr is guaranteed
                 // zero-network. Sequence on the worker thread:
                 //   1. list_prs_fast — get the rows and their states.
                 //   2. fetch_pr_refs for open PR numbers (+ origin/*).
@@ -216,15 +212,15 @@ fn run_worker(
                     result: combined,
                 });
             }
-            Request::LoadPr(pr) => {
-                run_load(&*gh, &*git, &repo_root, &res_tx, pr, window_size);
+            Request::OpenPr(pr) => {
+                run_open_pr(&*git, &repo_root, &res_tx, pr);
+            }
+            Request::BlameFile { number, head_oid, base_oid, path, commits } => {
+                run_blame_file(&*git, &repo_root, &res_tx, number, &head_oid, &base_oid, &path, &commits, window_size);
             }
             Request::Merge { number, method } => {
                 let result = gh.merge_pr(&repo_root, number, &method);
-                if res_tx
-                    .send(Response::MergeDone { number, result })
-                    .is_err()
-                {
+                if res_tx.send(Response::MergeDone { number, result }).is_err() {
                     break;
                 }
             }
@@ -232,21 +228,13 @@ fn run_worker(
     }
 }
 
-fn run_load(
-    _gh: &dyn GhClient,
+fn run_open_pr(
     git: &dyn GitClient,
     repo_root: &Path,
     res_tx: &Sender<Response>,
     pr: crate::data::pr::Pr,
-    window_size: usize,
 ) {
     let number = pr.number;
-
-    // Stage 1: resolve head/base from local refs. RefreshList guarantees
-    // these are populated before the user can open a PR — no network
-    // fallback. If a ref is missing here, something went wrong with the
-    // most recent refresh; surface the error rather than papering over
-    // it with a slow per-PR fetch.
     let head_ref = format!("refs/prpr/pr-{number}");
     let base_ref = format!("origin/{}", pr.base_ref_name);
     let head_oid = match git.rev_parse(repo_root, &head_ref) {
@@ -270,7 +258,6 @@ fn run_load(
         }
     };
 
-    // Stage 2: pull commits + diff in parallel (both local).
     let (commits_res, diff_res) = thread::scope(|s| {
         let commits_h = s.spawn(|| git.log_commits(repo_root, &base_oid, &head_oid));
         let diff_h = s.spawn(|| {
@@ -282,26 +269,18 @@ fn run_load(
     let commits = match commits_res {
         Ok(c) => c,
         Err(e) => {
-            let _ = res_tx.send(Response::PrLoadError {
-                number,
-                error: format!("{e:#}"),
-            });
+            let _ = res_tx.send(Response::PrLoadError { number, error: format!("{e:#}") });
             return;
         }
     };
     let files = match diff_res {
         Ok(f) => f,
         Err(e) => {
-            let _ = res_tx.send(Response::PrLoadError {
-                number,
-                error: format!("{e:#}"),
-            });
+            let _ = res_tx.send(Response::PrLoadError { number, error: format!("{e:#}") });
             return;
         }
     };
 
-    // Build PrDetail from cached Pr + locally-derived data. No gh round
-    // trip — `gh pr view` is no longer in the hot path.
     let detail = crate::data::pr::PrDetail {
         number: pr.number,
         title: pr.title.clone(),
@@ -315,7 +294,7 @@ fn run_load(
         mergeable: pr.mergeable.clone(),
         status_check_rollup: pr.status_check_rollup.clone(),
         review_decision: pr.review_decision,
-        commits: commits.clone(),
+        commits,
         files: files
             .iter()
             .map(|f| crate::data::pr::FileMeta {
@@ -325,99 +304,39 @@ fn run_load(
             })
             .collect(),
     };
-    let _ = res_tx.send(Response::PrDetail {
-        number,
-        result: Ok(detail),
-    });
-    let _ = res_tx.send(Response::PrDiff {
-        number,
-        result: Ok(files.clone()),
-    });
-
-    let commits: Vec<String> = commits.iter().map(|c| c.oid.clone()).collect();
-
-    // Stage 2: blame files[0] synchronously and emit its colors first.
-    if let Some(f) = files.first() {
-        if !f.binary {
-            let (lc, per) = blame_file(git, repo_root, &commits, &head_oid, &base_oid, f, window_size);
-            let _ = res_tx.send(Response::PrFileColors {
-                number,
-                head_oid: head_oid.clone(),
-                path: f.path.clone(),
-                colors: lc,
-                stats: per,
-            });
-        }
-    }
-
-    // Stage 3: parallel pool for the remainder.
-    let remainder: Vec<&crate::data::diff::FileDiff> = files.iter().skip(1).filter(|f| !f.binary).collect();
-    let n = remainder.len();
-    if n > 0 {
-        let n_workers = thread::available_parallelism()
-            .map(|p| p.get())
-            .unwrap_or(4)
-            .min(n);
-        let next_idx = AtomicUsize::new(0);
-        thread::scope(|s| {
-            for _ in 0..n_workers {
-                let tx = res_tx.clone();
-                let head_oid = head_oid.clone();
-                let base_oid = base_oid.clone();
-                let commits = commits.clone();
-                let remainder = &remainder;
-                let next_idx = &next_idx;
-                s.spawn(move || {
-                    loop {
-                        let i = next_idx.fetch_add(1, Ordering::Relaxed);
-                        if i >= remainder.len() {
-                            break;
-                        }
-                        let f = remainder[i];
-                        let (lc, per) = blame_file(
-                            git, repo_root, &commits, &head_oid, &base_oid, f, window_size,
-                        );
-                        let _ = tx.send(Response::PrFileColors {
-                            number,
-                            head_oid: head_oid.clone(),
-                            path: f.path.clone(),
-                            colors: lc,
-                            stats: per,
-                        });
-                    }
-                });
-            }
-        });
-    }
-
-    let _ = res_tx.send(Response::PrColorsDone {
-        number,
-        head_oid,
-    });
+    let _ = res_tx.send(Response::PrDetail { number, result: Ok(detail) });
+    let _ = res_tx.send(Response::PrDiff { number, result: Ok(files) });
 }
 
-/// Blame + log-patches for one file. Returns the file's `LineColors`
-/// and its per-commit `CommitStats` contribution.
-fn blame_file(
+#[allow(clippy::too_many_arguments)]
+fn run_blame_file(
     git: &dyn GitClient,
     repo_root: &Path,
-    commits: &[String],
+    res_tx: &Sender<Response>,
+    number: u32,
     head_oid: &str,
     base_oid: &str,
-    f: &crate::data::diff::FileDiff,
+    path: &str,
+    commits: &[String],
     window_size: usize,
-) -> (LineColors, HashMap<String, CommitStats>) {
+) {
     let head = git
-        .blame(repo_root, head_oid, &f.path)
+        .blame(repo_root, head_oid, path)
         .map(|s| parse_blame(&s))
         .unwrap_or_else(|_| Blame { line_shas: vec![] });
     let log_out = git
-        .log_patches(repo_root, base_oid, head_oid, &f.path)
+        .log_patches(repo_root, base_oid, head_oid, path)
         .unwrap_or_default();
     let deletes = parse_deletions(&log_out);
     let lc = attribute_file(commits, window_size, &head, &deletes);
     let per = commit_stats_for_file(commits, &head, &deletes);
-    (lc, per)
+    let _ = res_tx.send(Response::PrFileColors {
+        number,
+        head_oid: head_oid.to_string(),
+        path: path.to_string(),
+        colors: lc,
+        stats: per,
+    });
 }
 
 #[cfg(test)]
@@ -452,7 +371,7 @@ mod tests {
     }
 
     #[test]
-    fn load_pr_streams_detail_diff_then_per_file_colors() {
+    fn open_pr_emits_only_detail_and_diff_no_colors() {
         let detail = fixture_detail();
         let head_sha = detail.head_ref_oid.clone();
         let base_sha = detail.base_ref_oid.clone();
@@ -461,65 +380,80 @@ mod tests {
 
         let gh = FakeGh::new();
         let mut git = FakeGit::new("/tmp/repo");
-        git.refs
-            .insert(format!("refs/prpr/pr-{number}"), head_sha.clone());
-        git.refs
-            .insert(format!("origin/{}", pr.base_ref_name), base_sha.clone());
-        git.commits
-            .insert((base_sha.clone(), head_sha.clone()), detail.commits.clone());
+        git.refs.insert(format!("refs/prpr/pr-{number}"), head_sha.clone());
+        git.refs.insert(format!("origin/{}", pr.base_ref_name), base_sha.clone());
+        git.commits.insert((base_sha.clone(), head_sha.clone()), detail.commits.clone());
         git.diffs.insert(
             (base_sha.clone(), head_sha.clone()),
             include_str!("../../tests/fixtures/diff_basic.patch").to_string(),
         );
-        let porcelain = include_str!("../../tests/fixtures/blame_porcelain.txt").to_string();
-        git.blames
-            .insert((head_sha.clone(), "src/sched.rs".into()), porcelain.clone());
-        git.blames
-            .insert((head_sha.clone(), "README.md".into()), porcelain);
 
         let worker = Worker::spawn("/tmp/repo".into(), Arc::new(gh), Arc::new(git), 7);
-        worker.send(Request::LoadPr(pr));
+        worker.send(Request::OpenPr(pr));
 
-        // Drain everything until PrColorsDone, with a deadline so the test
-        // can't hang.
         let mut got_detail = false;
         let mut got_diff = false;
-        let mut color_paths: Vec<String> = vec![];
-        let mut done = false;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while std::time::Instant::now() < deadline && !done {
-            match worker.rx.recv_timeout(std::time::Duration::from_millis(500)) {
+        let mut color_events = 0;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            match worker.rx.recv_timeout(std::time::Duration::from_millis(200)) {
                 Ok(Response::PrDetail { number: n, result: Ok(_) }) if n == number => {
                     got_detail = true;
                 }
                 Ok(Response::PrDiff { number: n, result: Ok(_) }) if n == number => {
                     got_diff = true;
                 }
-                Ok(Response::PrFileColors {
-                    number: n,
-                    head_oid,
-                    path,
-                    ..
-                }) if n == number => {
-                    assert_eq!(head_oid, head_sha);
-                    color_paths.push(path);
-                }
-                Ok(Response::PrColorsDone { number: n, .. }) if n == number => {
-                    done = true;
-                }
+                Ok(Response::PrFileColors { .. }) => color_events += 1,
                 Ok(Response::PrLoadError { error, .. }) => panic!("unexpected error: {error}"),
-                Ok(_) | Err(_) => {}
+                Ok(_) => {}
+                Err(_) => {
+                    if got_detail && got_diff { break; }
+                }
             }
         }
         assert!(got_detail, "never received PrDetail");
         assert!(got_diff, "never received PrDiff");
-        assert!(done, "never received PrColorsDone");
-        // First color event is for files[0] (the visible file).
-        assert_eq!(color_paths.first().map(String::as_str), Some("src/sched.rs"));
+        assert_eq!(color_events, 0, "OpenPr must not emit color events");
     }
 
     #[test]
-    fn load_pr_emits_load_error_when_refs_missing() {
+    fn blame_file_emits_one_pr_file_colors_for_requested_path() {
+        let detail = fixture_detail();
+        let head_sha = detail.head_ref_oid.clone();
+        let base_sha = detail.base_ref_oid.clone();
+        let number = detail.number;
+
+        let gh = FakeGh::new();
+        let mut git = FakeGit::new("/tmp/repo");
+        let porcelain = include_str!("../../tests/fixtures/blame_porcelain.txt").to_string();
+        git.blames.insert((head_sha.clone(), "src/sched.rs".into()), porcelain);
+
+        let worker = Worker::spawn("/tmp/repo".into(), Arc::new(gh), Arc::new(git), 7);
+        worker.send(Request::BlameFile {
+            number,
+            head_oid: head_sha.clone(),
+            base_oid: base_sha.clone(),
+            path: "src/sched.rs".into(),
+            commits: detail.commits.iter().map(|c| c.oid.clone()).collect(),
+        });
+
+        let mut got = 0;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            match worker.rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                Ok(Response::PrFileColors { number: n, path, .. }) if n == number => {
+                    assert_eq!(path, "src/sched.rs");
+                    got += 1;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        assert_eq!(got, 1, "BlameFile should emit exactly one PrFileColors for the requested path");
+    }
+
+    #[test]
+    fn open_pr_emits_load_error_when_refs_missing() {
         // FakeGit.refs empty → rev_parse fails → cold-start fallback
         // also can't populate (FakeGit.fetch_pr is a no-op) → PrLoadError.
         let gh = FakeGh::new();
@@ -540,7 +474,7 @@ mod tests {
             review_decision: None,
             mergeable: None,
         };
-        worker.send(Request::LoadPr(pr));
+        worker.send(Request::OpenPr(pr));
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut saw_error = false;

@@ -8,14 +8,21 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::data::cache::PrPackage;
 use crate::data::diff::FileDiff;
-use crate::render::attribution::LineColors;
+use crate::data::pr::PrDetail;
+use crate::render::attribution::{CommitStats, LineColors};
 use crate::render::diff::{ext_of, render_line};
 use crate::render::style::*;
 
 #[derive(Debug, Default)]
 pub struct PrReviewState {
+    // Data owned by the review pane (populated by worker responses).
+    pub detail: Option<PrDetail>,
+    pub files: Vec<FileDiff>,
+    pub colors: HashMap<String, ColorState>,
+    pub commit_stats: HashMap<String, CommitStats>,
+
+    // View state.
     pub file_index: usize,
     pub cursor_line: usize,
     pub scroll: u16,
@@ -23,38 +30,46 @@ pub struct PrReviewState {
     pub status: String,
 }
 
-pub fn render(f: &mut Frame, area: Rect, pkg: &PrPackage, st: &PrReviewState) {
+#[derive(Debug, Clone)]
+pub enum ColorState {
+    Loading,
+    Ready(LineColors),
+}
+
+pub fn render(f: &mut Frame, area: Rect, st: &PrReviewState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // header
-            Constraint::Length(1), // spacer between header and file bar
-            Constraint::Length(2), // file bar (title + divider)
-            Constraint::Min(1),    // diff body
-            Constraint::Length(3), // status (cursor + 2 hint rows)
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(2),
+            Constraint::Min(1),
+            Constraint::Length(3),
         ])
         .split(area);
 
-    render_header(f, chunks[0], pkg);
-    render_file_bar(f, chunks[2], pkg, st);
-    render_diff_body(f, chunks[3], pkg, st);
-    render_status(f, chunks[4], pkg, st);
+    render_header(f, chunks[0], st);
+    render_file_bar(f, chunks[2], st);
+    render_diff_body(f, chunks[3], st);
+    render_status(f, chunks[4], st);
 }
 
-fn render_header(f: &mut Frame, area: Rect, pkg: &PrPackage) {
-    let d = &pkg.detail;
-    let header = format!(
-        "  prpr · #{} {} · {} · {} ← {}",
-        d.number, d.title, d.author.login, d.base_ref_name, d.head_ref_name,
-    );
+fn render_header(f: &mut Frame, area: Rect, st: &PrReviewState) {
+    let header = match &st.detail {
+        Some(d) => format!(
+            "  prpr · #{} {} · {} · {} ← {}",
+            d.number, d.title, d.author.login, d.base_ref_name, d.head_ref_name,
+        ),
+        None => "  prpr · loading…".to_string(),
+    };
     f.render_widget(
         Paragraph::new(header).style(Style::default().fg(TEXT)),
         area,
     );
 }
 
-fn render_file_bar(f: &mut Frame, area: Rect, pkg: &PrPackage, st: &PrReviewState) {
-    let paths = pkg.file_paths();
+fn render_file_bar(f: &mut Frame, area: Rect, st: &PrReviewState) {
+    let paths = file_paths(st);
     let total = paths.len();
     let path = paths.get(st.file_index).copied().unwrap_or("");
     let counter = format!("file {}/{}", st.file_index + 1, total.max(1));
@@ -80,8 +95,27 @@ fn render_file_bar(f: &mut Frame, area: Rect, pkg: &PrPackage, st: &PrReviewStat
     );
 }
 
-fn render_diff_body(f: &mut Frame, area: Rect, pkg: &PrPackage, st: &PrReviewState) {
-    if pkg.files.is_empty() {
+pub fn file_paths(st: &PrReviewState) -> Vec<&str> {
+    if st.files.is_empty() {
+        st.detail
+            .as_ref()
+            .map(|d| d.files.iter().map(|f| f.path.as_str()).collect())
+            .unwrap_or_default()
+    } else {
+        st.files.iter().map(|f| f.path.as_str()).collect()
+    }
+}
+
+pub fn file_count(st: &PrReviewState) -> usize {
+    if st.files.is_empty() {
+        st.detail.as_ref().map(|d| d.files.len()).unwrap_or(0)
+    } else {
+        st.files.len()
+    }
+}
+
+fn render_diff_body(f: &mut Frame, area: Rect, st: &PrReviewState) {
+    if st.files.is_empty() {
         f.render_widget(
             Paragraph::new(format!(
                 "  {} loading diff…",
@@ -92,7 +126,7 @@ fn render_diff_body(f: &mut Frame, area: Rect, pkg: &PrPackage, st: &PrReviewSta
         );
         return;
     }
-    let Some(file) = pkg.files.get(st.file_index) else {
+    let Some(file) = st.files.get(st.file_index) else {
         return;
     };
     if file.binary {
@@ -102,12 +136,15 @@ fn render_diff_body(f: &mut Frame, area: Rect, pkg: &PrPackage, st: &PrReviewSta
         );
         return;
     }
-    let lines = body_lines(file, &pkg.colors);
+    let lines = body_lines(file, &st.colors);
     f.render_widget(Paragraph::new(lines).scroll((st.scroll, 0)), area);
 }
 
-fn body_lines<'a>(file: &'a FileDiff, colors: &'a HashMap<String, LineColors>) -> Vec<Line<'a>> {
-    let lookup = colors.get(&file.path);
+fn body_lines<'a>(file: &'a FileDiff, colors: &'a HashMap<String, ColorState>) -> Vec<Line<'a>> {
+    let lookup = colors.get(&file.path).and_then(|c| match c {
+        ColorState::Ready(lc) => Some(lc),
+        ColorState::Loading => None,
+    });
     let ext = ext_of(&file.path);
     file.lines
         .iter()
@@ -117,10 +154,6 @@ fn body_lines<'a>(file: &'a FileDiff, colors: &'a HashMap<String, LineColors>) -
                     .and_then(|lc| lc.head.get(n.saturating_sub(1) as usize).copied())
                     .flatten()
             });
-            // Delete lines are looked up by text content — the same line
-            // text might appear at different positions in different commits,
-            // but `git log -p` records exactly which PR commit's patch
-            // removed each unique text. See data::log_patches.
             let base = if l.op == crate::data::diff::DiffOp::Delete {
                 lookup.and_then(|lc| lc.delete.get(&l.text).copied())
             } else {
@@ -131,17 +164,17 @@ fn body_lines<'a>(file: &'a FileDiff, colors: &'a HashMap<String, LineColors>) -
         .collect()
 }
 
-fn render_status(f: &mut Frame, area: Rect, pkg: &PrPackage, st: &PrReviewState) {
+fn render_status(f: &mut Frame, area: Rect, st: &PrReviewState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // cursor / status info
-            Constraint::Length(1), // hints row 1: scrolling
-            Constraint::Length(1), // hints row 2: actions
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
         ])
         .split(area);
 
-    let cursor_info = pkg
+    let cursor_info = st
         .files
         .get(st.file_index)
         .and_then(|file| {
@@ -153,8 +186,6 @@ fn render_status(f: &mut Frame, area: Rect, pkg: &PrPackage, st: &PrReviewState)
         })
         .map(|n| format!("line {n}"))
         .unwrap_or_default();
-    // Surface in-progress status (refresh in flight) alongside the cursor
-    // position so background work isn't silent — `…` is the convention.
     let status_text = if crate::render::spinner::looks_in_progress(&st.status) {
         format!("{} {}", crate::render::spinner::glyph(), st.status)
     } else if cursor_info.is_empty() {
@@ -191,21 +222,25 @@ fn render_status(f: &mut Frame, area: Rect, pkg: &PrPackage, st: &PrReviewState)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data::cache::PrPackage;
     use crate::data::diff::parse_diff;
     use crate::data::pr::PrDetail;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    fn fixture_pkg() -> PrPackage {
+    fn fixture_review_state() -> PrReviewState {
         let detail: PrDetail =
             serde_json::from_str(include_str!("../../tests/fixtures/pr_view.json")).unwrap();
         let files = parse_diff(include_str!("../../tests/fixtures/diff_basic.patch")).unwrap();
-        PrPackage {
-            detail,
+        PrReviewState {
+            detail: Some(detail),
             files,
             colors: HashMap::new(),
             commit_stats: HashMap::new(),
+            file_index: 0,
+            cursor_line: 0,
+            scroll: 0,
+            show_sha_margin: false,
+            status: String::new(),
         }
     }
 
@@ -217,12 +252,11 @@ mod tests {
 
     #[test]
     fn renders_pr_number_in_header() {
-        let pkg = fixture_pkg();
-        let st = PrReviewState::default();
+        let r = fixture_review_state();
         let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
         term.draw(|f| {
             let area = f.area();
-            render(f, area, &pkg, &st)
+            render(f, area, &r)
         })
         .unwrap();
         let buf = term.backend().buffer();
@@ -233,16 +267,14 @@ mod tests {
 
     #[test]
     fn renders_no_commit_strip() {
-        let pkg = fixture_pkg();
-        let st = PrReviewState::default();
+        let r = fixture_review_state();
         let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
         term.draw(|f| {
             let area = f.area();
-            render(f, area, &pkg, &st);
+            render(f, area, &r);
         })
         .unwrap();
         let buf = term.backend().buffer();
-        // No row should render the old "commits  " label.
         for y in 0..buf.area.height {
             let row = buffer_line(buf, y);
             assert!(
@@ -253,35 +285,30 @@ mod tests {
     }
 
     #[test]
-    fn file_bar_uses_detail_files_when_pkg_files_empty() {
-        let mut pkg = fixture_pkg();
-        pkg.files = vec![];
-        let st = PrReviewState::default();
-        // Use a wide terminal so the counter (right-hand side) isn't clipped.
+    fn file_bar_uses_detail_files_when_files_not_yet_parsed() {
+        let mut r = fixture_review_state();
+        let detail_file_count = r.detail.as_ref().unwrap().files.len();
+        r.files = vec![];
         let mut term = Terminal::new(TestBackend::new(120, 20)).unwrap();
         term.draw(|f| {
             let area = f.area();
-            render(f, area, &pkg, &st);
+            render(f, area, &r);
         })
         .unwrap();
         let buf = term.backend().buffer();
-        // File bar is at row 2 (header row 0; spacer row 1; file bar rows 2-3).
         let bar = buffer_line(buf, 2);
-        // First detail.files entry from fixture is "src/sched.rs".
         assert!(bar.contains("src/sched.rs"), "bar was: {bar:?}");
-        // Counter shows detail.files count.
-        assert!(bar.contains(&format!("file 1/{}", pkg.detail.files.len())), "bar was: {bar:?}");
+        assert!(bar.contains(&format!("file 1/{detail_file_count}")), "bar was: {bar:?}");
     }
 
     #[test]
-    fn diff_body_shows_loading_when_pkg_files_empty() {
-        let mut pkg = fixture_pkg();
-        pkg.files = vec![];
-        let st = PrReviewState::default();
+    fn diff_body_shows_loading_when_files_not_yet_parsed() {
+        let mut r = fixture_review_state();
+        r.files = vec![];
         let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
         term.draw(|f| {
             let area = f.area();
-            render(f, area, &pkg, &st);
+            render(f, area, &r);
         })
         .unwrap();
         let buf = term.backend().buffer();
@@ -291,23 +318,29 @@ mod tests {
 
     #[test]
     fn binary_file_renders_placeholder() {
-        let mut pkg = fixture_pkg();
-        pkg.files = vec![FileDiff {
+        let mut r = fixture_review_state();
+        r.files = vec![FileDiff {
             path: "img.png".into(),
             lines: vec![],
             binary: true,
         }];
-        let st = PrReviewState::default();
         let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
         term.draw(|f| {
             let area = f.area();
-            render(f, area, &pkg, &st)
+            render(f, area, &r)
         })
         .unwrap();
         let buf = term.backend().buffer();
-        // Body starts at row 4 (header row 0; spacer row 1; file bar rows 2-3;
-        // body rows 4..17; status row 17-19).
         let body = buffer_line(buf, 4);
         assert!(body.contains("binary file"), "row 4 was: {:?}", body);
+    }
+
+    #[test]
+    fn pr_review_state_default_has_empty_data_fields() {
+        let st = PrReviewState::default();
+        assert!(st.detail.is_none());
+        assert!(st.files.is_empty());
+        assert!(st.colors.is_empty());
+        assert!(st.commit_stats.is_empty());
     }
 }
