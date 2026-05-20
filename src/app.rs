@@ -623,9 +623,9 @@ fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) 
         Action::PrevFile => cycle_file(app, st, -1),
         Action::OpenFilePicker => {
             if let Some(r) = st.review.as_ref() {
-                let paths: Vec<String> = crate::view::pr_review::file_paths(r)
-                    .into_iter().map(String::from).collect();
-                let current = crate::view::pr_review::file_paths(r).get(r.file_index).copied();
+                let paths_vec = crate::view::pr_review::file_paths(r);
+                let current = paths_vec.get(r.file_index).copied();
+                let paths: Vec<String> = paths_vec.into_iter().map(String::from).collect();
                 st.picker = Some(FilePickerState::new(paths, current));
                 st.focused = FocusedView::FilePicker;
             }
