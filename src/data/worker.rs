@@ -1,7 +1,7 @@
 //! Worker thread + request/response channels.
 //!
-//! All blocking subprocess work (`gh pr list`, `gh pr view`, `gh pr diff`,
-//! `git fetch`, `git blame`, `gh pr merge`) runs on a single worker thread.
+//! All blocking subprocess work (`gh pr list`, `git fetch`, `git diff`,
+//! `git blame`, `gh pr merge`) runs on a single worker thread.
 //! The UI thread sends `Request`s and drains `Response`s every iteration of
 //! its event loop, so the screen stays redraw-able while subprocess calls
 //! run.
@@ -308,6 +308,7 @@ fn run_open_pr(
     let _ = res_tx.send(Response::PrDiff { number, result: Ok(files) });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_blame_file(
     git: &dyn GitClient,
     repo_root: &Path,

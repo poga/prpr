@@ -1105,7 +1105,7 @@ mod tests {
     }
 
     #[test]
-    fn move_review_is_noop_when_pkg_files_empty() {
+    fn move_review_is_noop_when_files_not_yet_parsed() {
         let mut st = dummy_app_state();
         let mut cache = Cache::new();
         let json = include_str!("../tests/fixtures/pr_view.json");

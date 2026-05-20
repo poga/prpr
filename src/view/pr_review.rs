@@ -285,7 +285,7 @@ mod tests {
     }
 
     #[test]
-    fn file_bar_uses_detail_files_when_pkg_files_empty() {
+    fn file_bar_uses_detail_files_when_files_not_yet_parsed() {
         let mut r = fixture_review_state();
         let detail_file_count = r.detail.as_ref().unwrap().files.len();
         r.files = vec![];
@@ -302,7 +302,7 @@ mod tests {
     }
 
     #[test]
-    fn diff_body_shows_loading_when_pkg_files_empty() {
+    fn diff_body_shows_loading_when_files_not_yet_parsed() {
         let mut r = fixture_review_state();
         r.files = vec![];
         let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
