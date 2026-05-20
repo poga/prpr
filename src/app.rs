@@ -339,15 +339,14 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
             if let Some(head) = head_oid {
                 app.cache.update_diff(number, &head, files.clone());
             }
-            if let Some(r) = st.review.as_mut()
-                && st.current_pr == Some(number)
-            {
-                r.files = files;
-                r.status = format!("{} files", r.files.len());
-            }
             if st.current_pr == Some(number) {
-                let path = st.review.as_ref()
-                    .and_then(|r| r.files.get(r.file_index).map(|f| f.path.clone()));
+                let path = if let Some(r) = st.review.as_mut() {
+                    r.files = files;
+                    r.status = format!("{} files", r.files.len());
+                    r.files.get(r.file_index).map(|f| f.path.clone())
+                } else {
+                    None
+                };
                 if let Some(path) = path {
                     ensure_blame(app, st, number, &path);
                 }
