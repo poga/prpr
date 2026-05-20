@@ -213,7 +213,7 @@ fn run_worker(
                 });
             }
             Request::OpenPr(pr) => {
-                run_open_pr(&*gh, &*git, &repo_root, &res_tx, pr);
+                run_open_pr(&*git, &repo_root, &res_tx, pr);
             }
             Request::BlameFile { number, head_oid, base_oid, path, commits } => {
                 run_blame_file(&*git, &repo_root, &res_tx, number, &head_oid, &base_oid, &path, &commits, window_size);
@@ -229,7 +229,6 @@ fn run_worker(
 }
 
 fn run_open_pr(
-    _gh: &dyn GhClient,
     git: &dyn GitClient,
     repo_root: &Path,
     res_tx: &Sender<Response>,
@@ -453,7 +452,7 @@ mod tests {
     }
 
     #[test]
-    fn load_pr_emits_load_error_when_refs_missing() {
+    fn open_pr_emits_load_error_when_refs_missing() {
         // FakeGit.refs empty → rev_parse fails → cold-start fallback
         // also can't populate (FakeGit.fetch_pr is a no-op) → PrLoadError.
         let gh = FakeGh::new();
