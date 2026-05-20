@@ -562,6 +562,7 @@ fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) 
                     scroll: 0,
                     show_sha_margin: app.config.show_sha_margin,
                     status: "loading…".into(),
+                    ..Default::default()
                 });
                 st.focused = FocusedView::Review;
                 if app.cache.get(num).is_none() {
@@ -1065,6 +1066,7 @@ mod tests {
             scroll: 0,
             show_sha_margin: false,
             status: String::new(),
+            ..Default::default()
         });
 
         cycle_file(&app, &mut st, 1);
@@ -1092,6 +1094,7 @@ mod tests {
             scroll: 0,
             show_sha_margin: false,
             status: String::new(),
+            ..Default::default()
         });
         move_review(&app, &mut st, 10);
         let r = st.review.as_ref().unwrap();
@@ -1510,6 +1513,7 @@ mod tests {
             scroll: 0,
             show_sha_margin: false,
             status: "loading…".into(),
+            ..Default::default()
         });
 
         let pr = crate::data::pr::Pr {

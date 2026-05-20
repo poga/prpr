@@ -10,17 +10,31 @@ use ratatui::widgets::Paragraph;
 
 use crate::data::cache::PrPackage;
 use crate::data::diff::FileDiff;
-use crate::render::attribution::LineColors;
+use crate::data::pr::PrDetail;
+use crate::render::attribution::{CommitStats, LineColors};
 use crate::render::diff::{ext_of, render_line};
 use crate::render::style::*;
 
 #[derive(Debug, Default)]
 pub struct PrReviewState {
+    // Data owned by the review pane (populated by worker responses).
+    pub detail: Option<PrDetail>,
+    pub files: Vec<FileDiff>,
+    pub colors: HashMap<String, ColorState>,
+    pub commit_stats: HashMap<String, CommitStats>,
+
+    // View state.
     pub file_index: usize,
     pub cursor_line: usize,
     pub scroll: u16,
     pub show_sha_margin: bool,
     pub status: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum ColorState {
+    Loading,
+    Ready(LineColors),
 }
 
 pub fn render(f: &mut Frame, area: Rect, pkg: &PrPackage, st: &PrReviewState) {
@@ -309,5 +323,25 @@ mod tests {
         // body rows 4..17; status row 17-19).
         let body = buffer_line(buf, 4);
         assert!(body.contains("binary file"), "row 4 was: {:?}", body);
+    }
+
+    #[test]
+    fn pr_review_state_default_has_empty_data_fields() {
+        let st = PrReviewState::default();
+        assert!(st.detail.is_none());
+        assert!(st.files.is_empty());
+        assert!(st.colors.is_empty());
+        assert!(st.commit_stats.is_empty());
+    }
+
+    #[test]
+    fn color_state_distinguishes_loading_from_ready() {
+        let loading = ColorState::Loading;
+        let ready = ColorState::Ready(LineColors {
+            head: vec![],
+            delete: HashMap::new(),
+        });
+        assert!(matches!(loading, ColorState::Loading));
+        assert!(matches!(ready, ColorState::Ready(_)));
     }
 }
