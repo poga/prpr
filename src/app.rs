@@ -309,7 +309,6 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
         }
         Response::ListEnriched { .. } => { /* stale; drop */ }
         Response::PrDetail { number, result: Ok(detail) } => {
-            app.cache.insert_partial(detail.clone());
             if let Some(r) = st.review.as_mut()
                 && st.current_pr == Some(number)
             {
@@ -332,13 +331,6 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
             st.list.status = format!("load #{number} failed: {e}");
         }
         Response::PrDiff { number, result: Ok(files) } => {
-            let head_oid = app
-                .cache
-                .get(number)
-                .map(|p| p.detail.head_ref_oid.clone());
-            if let Some(head) = head_oid {
-                app.cache.update_diff(number, &head, files.clone());
-            }
             if st.current_pr == Some(number) {
                 let path = if let Some(r) = st.review.as_mut() {
                     r.files = files;
@@ -361,12 +353,11 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
         }
         Response::PrFileColors {
             number,
-            head_oid,
+            head_oid: _,
             path,
             colors,
             stats,
         } => {
-            app.cache.add_file_colors(number, &head_oid, path.clone(), colors.clone(), stats.clone());
             if let Some(r) = st.review.as_mut()
                 && st.current_pr == Some(number)
             {
@@ -1092,7 +1083,6 @@ mod tests {
         let detail: crate::data::pr::PrDetail = serde_json::from_str(json).unwrap();
         let n_detail_files = detail.files.len();
         let number = detail.number;
-        cache.insert_partial(detail.clone());
         let app = test_app_for_state(&mut cache);
         st.current_pr = Some(number);
         st.review = Some(PrReviewState {
@@ -1121,7 +1111,6 @@ mod tests {
         let json = include_str!("../tests/fixtures/pr_view.json");
         let detail: crate::data::pr::PrDetail = serde_json::from_str(json).unwrap();
         let number = detail.number;
-        cache.insert_partial(detail.clone());
         let app = test_app_for_state(&mut cache);
         st.current_pr = Some(number);
         st.review = Some(PrReviewState {
@@ -1728,7 +1717,6 @@ mod tests {
             ..Default::default()
         });
         let mut cache = Cache::new();
-        cache.insert_partial(detail);
         let mut app = test_app_for_state(&mut cache);
 
         handle_response(
@@ -1757,7 +1745,6 @@ mod tests {
             ..Default::default()
         });
         let mut cache = Cache::new();
-        cache.insert_partial(detail.clone());
         let mut app = test_app_for_state(&mut cache);
 
         handle_response(
@@ -1905,8 +1892,6 @@ mod tests {
             ..Default::default()
         });
         let mut cache = Cache::new();
-        cache.insert_partial(detail);
-        cache.update_diff(number, &head_oid, files);
         let mut app = test_app_for_state(&mut cache);
 
         handle_response(

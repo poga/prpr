@@ -59,8 +59,8 @@ impl ListStage {
     }
 }
 
-// PrPackage-derived variants are larger than the others. The channel
-// is low-volume per cycle so the size disparity isn't worth boxing for.
+// Some variants are larger than the others. The channel is low-volume
+// per cycle so the size disparity isn't worth boxing for.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum Response {
