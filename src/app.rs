@@ -355,14 +355,6 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
                 }
             }
         }
-        Response::PrColorsDone { number, head_oid: _ } => {
-            if let Some(r) = st.review.as_mut()
-                && st.current_pr == Some(number)
-                && let Some(pkg) = app.cache.get(number)
-            {
-                r.status = format!("{} files", pkg.files.len());
-            }
-        }
         Response::PrLoadError { number, error } => {
             if let Some(r) = st.review.as_mut()
                 && st.current_pr == Some(number)
@@ -583,7 +575,7 @@ fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) 
                     ..Default::default()
                 });
                 st.focused = FocusedView::Review;
-                app.request(Request::LoadPr(pr));
+                app.request(Request::OpenPr(pr));
             }
         }
         Action::ListMerge => open_merge(st),
@@ -669,7 +661,7 @@ fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) 
                 if let Some(r) = st.review.as_mut() {
                     r.status = "loading…".into();
                 }
-                app.request(Request::LoadPr(pr));
+                app.request(Request::OpenPr(pr));
             }
         }
         Action::Nothing => {}
@@ -1502,35 +1494,21 @@ mod tests {
     }
 
     #[test]
-    fn end_to_end_load_pr_progresses_through_partial_states() {
-        use crate::data::gh::fakes::FakeGh;
-        use crate::data::git::fakes::FakeGit;
-        use crate::data::pr::PrDetail;
-        use crate::data::worker::Request;
-
-        let detail: PrDetail =
-            serde_json::from_str(include_str!("../tests/fixtures/pr_view.json")).unwrap();
+    fn end_to_end_open_pr_progresses_through_partial_states() {
+        let detail = fixture_pr_detail();
         let number = detail.number;
         let head_sha = detail.head_ref_oid.clone();
         let base_sha = detail.base_ref_oid.clone();
 
-        let gh = FakeGh::new();
-        let mut git = FakeGit::new("/tmp/repo");
-        git.refs
-            .insert(format!("refs/prpr/pr-{number}"), head_sha.clone());
-        git.refs
-            .insert(format!("origin/{}", detail.base_ref_name), base_sha.clone());
-        git.commits
-            .insert((base_sha.clone(), head_sha.clone()), detail.commits.clone());
+        let gh = crate::data::gh::fakes::FakeGh::new();
+        let mut git = crate::data::git::fakes::FakeGit::new("/tmp/repo");
+        git.refs.insert(format!("refs/prpr/pr-{number}"), head_sha.clone());
+        git.refs.insert(format!("origin/{}", detail.base_ref_name), base_sha.clone());
+        git.commits.insert((base_sha.clone(), head_sha.clone()), detail.commits.clone());
         git.diffs.insert(
-            (base_sha, head_sha.clone()),
+            (base_sha.clone(), head_sha.clone()),
             include_str!("../tests/fixtures/diff_basic.patch").to_string(),
         );
-        let porcelain = include_str!("../tests/fixtures/blame_porcelain.txt").to_string();
-        git.blames
-            .insert((head_sha.clone(), "src/sched.rs".into()), porcelain.clone());
-        git.blames
-            .insert((head_sha.clone(), "README.md".into()), porcelain);
 
         let mut app = App::new(
             "/tmp/repo".into(),
@@ -1541,10 +1519,6 @@ mod tests {
         let mut st = AppState::new("repo".into(), "main".into());
         st.current_pr = Some(number);
         st.review = Some(PrReviewState {
-            file_index: 0,
-            cursor_line: 0,
-            scroll: 0,
-            show_sha_margin: false,
             status: "loading…".into(),
             ..Default::default()
         });
@@ -1564,45 +1538,31 @@ mod tests {
             review_decision: detail.review_decision,
             mergeable: detail.mergeable.clone(),
         };
-        app.request(Request::LoadPr(pr));
+        app.request(Request::OpenPr(pr));
 
-        // Drain until we see PrColorsDone, feeding events through.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         let mut saw_detail = false;
         let mut saw_diff = false;
-        let mut done = false;
-        while std::time::Instant::now() < deadline && !done {
-            match app
-                .worker
-                .rx
-                .recv_timeout(std::time::Duration::from_millis(500))
-            {
-                Ok(resp) => {
-                    let is_detail = matches!(resp, crate::data::worker::Response::PrDetail { .. });
-                    let is_diff = matches!(resp, crate::data::worker::Response::PrDiff { .. });
-                    let is_done =
-                        matches!(resp, crate::data::worker::Response::PrColorsDone { .. });
-                    handle_response(&mut app, &mut st, resp);
-                    if is_detail {
-                        saw_detail = true;
-                        assert!(app.cache.get(number).is_some(), "cache should have partial");
-                        assert_eq!(st.review.as_ref().unwrap().status, "loading diff…");
-                    }
-                    if is_diff {
-                        saw_diff = true;
-                        assert!(!app.cache.get(number).unwrap().files.is_empty());
-                        assert_eq!(st.review.as_ref().unwrap().status, format!("{} files", app.cache.get(number).unwrap().files.len()));
-                    }
-                    if is_done {
-                        done = true;
-                        let n = app.cache.get(number).unwrap().files.len();
-                        assert_eq!(st.review.as_ref().unwrap().status, format!("{n} files"));
-                    }
+        while std::time::Instant::now() < deadline && !(saw_detail && saw_diff) {
+            if let Ok(resp) = app.worker.rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                let is_detail = matches!(resp, Response::PrDetail { .. });
+                let is_diff = matches!(resp, Response::PrDiff { .. });
+                handle_response(&mut app, &mut st, resp);
+                if is_detail {
+                    saw_detail = true;
+                    let r = st.review.as_ref().unwrap();
+                    assert!(r.detail.is_some());
+                    assert_eq!(r.status, "loading diff…");
                 }
-                Err(_) => continue,
+                if is_diff {
+                    saw_diff = true;
+                    let r = st.review.as_ref().unwrap();
+                    assert!(!r.files.is_empty());
+                    assert_eq!(r.status, format!("{} files", r.files.len()));
+                }
             }
         }
-        assert!(saw_detail && saw_diff && done, "missed an event");
+        assert!(saw_detail && saw_diff, "missed an event");
     }
 
     #[test]
