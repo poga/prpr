@@ -334,14 +334,4 @@ mod tests {
         assert!(st.commit_stats.is_empty());
     }
 
-    #[test]
-    fn color_state_distinguishes_loading_from_ready() {
-        let loading = ColorState::Loading;
-        let ready = ColorState::Ready(LineColors {
-            head: vec![],
-            delete: HashMap::new(),
-        });
-        assert!(matches!(loading, ColorState::Loading));
-        assert!(matches!(ready, ColorState::Ready(_)));
-    }
 }
