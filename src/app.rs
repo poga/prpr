@@ -235,6 +235,23 @@ pub fn run(term: &mut Term, app: &mut App, st: &mut AppState) -> Result<()> {
     Ok(())
 }
 
+fn ensure_blame(app: &App, st: &mut AppState, number: u32, path: &str) {
+    let Some(r) = st.review.as_mut() else { return };
+    let Some(d) = r.detail.as_ref() else { return };
+    if r.colors.contains_key(path) { return; }
+    let commits: Vec<String> = d.commits.iter().map(|c| c.oid.clone()).collect();
+    let head_oid = d.head_ref_oid.clone();
+    let base_oid = d.base_ref_oid.clone();
+    r.colors.insert(path.to_string(), crate::view::pr_review::ColorState::Loading);
+    app.request(Request::BlameFile {
+        number,
+        head_oid,
+        base_oid,
+        path: path.to_string(),
+        commits,
+    });
+}
+
 fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
     match resp {
         Response::ListProgress { generation, stage } if generation == st.list_gen => {
@@ -327,6 +344,13 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
             {
                 r.files = files;
                 r.status = format!("{} files", r.files.len());
+            }
+            if st.current_pr == Some(number) {
+                let path = st.review.as_ref()
+                    .and_then(|r| r.files.get(r.file_index).map(|f| f.path.clone()));
+                if let Some(path) = path {
+                    ensure_blame(app, st, number, &path);
+                }
             }
         }
         Response::PrDiff { number, result: Err(e) } => {
@@ -716,14 +740,21 @@ fn move_review(_app: &App, st: &mut AppState, delta: i32) {
     r.cursor_line = new_cursor as usize;
 }
 
-fn cycle_file(_app: &App, st: &mut AppState, delta: i32) {
-    let Some(r) = st.review.as_mut() else { return };
-    let n = crate::view::pr_review::file_count(r) as i32;
-    if n == 0 { return; }
-    let new_idx = ((r.file_index as i32 + delta).rem_euclid(n)) as usize;
-    r.file_index = new_idx;
-    r.cursor_line = 0;
-    r.scroll = 0;
+fn cycle_file(app: &App, st: &mut AppState, delta: i32) {
+    let Some(num) = st.current_pr else { return };
+    let path_for_blame = {
+        let Some(r) = st.review.as_mut() else { return };
+        let n = crate::view::pr_review::file_count(r) as i32;
+        if n == 0 { return; }
+        let new_idx = ((r.file_index as i32 + delta).rem_euclid(n)) as usize;
+        r.file_index = new_idx;
+        r.cursor_line = 0;
+        r.scroll = 0;
+        r.files.get(new_idx).map(|f| f.path.clone())
+    };
+    if let Some(path) = path_for_blame {
+        ensure_blame(app, st, num, &path);
+    }
 }
 
 fn handle_mouse(app: &mut App, st: &mut AppState, ev: crossterm::event::MouseEvent) {
@@ -755,7 +786,7 @@ fn handle_mouse(app: &mut App, st: &mut AppState, ev: crossterm::event::MouseEve
     }
 }
 
-fn handle_file_picker(_app: &App, st: &mut AppState, ev: crossterm::event::KeyEvent) {
+fn handle_file_picker(app: &App, st: &mut AppState, ev: crossterm::event::KeyEvent) {
     use crossterm::event::{KeyCode, KeyModifiers};
     let Some(picker) = st.picker.as_mut() else {
         return;
@@ -768,7 +799,7 @@ fn handle_file_picker(_app: &App, st: &mut AppState, ev: crossterm::event::KeyEv
     match ev.code {
         KeyCode::Enter => {
             let chosen = picker.matches().get(picker.selected).map(|s| (*s).clone());
-            if let (Some(path), Some(r)) = (chosen, st.review.as_mut()) {
+            let blame_target = if let (Some(path), Some(r)) = (chosen, st.review.as_mut()) {
                 let idx = crate::view::pr_review::file_paths(r)
                     .iter()
                     .position(|p| *p == path.as_str());
@@ -776,7 +807,11 @@ fn handle_file_picker(_app: &App, st: &mut AppState, ev: crossterm::event::KeyEv
                     r.file_index = idx;
                     r.cursor_line = 0;
                     r.scroll = 0;
-                }
+                    r.files.get(idx).map(|f| f.path.clone())
+                } else { None }
+            } else { None };
+            if let (Some(path), Some(num)) = (blame_target, st.current_pr) {
+                ensure_blame(app, st, num, &path);
             }
             st.picker = None;
             st.focused = FocusedView::Review;
@@ -1697,6 +1732,107 @@ mod tests {
 
         let r = st.review.as_ref().unwrap();
         assert_eq!(r.files.len(), files.len());
+    }
+
+    #[test]
+    fn pr_diff_response_dispatches_blame_file_for_current_file_and_marks_loading() {
+        let detail = fixture_pr_detail();
+        let number = detail.number;
+        let files = crate::data::diff::parse_diff(
+            include_str!("../tests/fixtures/diff_basic.patch")
+        ).unwrap();
+        let first_path = files[0].path.clone();
+
+        let mut st = dummy_app_state();
+        st.current_pr = Some(number);
+        st.review = Some(PrReviewState {
+            detail: Some(detail.clone()),
+            ..Default::default()
+        });
+        let mut cache = Cache::new();
+        cache.insert_partial(detail.clone());
+        let mut app = test_app_for_state(&mut cache);
+
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::PrDiff { number, result: Ok(files.clone()) },
+        );
+
+        let r = st.review.as_ref().unwrap();
+        assert!(matches!(
+            r.colors.get(&first_path),
+            Some(crate::view::pr_review::ColorState::Loading)
+        ));
+    }
+
+    #[test]
+    fn cycle_file_marks_new_file_loading_when_not_yet_blamed() {
+        let detail = fixture_pr_detail();
+        let number = detail.number;
+        let files = crate::data::diff::parse_diff(
+            include_str!("../tests/fixtures/diff_basic.patch")
+        ).unwrap();
+        assert!(files.len() >= 2);
+        let second_path = files[1].path.clone();
+
+        let mut st = dummy_app_state();
+        st.current_pr = Some(number);
+        st.review = Some(PrReviewState {
+            detail: Some(detail),
+            files: files.clone(),
+            file_index: 0,
+            ..Default::default()
+        });
+        let mut cache = Cache::new();
+        let app = test_app_for_state(&mut cache);
+
+        cycle_file(&app, &mut st, 1);
+
+        let r = st.review.as_ref().unwrap();
+        assert_eq!(r.file_index, 1);
+        assert!(matches!(
+            r.colors.get(&second_path),
+            Some(crate::view::pr_review::ColorState::Loading)
+        ));
+    }
+
+    #[test]
+    fn cycle_file_does_not_remark_loading_or_ready_file() {
+        use crate::render::attribution::LineColors;
+        let detail = fixture_pr_detail();
+        let number = detail.number;
+        let files = crate::data::diff::parse_diff(
+            include_str!("../tests/fixtures/diff_basic.patch")
+        ).unwrap();
+        assert!(files.len() >= 2);
+        let second_path = files[1].path.clone();
+
+        let ready = crate::view::pr_review::ColorState::Ready(LineColors {
+            head: vec![], delete: std::collections::HashMap::new(),
+        });
+        let mut colors = std::collections::HashMap::new();
+        colors.insert(second_path.clone(), ready);
+
+        let mut st = dummy_app_state();
+        st.current_pr = Some(number);
+        st.review = Some(PrReviewState {
+            detail: Some(detail),
+            files,
+            colors,
+            file_index: 0,
+            ..Default::default()
+        });
+        let mut cache = Cache::new();
+        let app = test_app_for_state(&mut cache);
+
+        cycle_file(&app, &mut st, 1);
+
+        let r = st.review.as_ref().unwrap();
+        assert!(matches!(
+            r.colors.get(&second_path),
+            Some(crate::view::pr_review::ColorState::Ready(_))
+        ), "ready entry must not be reset to Loading");
     }
 
     #[test]
