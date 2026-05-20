@@ -415,15 +415,16 @@ fn draw(f: &mut ratatui::Frame, app: &App, st: &AppState) {
         | FocusedView::FilePicker
         | FocusedView::MergeModal
         | FocusedView::CommitsModal => {
-            let pkg = st.current_pr.and_then(|n| app.cache.get(n));
-            if let (Some(pkg), Some(review)) = (pkg, st.review.as_ref()) {
-                crate::view::pr_review::render(f, area, pkg, review);
-            } else {
-                let text = format!("{} loading…", crate::render::spinner::glyph());
-                let msg = ratatui::widgets::Paragraph::new(text)
-                    .style(ratatui::style::Style::default().fg(crate::render::style::OVERLAY1))
-                    .alignment(ratatui::layout::Alignment::Center);
-                f.render_widget(msg, area);
+            if let Some(review) = st.review.as_ref() {
+                if review.detail.is_some() {
+                    crate::view::pr_review::render(f, area, review);
+                } else {
+                    let text = format!("{} loading…", crate::render::spinner::glyph());
+                    let msg = ratatui::widgets::Paragraph::new(text)
+                        .style(ratatui::style::Style::default().fg(crate::render::style::OVERLAY1))
+                        .alignment(ratatui::layout::Alignment::Center);
+                    f.render_widget(msg, area);
+                }
             }
         }
     }
