@@ -583,9 +583,7 @@ fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) 
                     ..Default::default()
                 });
                 st.focused = FocusedView::Review;
-                if app.cache.get(num).is_none() {
-                    app.request(Request::LoadPr(pr));
-                }
+                app.request(Request::LoadPr(pr));
             }
         }
         Action::ListMerge => open_merge(st),
