@@ -560,6 +560,10 @@ fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) 
     }
 
     let action = dispatch(st.focused, ev);
+    handle_action(app, st, action);
+}
+
+fn handle_action(app: &mut App, st: &mut AppState, action: Action) {
     match action {
         Action::Quit => st.running = false,
         Action::ListUp => {
