@@ -292,10 +292,17 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
         }
         Response::ListEnriched { .. } => { /* stale; drop */ }
         Response::PrDetail { number, result: Ok(detail) } => {
-            app.cache.insert_partial(detail);
+            app.cache.insert_partial(detail.clone());
             if let Some(r) = st.review.as_mut()
                 && st.current_pr == Some(number)
             {
+                let zero_stats = detail
+                    .commits
+                    .iter()
+                    .map(|c| (c.oid.clone(), crate::render::attribution::CommitStats::default()))
+                    .collect();
+                r.detail = Some(detail);
+                r.commit_stats = zero_stats;
                 r.status = "loading diff…".into();
             }
         }
@@ -313,13 +320,13 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
                 .get(number)
                 .map(|p| p.detail.head_ref_oid.clone());
             if let Some(head) = head_oid {
-                app.cache.update_diff(number, &head, files);
+                app.cache.update_diff(number, &head, files.clone());
             }
             if let Some(r) = st.review.as_mut()
                 && st.current_pr == Some(number)
-                && let Some(pkg) = app.cache.get(number)
             {
-                r.status = format!("coloring {} files…", pkg.files.len());
+                r.files = files;
+                r.status = format!("{} files", r.files.len());
             }
         }
         Response::PrDiff { number, result: Err(e) } => {
@@ -336,7 +343,17 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
             colors,
             stats,
         } => {
-            app.cache.add_file_colors(number, &head_oid, path, colors, stats);
+            app.cache.add_file_colors(number, &head_oid, path.clone(), colors.clone(), stats.clone());
+            if let Some(r) = st.review.as_mut()
+                && st.current_pr == Some(number)
+            {
+                r.colors.insert(path, crate::view::pr_review::ColorState::Ready(colors));
+                for (oid, s) in stats {
+                    let entry = r.commit_stats.entry(oid).or_default();
+                    entry.adds += s.adds;
+                    entry.dels += s.dels;
+                }
+            }
         }
         Response::PrColorsDone { number, head_oid: _ } => {
             if let Some(r) = st.review.as_mut()
@@ -1106,6 +1123,11 @@ mod tests {
         AppState::new("repo".into(), "main".into())
     }
 
+    fn fixture_pr_detail() -> crate::data::pr::PrDetail {
+        let json = include_str!("../tests/fixtures/pr_view.json");
+        serde_json::from_str(json).unwrap()
+    }
+
     fn open_pr(n: u32) -> Pr {
         Pr {
             number: n,
@@ -1558,11 +1580,7 @@ mod tests {
                     if is_diff {
                         saw_diff = true;
                         assert!(!app.cache.get(number).unwrap().files.is_empty());
-                        assert!(
-                            st.review.as_ref().unwrap().status.starts_with("coloring "),
-                            "status was: {}",
-                            st.review.as_ref().unwrap().status,
-                        );
+                        assert_eq!(st.review.as_ref().unwrap().status, format!("{} files", app.cache.get(number).unwrap().files.len()));
                     }
                     if is_done {
                         done = true;
@@ -1655,5 +1673,96 @@ mod tests {
         assert_eq!(nums, vec![5, 8]);
         // #5 is still at index 0.
         assert_eq!(st.list.selected, 0);
+    }
+
+    #[test]
+    fn pr_detail_response_populates_review_state_detail() {
+        let detail = fixture_pr_detail();
+        let number = detail.number;
+        let mut st = dummy_app_state();
+        st.current_pr = Some(number);
+        st.review = Some(PrReviewState {
+            status: "loading…".into(),
+            ..Default::default()
+        });
+        let mut cache = Cache::new();
+        let mut app = test_app_for_state(&mut cache);
+
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::PrDetail { number, result: Ok(detail.clone()) },
+        );
+
+        let r = st.review.as_ref().unwrap();
+        assert_eq!(r.detail.as_ref().unwrap().number, number);
+        assert_eq!(r.commit_stats.len(), detail.commits.len(),
+            "commit_stats zero-filled for every PR commit");
+    }
+
+    #[test]
+    fn pr_diff_response_populates_review_state_files() {
+        let detail = fixture_pr_detail();
+        let number = detail.number;
+        let files = crate::data::diff::parse_diff(
+            include_str!("../tests/fixtures/diff_basic.patch")
+        ).unwrap();
+        let mut st = dummy_app_state();
+        st.current_pr = Some(number);
+        st.review = Some(PrReviewState {
+            detail: Some(detail.clone()),
+            status: "loading diff…".into(),
+            ..Default::default()
+        });
+        let mut cache = Cache::new();
+        cache.insert_partial(detail);
+        let mut app = test_app_for_state(&mut cache);
+
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::PrDiff { number, result: Ok(files.clone()) },
+        );
+
+        let r = st.review.as_ref().unwrap();
+        assert_eq!(r.files.len(), files.len());
+    }
+
+    #[test]
+    fn pr_file_colors_response_marks_path_ready_in_review() {
+        use crate::render::attribution::LineColors;
+        let detail = fixture_pr_detail();
+        let number = detail.number;
+        let head_oid = detail.head_ref_oid.clone();
+        let files = crate::data::diff::parse_diff(
+            include_str!("../tests/fixtures/diff_basic.patch")
+        ).unwrap();
+        let path = files[0].path.clone();
+        let mut st = dummy_app_state();
+        st.current_pr = Some(number);
+        st.review = Some(PrReviewState {
+            detail: Some(detail.clone()),
+            files: files.clone(),
+            ..Default::default()
+        });
+        let mut cache = Cache::new();
+        cache.insert_partial(detail);
+        cache.update_diff(number, &head_oid, files);
+        let mut app = test_app_for_state(&mut cache);
+
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::PrFileColors {
+                number,
+                head_oid: head_oid.clone(),
+                path: path.clone(),
+                colors: LineColors { head: vec![], delete: std::collections::HashMap::new() },
+                stats: std::collections::HashMap::new(),
+            },
+        );
+
+        let r = st.review.as_ref().unwrap();
+        assert!(matches!(r.colors.get(&path), Some(crate::view::pr_review::ColorState::Ready(_))));
     }
 }
