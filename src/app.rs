@@ -399,7 +399,7 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
     }
 }
 
-fn draw(f: &mut ratatui::Frame, app: &App, st: &AppState) {
+fn draw(f: &mut ratatui::Frame, _app: &App, st: &AppState) {
     let area = f.area();
     if area.width < 80 || area.height < 24 {
         let msg = ratatui::widgets::Paragraph::new("terminal too small (need ≥80×24)")
