@@ -614,9 +614,8 @@ fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) 
             }
         }
         Action::Bottom => {
-            if let Some((num, r)) = st.current_pr.zip(st.review.as_mut())
-                && let Some(pkg) = app.cache.get(num)
-                && let Some(file) = pkg.files.get(r.file_index)
+            if let Some(r) = st.review.as_mut()
+                && let Some(file) = r.files.get(r.file_index)
             {
                 r.scroll = max_scroll(file.lines.len());
                 r.cursor_line = max_cursor_line(file);
@@ -625,22 +624,21 @@ fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) 
         Action::NextFile => cycle_file(app, st, 1),
         Action::PrevFile => cycle_file(app, st, -1),
         Action::OpenFilePicker => {
-            if let (Some(num), Some(r)) = (st.current_pr, st.review.as_ref())
-                && let Some(pkg) = app.cache.get(num)
-            {
-                let paths: Vec<String> = pkg.file_paths().into_iter().map(String::from).collect();
-                let current = pkg.file_paths().get(r.file_index).copied();
+            if let Some(r) = st.review.as_ref() {
+                let paths: Vec<String> = crate::view::pr_review::file_paths(r)
+                    .into_iter().map(String::from).collect();
+                let current = crate::view::pr_review::file_paths(r).get(r.file_index).copied();
                 st.picker = Some(FilePickerState::new(paths, current));
                 st.focused = FocusedView::FilePicker;
             }
         }
         Action::OpenCommitsModal => {
-            if let (Some(num), Some(_)) = (st.current_pr, st.review.as_ref())
-                && let Some(pkg) = app.cache.get(num)
+            if let Some(r) = st.review.as_ref()
+                && let Some(d) = r.detail.as_ref()
             {
                 let rows = commits_modal::build_rows(
-                    &pkg.detail.commits,
-                    &pkg.commit_stats,
+                    &d.commits,
+                    &r.commit_stats,
                     app.config.window_size,
                     Utc::now(),
                 );
@@ -717,15 +715,9 @@ fn max_cursor_line(file: &crate::data::diff::FileDiff) -> usize {
 
 /// Move the review cursor + scroll by `delta` lines, clamping at both ends so
 /// scrolling can't blank out the buffer.
-fn move_review(app: &App, st: &mut AppState, delta: i32) {
-    let Some(num) = st.current_pr else { return };
-    let Some(pkg) = app.cache.get(num) else {
-        return;
-    };
+fn move_review(_app: &App, st: &mut AppState, delta: i32) {
     let Some(r) = st.review.as_mut() else { return };
-    let Some(file) = pkg.files.get(r.file_index) else {
-        return;
-    };
+    let Some(file) = r.files.get(r.file_index) else { return };
     let max_scr = max_scroll(file.lines.len()) as i64;
     let max_cur = max_cursor_line(file) as i64;
     let new_scroll = (r.scroll as i64 + delta as i64).clamp(0, max_scr);
@@ -734,21 +726,14 @@ fn move_review(app: &App, st: &mut AppState, delta: i32) {
     r.cursor_line = new_cursor as usize;
 }
 
-fn cycle_file(app: &App, st: &mut AppState, delta: i32) {
-    let Some(num) = st.current_pr else { return };
-    let Some(pkg) = app.cache.get(num) else {
-        return;
-    };
-    let n = pkg.file_count() as i32;
-    if n == 0 {
-        return;
-    }
-    if let Some(r) = st.review.as_mut() {
-        let new_idx = ((r.file_index as i32 + delta).rem_euclid(n)) as usize;
-        r.file_index = new_idx;
-        r.cursor_line = 0;
-        r.scroll = 0;
-    }
+fn cycle_file(_app: &App, st: &mut AppState, delta: i32) {
+    let Some(r) = st.review.as_mut() else { return };
+    let n = crate::view::pr_review::file_count(r) as i32;
+    if n == 0 { return; }
+    let new_idx = ((r.file_index as i32 + delta).rem_euclid(n)) as usize;
+    r.file_index = new_idx;
+    r.cursor_line = 0;
+    r.scroll = 0;
 }
 
 fn handle_mouse(app: &mut App, st: &mut AppState, ev: crossterm::event::MouseEvent) {
@@ -780,7 +765,7 @@ fn handle_mouse(app: &mut App, st: &mut AppState, ev: crossterm::event::MouseEve
     }
 }
 
-fn handle_file_picker(app: &App, st: &mut AppState, ev: crossterm::event::KeyEvent) {
+fn handle_file_picker(_app: &App, st: &mut AppState, ev: crossterm::event::KeyEvent) {
     use crossterm::event::{KeyCode, KeyModifiers};
     let Some(picker) = st.picker.as_mut() else {
         return;
@@ -793,11 +778,11 @@ fn handle_file_picker(app: &App, st: &mut AppState, ev: crossterm::event::KeyEve
     match ev.code {
         KeyCode::Enter => {
             let chosen = picker.matches().get(picker.selected).map(|s| (*s).clone());
-            if let (Some(path), Some(num)) = (chosen, st.current_pr)
-                && let Some(pkg) = app.cache.get(num)
-            {
-                let idx = pkg.file_paths().iter().position(|p| *p == path.as_str());
-                if let (Some(idx), Some(r)) = (idx, st.review.as_mut()) {
+            if let (Some(path), Some(r)) = (chosen, st.review.as_mut()) {
+                let idx = crate::view::pr_review::file_paths(r)
+                    .iter()
+                    .position(|p| *p == path.as_str());
+                if let Some(idx) = idx {
                     r.file_index = idx;
                     r.cursor_line = 0;
                     r.scroll = 0;
@@ -1075,10 +1060,11 @@ mod tests {
         let detail: crate::data::pr::PrDetail = serde_json::from_str(json).unwrap();
         let n_detail_files = detail.files.len();
         let number = detail.number;
-        cache.insert_partial(detail);
-        let mut app = test_app_for_state(&mut cache);
+        cache.insert_partial(detail.clone());
+        let app = test_app_for_state(&mut cache);
         st.current_pr = Some(number);
         st.review = Some(PrReviewState {
+            detail: Some(detail),
             file_index: 0,
             cursor_line: 0,
             scroll: 0,
@@ -1103,10 +1089,11 @@ mod tests {
         let json = include_str!("../tests/fixtures/pr_view.json");
         let detail: crate::data::pr::PrDetail = serde_json::from_str(json).unwrap();
         let number = detail.number;
-        cache.insert_partial(detail);
-        let mut app = test_app_for_state(&mut cache);
+        cache.insert_partial(detail.clone());
+        let app = test_app_for_state(&mut cache);
         st.current_pr = Some(number);
         st.review = Some(PrReviewState {
+            detail: Some(detail),
             file_index: 0,
             cursor_line: 0,
             scroll: 0,
@@ -1118,6 +1105,31 @@ mod tests {
         let r = st.review.as_ref().unwrap();
         assert_eq!(r.cursor_line, 0);
         assert_eq!(r.scroll, 0);
+    }
+
+    #[test]
+    fn cycle_file_reads_files_from_review_state_not_cache() {
+        let detail = fixture_pr_detail();
+        let number = detail.number;
+        let files = crate::data::diff::parse_diff(
+            include_str!("../tests/fixtures/diff_basic.patch")
+        ).unwrap();
+        assert!(files.len() >= 2, "fixture needs at least 2 files for this test");
+
+        let mut st = dummy_app_state();
+        st.current_pr = Some(number);
+        st.review = Some(PrReviewState {
+            detail: Some(detail.clone()),
+            files: files.clone(),
+            file_index: 0,
+            ..Default::default()
+        });
+        let mut cache = Cache::new();
+        let app = test_app_for_state(&mut cache);
+
+        cycle_file(&app, &mut st, 1);
+
+        assert_eq!(st.review.as_ref().unwrap().file_index, 1);
     }
 
     fn dummy_app_state() -> AppState {
