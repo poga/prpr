@@ -686,6 +686,10 @@ fn handle_action(app: &mut App, st: &mut AppState, action: Action) {
                 && let Some(pr) = st.list.prs.iter().find(|p| p.number == num).cloned()
             {
                 if let Some(r) = st.review.as_mut() {
+                    r.detail = None;
+                    r.files.clear();
+                    r.colors.clear();
+                    r.commit_stats.clear();
                     r.status = "loading…".into();
                 }
                 app.request(Request::OpenPr(pr));
@@ -1836,6 +1840,51 @@ mod tests {
             r.colors.get(&second_path),
             Some(crate::view::pr_review::ColorState::Ready(_))
         ), "ready entry must not be reset to Loading");
+    }
+
+    #[test]
+    fn refresh_action_in_review_clears_data_and_dispatches_open_pr() {
+        use crate::render::attribution::LineColors;
+        let detail = fixture_pr_detail();
+        let number = detail.number;
+        let pr = crate::data::pr::Pr {
+            number, title: detail.title.clone(), is_draft: detail.is_draft,
+            state: detail.state, author: detail.author.clone(),
+            created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            updated_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            base_ref_name: detail.base_ref_name.clone(),
+            head_ref_name: detail.head_ref_name.clone(),
+            labels: vec![], status_check_rollup: detail.status_check_rollup.clone(),
+            review_decision: detail.review_decision, mergeable: detail.mergeable.clone(),
+        };
+
+        let mut st = dummy_app_state();
+        st.current_pr = Some(number);
+        st.list.prs = vec![pr.clone()];
+        let mut colors = std::collections::HashMap::new();
+        colors.insert("src/sched.rs".into(), crate::view::pr_review::ColorState::Ready(
+            LineColors { head: vec![], delete: std::collections::HashMap::new() }
+        ));
+        st.review = Some(PrReviewState {
+            detail: Some(detail.clone()),
+            files: vec![crate::data::diff::FileDiff {
+                path: "src/sched.rs".into(),
+                lines: vec![], binary: false,
+            }],
+            colors,
+            ..Default::default()
+        });
+        let mut cache = Cache::new();
+        let mut app = test_app_for_state(&mut cache);
+
+        handle_action(&mut app, &mut st, Action::Refresh);
+
+        let r = st.review.as_ref().unwrap();
+        assert!(r.detail.is_none());
+        assert!(r.files.is_empty());
+        assert!(r.colors.is_empty());
+        assert!(r.commit_stats.is_empty());
+        assert_eq!(r.status, "loading…");
     }
 
     #[test]
