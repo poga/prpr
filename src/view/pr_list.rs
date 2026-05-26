@@ -364,11 +364,22 @@ fn file_line(f: &crate::data::pr::FileMeta, last: bool, width: u16) -> Line<'sta
         .saturating_sub(left_cols)
         .saturating_sub(path.chars().count())
         .saturating_sub(stats_len);
-    let mut spans: Vec<Span<'static>> = vec![
-        Span::styled(format!("  {glyph} "), Style::default().fg(SURFACE2)),
-        Span::styled(path, Style::default().fg(TEXT)),
-        Span::styled(" ".repeat(pad_cols), Style::default()),
-    ];
+    let mut spans: Vec<Span<'static>> = vec![Span::styled(
+        format!("  {glyph} "),
+        Style::default().fg(SURFACE2),
+    )];
+    // Split at last '/' so directory prefix renders dim and filename pops.
+    match path.rfind('/') {
+        Some(i) => {
+            let (dir, name) = path.split_at(i + 1);
+            spans.push(Span::styled(dir.to_string(), Style::default().fg(OVERLAY1)));
+            spans.push(Span::styled(name.to_string(), Style::default().fg(TEXT)));
+        }
+        None => {
+            spans.push(Span::styled(path.clone(), Style::default().fg(TEXT)));
+        }
+    }
+    spans.push(Span::styled(" ".repeat(pad_cols), Style::default()));
     if f.additions > 0 {
         spans.push(Span::styled(
             format!("+{}", f.additions),
@@ -692,5 +703,47 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(all.contains("#119"), "selected PR #119 must be visible in:\n{all}");
+    }
+
+    #[test]
+    fn file_line_dims_directory_and_brightens_filename() {
+        use crate::data::pr::FileMeta;
+        let line = file_line(
+            &FileMeta { path: "src/foo/bar.rs".into(), additions: 1, deletions: 0 },
+            false,
+            80,
+        );
+        let dim_span = line
+            .spans
+            .iter()
+            .find(|s| s.content == "src/foo/")
+            .expect("expected a span with text 'src/foo/'");
+        assert_eq!(dim_span.style.fg, Some(OVERLAY1), "dir prefix must be OVERLAY1");
+        let bright_span = line
+            .spans
+            .iter()
+            .find(|s| s.content == "bar.rs")
+            .expect("expected a span with text 'bar.rs'");
+        assert_eq!(bright_span.style.fg, Some(TEXT), "filename must be TEXT");
+    }
+
+    #[test]
+    fn file_line_top_level_file_is_all_bright() {
+        use crate::data::pr::FileMeta;
+        let line = file_line(
+            &FileMeta { path: "Cargo.toml".into(), additions: 1, deletions: 0 },
+            false,
+            80,
+        );
+        let bright_span = line
+            .spans
+            .iter()
+            .find(|s| s.content == "Cargo.toml")
+            .expect("expected a span with text 'Cargo.toml'");
+        assert_eq!(bright_span.style.fg, Some(TEXT), "filename must be TEXT");
+        assert!(
+            !line.spans.iter().any(|s| s.style.fg == Some(OVERLAY1) && s.content.contains("Cargo.toml")),
+            "top-level file should not have a dim path span"
+        );
     }
 }
