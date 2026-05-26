@@ -663,24 +663,26 @@ mod tests {
         // sits at line index 20 (1 divider + 19 prior rows) — off-screen
         // without scrolling. Scroll must bring it into view.
         use crate::data::pr::{Author, FileMeta, Pr, PrState};
-        let mut st = PrListState::default();
-        st.repo_name = "prpr".into();
-        st.branch = "main".into();
-        st.prs = (0..20).map(|i| Pr {
-            number: 100 + i, title: format!("p{i}"), is_draft: false, state: PrState::Open,
-            author: Author { login: "a".into() }, created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
-            updated_at: "2026-01-01T00:00:00Z".parse().unwrap(),
-            base_ref_name: "main".into(), head_ref_name: "f".into(),
-            labels: vec![], status_check_rollup: vec![],
-            review_decision: None, mergeable: None,
-        }).collect();
-        st.selected = 19;
-        st.expanded = Some(ExpandedFiles::Ready {
-            number: 119,
-            files: (0..20).map(|i| FileMeta {
-                path: format!("file{i}.rs"), additions: 1, deletions: 0,
+        let st = PrListState {
+            repo_name: "prpr".into(),
+            branch: "main".into(),
+            prs: (0..20).map(|i| Pr {
+                number: 100 + i, title: format!("p{i}"), is_draft: false, state: PrState::Open,
+                author: Author { login: "a".into() }, created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+                updated_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+                base_ref_name: "main".into(), head_ref_name: "f".into(),
+                labels: vec![], status_check_rollup: vec![],
+                review_decision: None, mergeable: None,
             }).collect(),
-        });
+            selected: 19,
+            expanded: Some(ExpandedFiles::Ready {
+                number: 119,
+                files: (0..20).map(|i| FileMeta {
+                    path: format!("file{i}.rs"), additions: 1, deletions: 0,
+                }).collect(),
+            }),
+            ..Default::default()
+        };
         let mut term = Terminal::new(TestBackend::new(80, 18)).unwrap();
         let now: DateTime<Utc> = "2026-05-06T00:00:00Z".parse().unwrap();
         term.draw(|f| { let area = f.area(); render(f, area, &st, now); }).unwrap();
