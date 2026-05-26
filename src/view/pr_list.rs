@@ -123,6 +123,24 @@ fn render_rows(f: &mut Frame, area: Rect, st: &PrListState, now: DateTime<Utc>) 
     lines.push(divider(area.width as usize));
     for (i, pr) in visible.iter().enumerate() {
         lines.push(row_for(pr, i == st.selected, now, area.width));
+        if i == st.selected {
+            match &st.expanded {
+                Some(ExpandedFiles::Loading { number }) if *number == pr.number => {
+                    lines.push(loading_line(area.width));
+                }
+                Some(ExpandedFiles::Ready { number, files }) if *number == pr.number => {
+                    let total = files.len();
+                    for (fi, f) in files.iter().enumerate() {
+                        let last = fi + 1 == total;
+                        lines.push(file_line(f, last, area.width));
+                    }
+                }
+                Some(ExpandedFiles::Error { number, message }) if *number == pr.number => {
+                    lines.push(error_line(message, area.width));
+                }
+                _ => {}
+            }
+        }
     }
     f.render_widget(Paragraph::new(lines), area);
 }
@@ -283,6 +301,68 @@ fn humanize_age(t: DateTime<Utc>, now: DateTime<Utc>) -> String {
     } else {
         format!("{}w", secs / (86400 * 7))
     }
+}
+
+fn loading_line(width: u16) -> Line<'static> {
+    let body = format!("  {} loading files…", crate::render::spinner::glyph());
+    Line::from(Span::styled(
+        format!("{:<width$}", body, width = width as usize),
+        Style::default().fg(OVERLAY1),
+    ))
+}
+
+fn error_line(message: &str, width: u16) -> Line<'static> {
+    let max = (width as usize).saturating_sub(10).max(8);
+    let trimmed = truncate(message, max);
+    Line::from(Span::styled(
+        format!("  error: {trimmed}"),
+        Style::default().fg(DIFF_DEL_FG),
+    ))
+}
+
+fn file_line(f: &crate::data::pr::FileMeta, last: bool, width: u16) -> Line<'static> {
+    let glyph = if last { "└" } else { "├" };
+    // Compute stats length for layout — same content colored separately below.
+    let mut stats_len = 0;
+    if f.additions > 0 { stats_len += format!("+{}", f.additions).chars().count(); }
+    if f.additions > 0 && f.deletions > 0 { stats_len += 1; }
+    if f.deletions > 0 { stats_len += format!("-{}", f.deletions).chars().count(); }
+    let left_cols = 4; // "  ├ " or "  └ "
+    let path_budget = (width as usize)
+        .saturating_sub(left_cols)
+        .saturating_sub(stats_len + 2)
+        .max(8);
+    let path = if f.path.chars().count() <= path_budget {
+        f.path.clone()
+    } else {
+        let skip = f.path.chars().count() - (path_budget - 1);
+        format!("…{}", f.path.chars().skip(skip).collect::<String>())
+    };
+    let pad_cols = (width as usize)
+        .saturating_sub(left_cols)
+        .saturating_sub(path.chars().count())
+        .saturating_sub(stats_len);
+    let mut spans: Vec<Span<'static>> = vec![
+        Span::styled(format!("  {glyph} "), Style::default().fg(SURFACE2)),
+        Span::styled(path, Style::default().fg(TEXT)),
+        Span::styled(" ".repeat(pad_cols), Style::default()),
+    ];
+    if f.additions > 0 {
+        spans.push(Span::styled(
+            format!("+{}", f.additions),
+            Style::default().fg(DIFF_ADD_FG),
+        ));
+    }
+    if f.additions > 0 && f.deletions > 0 {
+        spans.push(Span::styled(" ".to_string(), Style::default()));
+    }
+    if f.deletions > 0 {
+        spans.push(Span::styled(
+            format!("-{}", f.deletions),
+            Style::default().fg(DIFF_DEL_FG),
+        ));
+    }
+    Line::from(spans)
 }
 
 #[cfg(test)]
@@ -466,5 +546,70 @@ mod tests {
         let buf = term.backend().buffer();
         let bottom = buffer_line(buf, 9);
         assert!(!bottom.contains("enriching"), "footer was: {bottom:?}");
+    }
+
+    #[test]
+    fn expanded_ready_renders_file_paths_under_selected_row() {
+        use crate::data::pr::FileMeta;
+        let mut st = fixture_state();
+        st.selected = 0;
+        let sel_number = st.visible_prs()[0].number;
+        st.expanded = Some(ExpandedFiles::Ready {
+            number: sel_number,
+            files: vec![
+                FileMeta { path: "src/foo.rs".into(), additions: 12, deletions: 3 },
+                FileMeta { path: "tests/bar.rs".into(), additions: 4, deletions: 0 },
+            ],
+        });
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        let now: DateTime<Utc> = "2026-05-06T00:00:00Z".parse().unwrap();
+        term.draw(|f| { let area = f.area(); render(f, area, &st, now); }).unwrap();
+        let buf = term.backend().buffer();
+        let all: String = (0..buf.area.height)
+            .map(|y| buffer_line(buf, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(all.contains("src/foo.rs"), "missing src/foo.rs in:\n{all}");
+        assert!(all.contains("tests/bar.rs"), "missing tests/bar.rs in:\n{all}");
+        assert!(all.contains("+12"), "missing +12 in:\n{all}");
+        assert!(all.contains("-3"),  "missing -3 in:\n{all}");
+        assert!(all.contains("+4"),  "missing +4 in:\n{all}");
+    }
+
+    #[test]
+    fn expanded_loading_renders_loading_files_text() {
+        let mut st = fixture_state();
+        st.selected = 0;
+        let sel_number = st.visible_prs()[0].number;
+        st.expanded = Some(ExpandedFiles::Loading { number: sel_number });
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        let now: DateTime<Utc> = "2026-05-06T00:00:00Z".parse().unwrap();
+        term.draw(|f| { let area = f.area(); render(f, area, &st, now); }).unwrap();
+        let buf = term.backend().buffer();
+        let all: String = (0..buf.area.height)
+            .map(|y| buffer_line(buf, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(all.contains("loading files"), "missing loading text in:\n{all}");
+    }
+
+    #[test]
+    fn expanded_mismatched_number_does_not_render_files() {
+        use crate::data::pr::FileMeta;
+        let mut st = fixture_state();
+        st.selected = 0;
+        st.expanded = Some(ExpandedFiles::Ready {
+            number: 999_999,
+            files: vec![FileMeta { path: "stale.rs".into(), additions: 1, deletions: 0 }],
+        });
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        let now: DateTime<Utc> = "2026-05-06T00:00:00Z".parse().unwrap();
+        term.draw(|f| { let area = f.area(); render(f, area, &st, now); }).unwrap();
+        let buf = term.backend().buffer();
+        let all: String = (0..buf.area.height)
+            .map(|y| buffer_line(buf, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!all.contains("stale.rs"), "stale row leaked into:\n{all}");
     }
 }
