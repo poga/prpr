@@ -314,8 +314,9 @@ fn loading_line(width: u16) -> Line<'static> {
 fn error_line(message: &str, width: u16) -> Line<'static> {
     let max = (width as usize).saturating_sub(10).max(8);
     let trimmed = truncate(message, max);
+    let body = format!("  error: {trimmed}");
     Line::from(Span::styled(
-        format!("  error: {trimmed}"),
+        format!("{:<width$}", body, width = width as usize),
         Style::default().fg(DIFF_DEL_FG),
     ))
 }
@@ -611,5 +612,26 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(!all.contains("stale.rs"), "stale row leaked into:\n{all}");
+    }
+
+    #[test]
+    fn expanded_error_renders_error_message_under_selected_row() {
+        let mut st = fixture_state();
+        st.selected = 0;
+        let sel_number = st.visible_prs()[0].number;
+        st.expanded = Some(ExpandedFiles::Error {
+            number: sel_number,
+            message: "ref missing locally".into(),
+        });
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        let now: DateTime<Utc> = "2026-05-06T00:00:00Z".parse().unwrap();
+        term.draw(|f| { let area = f.area(); render(f, area, &st, now); }).unwrap();
+        let buf = term.backend().buffer();
+        let all: String = (0..buf.area.height)
+            .map(|y| buffer_line(buf, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(all.contains("error:"), "expected 'error:' prefix in:\n{all}");
+        assert!(all.contains("ref missing locally"), "expected error message in:\n{all}");
     }
 }
