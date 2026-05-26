@@ -404,6 +404,8 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
             st.merging = None;
             st.list.status = format!("merge #{number} failed: {e}");
         }
+        // Wired in Task 6; accepted here so the enum stays exhaustive.
+        Response::ListFiles { .. } => {}
     }
 }
 
