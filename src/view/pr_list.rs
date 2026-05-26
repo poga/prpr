@@ -18,7 +18,6 @@ pub struct PrListState {
     pub branch: String,
     pub prs: Vec<Pr>,
     pub selected: usize,
-    pub filter_open_only: bool,
     pub search: Option<String>,
     pub status: String,
     /// True while the initial `gh pr list` is in flight. The renderer
@@ -44,7 +43,6 @@ impl PrListState {
         let q = self.search.as_deref().map(str::to_lowercase);
         self.prs
             .iter()
-            .filter(|p| !self.filter_open_only || p.state == PrState::Open)
             .filter(|p| match &q {
                 Some(s) => {
                     p.title.to_lowercase().contains(s) || p.author.login.to_lowercase().contains(s)
@@ -73,11 +71,8 @@ fn render_header(f: &mut Frame, area: Rect, st: &PrListState) {
     let visible = st.visible_prs();
     let count = visible.iter().filter(|p| p.state == PrState::Open).count();
     let header = format!(
-        "  prpr · {} · {} · {} open                                   filter: {}",
-        st.repo_name,
-        st.branch,
-        count,
-        if st.filter_open_only { "open" } else { "all" },
+        "  prpr · {} · {} · {} open",
+        st.repo_name, st.branch, count,
     );
     f.render_widget(
         Paragraph::new(header).style(Style::default().fg(OVERLAY1)),
@@ -118,7 +113,7 @@ fn render_footer(f: &mut Frame, area: Rect, st: &PrListState) {
         .constraints([Constraint::Length(1), Constraint::Length(1)])
         .split(area);
     f.render_widget(
-        Paragraph::new("  ↵ open   o browser   m merge   r refresh   / search   f filter   q quit")
+        Paragraph::new("  ↵ open   o browser   m merge   r refresh   / search   q quit")
             .style(Style::default().fg(OVERLAY1)),
         chunks[0],
     );
@@ -285,7 +280,6 @@ mod tests {
             branch: "main".into(),
             prs,
             selected: 0,
-            filter_open_only: true,
             search: None,
             loading: false,
             enriching: false,

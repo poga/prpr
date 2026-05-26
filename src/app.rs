@@ -125,7 +125,6 @@ impl AppState {
                 branch,
                 prs: vec![],
                 selected: 0,
-                filter_open_only: true,
                 search: None,
                 status: String::new(),
                 loading: false,
@@ -614,9 +613,6 @@ fn handle_action(app: &mut App, st: &mut AppState, action: Action) {
         }
         Action::ListSearch => {
             st.list.search = Some(String::new());
-        }
-        Action::ListCycleFilter => {
-            st.list.filter_open_only = !st.list.filter_open_only;
         }
         Action::ListClearFilter => {
             st.list.search = None;
