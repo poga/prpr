@@ -131,6 +131,7 @@ impl AppState {
                 enriching: false,
                 loading_stage: None,
                 manual_refresh_in_flight: false,
+                expanded: None,
             },
             review: None,
             current_pr: None,

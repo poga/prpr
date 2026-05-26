@@ -12,6 +12,24 @@ use crate::data::worker::ListStage;
 use crate::render::spinner;
 use crate::render::style::*;
 
+/// Inline file data for the selected PR; tagged with the PR number.
+#[derive(Debug, Clone)]
+pub enum ExpandedFiles {
+    Loading { number: u32 },
+    Ready { number: u32, files: Vec<crate::data::pr::FileMeta> },
+    Error { number: u32, message: String },
+}
+
+impl ExpandedFiles {
+    pub fn number(&self) -> u32 {
+        match self {
+            Self::Loading { number }
+            | Self::Ready { number, .. }
+            | Self::Error { number, .. } => *number,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct PrListState {
     pub repo_name: String,
@@ -36,6 +54,8 @@ pub struct PrListState {
     /// input layer ignores keys other than quit so the user can't act on
     /// stale data mid-refresh.
     pub manual_refresh_in_flight: bool,
+    /// Inline files for the selected PR; tagged with the PR number.
+    pub expanded: Option<ExpandedFiles>,
 }
 
 impl PrListState {
@@ -286,6 +306,7 @@ mod tests {
             loading_stage: None,
             status: String::new(),
             manual_refresh_in_flight: false,
+            expanded: None,
         }
     }
 
@@ -420,6 +441,16 @@ mod tests {
             all.contains("fetching PR list (gh)"),
             "body should show stage label; got:\n{all}"
         );
+    }
+
+    #[test]
+    fn expanded_files_number_accessor_works_for_all_variants() {
+        let l = ExpandedFiles::Loading { number: 7 };
+        let r = ExpandedFiles::Ready { number: 8, files: vec![] };
+        let e = ExpandedFiles::Error { number: 9, message: "x".into() };
+        assert_eq!(l.number(), 7);
+        assert_eq!(r.number(), 8);
+        assert_eq!(e.number(), 9);
     }
 
     #[test]
