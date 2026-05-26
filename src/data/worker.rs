@@ -36,6 +36,7 @@ pub enum Request {
         commits: Vec<String>,
     },
     Merge { number: u32, method: String },
+    ListFiles { number: u32, base_ref: String },
 }
 
 /// Pipeline stage emitted by the worker while servicing `RefreshList`.
@@ -102,6 +103,12 @@ pub enum Response {
     MergeDone {
         number: u32,
         result: Result<()>,
+    },
+    /// Inline file list emitted in response to `ListFiles`. `number` is the
+    /// staleness key — the UI matches it against the current PR before applying.
+    ListFiles {
+        number: u32,
+        result: anyhow::Result<Vec<crate::data::pr::FileMeta>>,
     },
 }
 
@@ -223,6 +230,16 @@ fn run_worker(
                 if res_tx.send(Response::MergeDone { number, result }).is_err() {
                     break;
                 }
+            }
+            Request::ListFiles { number, base_ref } => {
+                let head_ref = format!("refs/prpr/pr-{number}");
+                let base_ref_full = format!("origin/{base_ref}");
+                let result = (|| -> Result<Vec<crate::data::pr::FileMeta>> {
+                    let head = git.rev_parse(&repo_root, &head_ref)?;
+                    let base = git.rev_parse(&repo_root, &base_ref_full)?;
+                    git.diff_numstat(&repo_root, &base, &head)
+                })();
+                let _ = res_tx.send(Response::ListFiles { number, result });
             }
         }
     }
@@ -536,6 +553,55 @@ mod tests {
             vec![ListStage::FetchingList, ListStage::FetchingRefs],
             "expected fetch-list → fetch-refs in order before ListFast"
         );
+    }
+
+    #[test]
+    fn list_files_emits_filemeta_for_resolvable_refs() {
+        use crate::data::pr::FileMeta;
+        let gh = FakeGh::new();
+        let mut git = FakeGit::new("/tmp/repo");
+        git.refs.insert("refs/prpr/pr-7".into(), "headoid".into());
+        git.refs.insert("origin/main".into(), "baseoid".into());
+        git.numstats.insert(
+            ("baseoid".into(), "headoid".into()),
+            vec![FileMeta { path: "a.rs".into(), additions: 1, deletions: 2 }],
+        );
+        let worker = Worker::spawn("/tmp/repo".into(), Arc::new(gh), Arc::new(git), 7);
+        worker.send(Request::ListFiles { number: 7, base_ref: "main".into() });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            match worker.rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                Ok(Response::ListFiles { number: 7, result: Ok(files) }) => {
+                    assert_eq!(files.len(), 1);
+                    assert_eq!(files[0].path, "a.rs");
+                    return;
+                }
+                Ok(Response::ListFiles { result: Err(e), .. }) => panic!("unexpected err: {e}"),
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        panic!("never received ListFiles ok");
+    }
+
+    #[test]
+    fn list_files_emits_error_when_refs_missing() {
+        let gh = FakeGh::new();
+        let git = FakeGit::new("/tmp/repo");
+        let worker = Worker::spawn("/tmp/repo".into(), Arc::new(gh), Arc::new(git), 7);
+        worker.send(Request::ListFiles { number: 7, base_ref: "main".into() });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            match worker.rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                Ok(Response::ListFiles { number: 7, result: Err(_) }) => return,
+                Ok(Response::ListFiles { result: Ok(_), .. }) => panic!("expected err"),
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        panic!("never received ListFiles err");
     }
 
     #[test]

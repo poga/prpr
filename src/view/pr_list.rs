@@ -12,13 +12,30 @@ use crate::data::worker::ListStage;
 use crate::render::spinner;
 use crate::render::style::*;
 
+/// Inline file data for the selected PR; tagged with the PR number.
+#[derive(Debug, Clone)]
+pub enum ExpandedFiles {
+    Loading { number: u32 },
+    Ready { number: u32, files: Vec<crate::data::pr::FileMeta> },
+    Error { number: u32, message: String },
+}
+
+impl ExpandedFiles {
+    pub fn number(&self) -> u32 {
+        match self {
+            Self::Loading { number }
+            | Self::Ready { number, .. }
+            | Self::Error { number, .. } => *number,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct PrListState {
     pub repo_name: String,
     pub branch: String,
     pub prs: Vec<Pr>,
     pub selected: usize,
-    pub filter_open_only: bool,
     pub search: Option<String>,
     pub status: String,
     /// True while the initial `gh pr list` is in flight. The renderer
@@ -37,6 +54,8 @@ pub struct PrListState {
     /// input layer ignores keys other than quit so the user can't act on
     /// stale data mid-refresh.
     pub manual_refresh_in_flight: bool,
+    /// Inline files for the selected PR; tagged with the PR number.
+    pub expanded: Option<ExpandedFiles>,
 }
 
 impl PrListState {
@@ -44,7 +63,6 @@ impl PrListState {
         let q = self.search.as_deref().map(str::to_lowercase);
         self.prs
             .iter()
-            .filter(|p| !self.filter_open_only || p.state == PrState::Open)
             .filter(|p| match &q {
                 Some(s) => {
                     p.title.to_lowercase().contains(s) || p.author.login.to_lowercase().contains(s)
@@ -71,13 +89,10 @@ pub fn render(f: &mut Frame, area: Rect, st: &PrListState, now: DateTime<Utc>) {
 
 fn render_header(f: &mut Frame, area: Rect, st: &PrListState) {
     let visible = st.visible_prs();
-    let count = visible.iter().filter(|p| p.state == PrState::Open).count();
+    let count = visible.len();
     let header = format!(
-        "  prpr · {} · {} · {} open                                   filter: {}",
-        st.repo_name,
-        st.branch,
-        count,
-        if st.filter_open_only { "open" } else { "all" },
+        "  prpr · {} · {} · {} open",
+        st.repo_name, st.branch, count,
     );
     f.render_widget(
         Paragraph::new(header).style(Style::default().fg(OVERLAY1)),
@@ -108,8 +123,47 @@ fn render_rows(f: &mut Frame, area: Rect, st: &PrListState, now: DateTime<Utc>) 
     lines.push(divider(area.width as usize));
     for (i, pr) in visible.iter().enumerate() {
         lines.push(row_for(pr, i == st.selected, now, area.width));
+        if i == st.selected {
+            match &st.expanded {
+                Some(ExpandedFiles::Loading { number }) if *number == pr.number => {
+                    lines.push(loading_line(area.width));
+                }
+                Some(ExpandedFiles::Ready { number, files }) if *number == pr.number => {
+                    let total = files.len();
+                    for (fi, f) in files.iter().enumerate() {
+                        let last = fi + 1 == total;
+                        lines.push(file_line(f, last, area.width));
+                    }
+                }
+                Some(ExpandedFiles::Error { number, message }) if *number == pr.number => {
+                    lines.push(error_line(message, area.width));
+                }
+                _ => {}
+            }
+        }
     }
-    f.render_widget(Paragraph::new(lines), area);
+    // Compute the absolute line index of the selected PR's row, so we
+    // can scroll it into view when the expanded block pushes content
+    // past the viewport. The selected row's index is:
+    //   1 (divider) + selected
+    // (only the selected row has expansion lines, and they appear AFTER
+    // the row, so they don't shift the selected row's own position).
+    let selected_row_idx = 1 + st.selected;
+    let h = area.height as usize;
+    let total = lines.len();
+    let offset = if total <= h {
+        0
+    } else if selected_row_idx + 2 < h {
+        // Selected row already in the upper portion — no scroll needed.
+        0
+    } else {
+        // Keep the selected row ~2 lines from the top of the viewport.
+        let target_top = selected_row_idx.saturating_sub(2);
+        target_top.min(total.saturating_sub(h))
+    };
+    let view: Vec<Line<'static>> =
+        lines.into_iter().skip(offset).take(h).collect();
+    f.render_widget(Paragraph::new(view), area);
 }
 
 fn render_footer(f: &mut Frame, area: Rect, st: &PrListState) {
@@ -118,7 +172,7 @@ fn render_footer(f: &mut Frame, area: Rect, st: &PrListState) {
         .constraints([Constraint::Length(1), Constraint::Length(1)])
         .split(area);
     f.render_widget(
-        Paragraph::new("  ↵ open   o browser   m merge   r refresh   / search   f filter   q quit")
+        Paragraph::new("  ↵ open   o browser   m merge   r refresh   / search   q quit")
             .style(Style::default().fg(OVERLAY1)),
         chunks[0],
     );
@@ -270,6 +324,69 @@ fn humanize_age(t: DateTime<Utc>, now: DateTime<Utc>) -> String {
     }
 }
 
+fn loading_line(width: u16) -> Line<'static> {
+    let body = format!("  {} loading files…", crate::render::spinner::glyph());
+    Line::from(Span::styled(
+        format!("{:<width$}", body, width = width as usize),
+        Style::default().fg(OVERLAY1),
+    ))
+}
+
+fn error_line(message: &str, width: u16) -> Line<'static> {
+    let max = (width as usize).saturating_sub(10).max(8);
+    let trimmed = truncate(message, max);
+    let body = format!("  error: {trimmed}");
+    Line::from(Span::styled(
+        format!("{:<width$}", body, width = width as usize),
+        Style::default().fg(DIFF_DEL_FG),
+    ))
+}
+
+fn file_line(f: &crate::data::pr::FileMeta, last: bool, width: u16) -> Line<'static> {
+    let glyph = if last { "└" } else { "├" };
+    // Compute stats length for layout — same content colored separately below.
+    let mut stats_len = 0;
+    if f.additions > 0 { stats_len += format!("+{}", f.additions).chars().count(); }
+    if f.additions > 0 && f.deletions > 0 { stats_len += 1; }
+    if f.deletions > 0 { stats_len += format!("-{}", f.deletions).chars().count(); }
+    let left_cols = 4; // "  ├ " or "  └ "
+    let path_budget = (width as usize)
+        .saturating_sub(left_cols)
+        .saturating_sub(stats_len + 2)
+        .max(8);
+    let path = if f.path.chars().count() <= path_budget {
+        f.path.clone()
+    } else {
+        let skip = f.path.chars().count() - (path_budget - 1);
+        format!("…{}", f.path.chars().skip(skip).collect::<String>())
+    };
+    let pad_cols = (width as usize)
+        .saturating_sub(left_cols)
+        .saturating_sub(path.chars().count())
+        .saturating_sub(stats_len);
+    let mut spans: Vec<Span<'static>> = vec![
+        Span::styled(format!("  {glyph} "), Style::default().fg(SURFACE2)),
+        Span::styled(path, Style::default().fg(TEXT)),
+        Span::styled(" ".repeat(pad_cols), Style::default()),
+    ];
+    if f.additions > 0 {
+        spans.push(Span::styled(
+            format!("+{}", f.additions),
+            Style::default().fg(DIFF_ADD_FG),
+        ));
+    }
+    if f.additions > 0 && f.deletions > 0 {
+        spans.push(Span::styled(" ".to_string(), Style::default()));
+    }
+    if f.deletions > 0 {
+        spans.push(Span::styled(
+            format!("-{}", f.deletions),
+            Style::default().fg(DIFF_DEL_FG),
+        ));
+    }
+    Line::from(spans)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,13 +402,13 @@ mod tests {
             branch: "main".into(),
             prs,
             selected: 0,
-            filter_open_only: true,
             search: None,
             loading: false,
             enriching: false,
             loading_stage: None,
             status: String::new(),
             manual_refresh_in_flight: false,
+            expanded: None,
         }
     }
 
@@ -429,6 +546,16 @@ mod tests {
     }
 
     #[test]
+    fn expanded_files_number_accessor_works_for_all_variants() {
+        let l = ExpandedFiles::Loading { number: 7 };
+        let r = ExpandedFiles::Ready { number: 8, files: vec![] };
+        let e = ExpandedFiles::Error { number: 9, message: "x".into() };
+        assert_eq!(l.number(), 7);
+        assert_eq!(r.number(), 8);
+        assert_eq!(e.number(), 9);
+    }
+
+    #[test]
     fn footer_omits_enriching_when_flag_clear() {
         let st = fixture_state();
         let mut term = Terminal::new(TestBackend::new(80, 10)).unwrap();
@@ -441,5 +568,129 @@ mod tests {
         let buf = term.backend().buffer();
         let bottom = buffer_line(buf, 9);
         assert!(!bottom.contains("enriching"), "footer was: {bottom:?}");
+    }
+
+    #[test]
+    fn expanded_ready_renders_file_paths_under_selected_row() {
+        use crate::data::pr::FileMeta;
+        let mut st = fixture_state();
+        st.selected = 0;
+        let sel_number = st.visible_prs()[0].number;
+        st.expanded = Some(ExpandedFiles::Ready {
+            number: sel_number,
+            files: vec![
+                FileMeta { path: "src/foo.rs".into(), additions: 12, deletions: 3 },
+                FileMeta { path: "tests/bar.rs".into(), additions: 4, deletions: 0 },
+            ],
+        });
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        let now: DateTime<Utc> = "2026-05-06T00:00:00Z".parse().unwrap();
+        term.draw(|f| { let area = f.area(); render(f, area, &st, now); }).unwrap();
+        let buf = term.backend().buffer();
+        let all: String = (0..buf.area.height)
+            .map(|y| buffer_line(buf, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(all.contains("src/foo.rs"), "missing src/foo.rs in:\n{all}");
+        assert!(all.contains("tests/bar.rs"), "missing tests/bar.rs in:\n{all}");
+        assert!(all.contains("+12"), "missing +12 in:\n{all}");
+        assert!(all.contains("-3"),  "missing -3 in:\n{all}");
+        assert!(all.contains("+4"),  "missing +4 in:\n{all}");
+    }
+
+    #[test]
+    fn expanded_loading_renders_loading_files_text() {
+        let mut st = fixture_state();
+        st.selected = 0;
+        let sel_number = st.visible_prs()[0].number;
+        st.expanded = Some(ExpandedFiles::Loading { number: sel_number });
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        let now: DateTime<Utc> = "2026-05-06T00:00:00Z".parse().unwrap();
+        term.draw(|f| { let area = f.area(); render(f, area, &st, now); }).unwrap();
+        let buf = term.backend().buffer();
+        let all: String = (0..buf.area.height)
+            .map(|y| buffer_line(buf, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(all.contains("loading files"), "missing loading text in:\n{all}");
+    }
+
+    #[test]
+    fn expanded_mismatched_number_does_not_render_files() {
+        use crate::data::pr::FileMeta;
+        let mut st = fixture_state();
+        st.selected = 0;
+        st.expanded = Some(ExpandedFiles::Ready {
+            number: 999_999,
+            files: vec![FileMeta { path: "stale.rs".into(), additions: 1, deletions: 0 }],
+        });
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        let now: DateTime<Utc> = "2026-05-06T00:00:00Z".parse().unwrap();
+        term.draw(|f| { let area = f.area(); render(f, area, &st, now); }).unwrap();
+        let buf = term.backend().buffer();
+        let all: String = (0..buf.area.height)
+            .map(|y| buffer_line(buf, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!all.contains("stale.rs"), "stale row leaked into:\n{all}");
+    }
+
+    #[test]
+    fn expanded_error_renders_error_message_under_selected_row() {
+        let mut st = fixture_state();
+        st.selected = 0;
+        let sel_number = st.visible_prs()[0].number;
+        st.expanded = Some(ExpandedFiles::Error {
+            number: sel_number,
+            message: "ref missing locally".into(),
+        });
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        let now: DateTime<Utc> = "2026-05-06T00:00:00Z".parse().unwrap();
+        term.draw(|f| { let area = f.area(); render(f, area, &st, now); }).unwrap();
+        let buf = term.backend().buffer();
+        let all: String = (0..buf.area.height)
+            .map(|y| buffer_line(buf, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(all.contains("error:"), "expected 'error:' prefix in:\n{all}");
+        assert!(all.contains("ref missing locally"), "expected error message in:\n{all}");
+    }
+
+    #[test]
+    fn selected_row_stays_visible_when_expanded_block_is_tall() {
+        // 20 PRs; selected = 19 (last); expanded with 20 files; body
+        // area is 14 lines (18 terminal - 4 header/footer). Selected row
+        // sits at line index 20 (1 divider + 19 prior rows) — off-screen
+        // without scrolling. Scroll must bring it into view.
+        use crate::data::pr::{Author, FileMeta, Pr, PrState};
+        let st = PrListState {
+            repo_name: "prpr".into(),
+            branch: "main".into(),
+            prs: (0..20).map(|i| Pr {
+                number: 100 + i, title: format!("p{i}"), is_draft: false, state: PrState::Open,
+                author: Author { login: "a".into() }, created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+                updated_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+                base_ref_name: "main".into(), head_ref_name: "f".into(),
+                labels: vec![], status_check_rollup: vec![],
+                review_decision: None, mergeable: None,
+            }).collect(),
+            selected: 19,
+            expanded: Some(ExpandedFiles::Ready {
+                number: 119,
+                files: (0..20).map(|i| FileMeta {
+                    path: format!("file{i}.rs"), additions: 1, deletions: 0,
+                }).collect(),
+            }),
+            ..Default::default()
+        };
+        let mut term = Terminal::new(TestBackend::new(80, 18)).unwrap();
+        let now: DateTime<Utc> = "2026-05-06T00:00:00Z".parse().unwrap();
+        term.draw(|f| { let area = f.area(); render(f, area, &st, now); }).unwrap();
+        let buf = term.backend().buffer();
+        let all: String = (0..buf.area.height)
+            .map(|y| buffer_line(buf, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(all.contains("#119"), "selected PR #119 must be visible in:\n{all}");
     }
 }

@@ -8,6 +8,32 @@ use chrono::{DateTime, Utc};
 
 use crate::data::pr::{Author, Commit};
 
+/// Parse `git diff --numstat`. `-\t-` means binary (counted as 0/0).
+fn parse_numstat(raw: &str) -> Result<Vec<crate::data::pr::FileMeta>> {
+    let mut out = Vec::new();
+    for line in raw.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.splitn(3, '\t');
+        let a = parts.next().unwrap_or("");
+        let d = parts.next().unwrap_or("");
+        let path = parts.next().unwrap_or("");
+        if path.is_empty() {
+            return Err(anyhow!("malformed numstat line: {line:?}"));
+        }
+        let additions = if a == "-" { 0 } else {
+            a.parse::<u32>().with_context(|| format!("parsing adds in {line:?}"))?
+        };
+        let deletions = if d == "-" { 0 } else {
+            d.parse::<u32>().with_context(|| format!("parsing dels in {line:?}"))?
+        };
+        out.push(crate::data::pr::FileMeta { path: path.to_string(), additions, deletions });
+    }
+    Ok(out)
+}
+
 pub trait GitClient: Send + Sync {
     /// Resolve the repo root containing `cwd`. Errors if `cwd` is not in a git repo.
     fn repo_root(&self, cwd: &Path) -> Result<std::path::PathBuf>;
@@ -32,6 +58,8 @@ pub trait GitClient: Send + Sync {
     /// per commit. Used to attribute deleted lines to the PR commit that
     /// removed them. Returns raw stdout.
     fn log_patches(&self, repo_root: &Path, base: &str, head: &str, file: &str) -> Result<String>;
+    /// `git diff --numstat <base>..<head>`. Returns one `FileMeta` per changed file.
+    fn diff_numstat(&self, repo_root: &Path, base: &str, head: &str) -> Result<Vec<crate::data::pr::FileMeta>>;
 }
 
 pub struct GitCli;
@@ -176,6 +204,78 @@ impl GitClient for GitCli {
         let s = String::from_utf8(out.stdout)?;
         Ok(s)
     }
+
+    fn diff_numstat(
+        &self,
+        repo_root: &Path,
+        base: &str,
+        head: &str,
+    ) -> Result<Vec<crate::data::pr::FileMeta>> {
+        let range = format!("{base}..{head}");
+        let out = run(Command::new("git").current_dir(repo_root).args([
+            "diff", "--numstat", "--no-color", &range,
+        ]))?;
+        let raw = String::from_utf8(out.stdout)
+            .with_context(|| "`git diff --numstat` returned non-UTF-8")?;
+        parse_numstat(&raw)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::pr::FileMeta;
+
+    #[test]
+    fn parses_numstat_with_text_binary_rename_pure_delete() {
+        let raw = include_str!("../../tests/fixtures/diff_numstat.txt");
+        let got = parse_numstat(raw).unwrap();
+        assert_eq!(
+            got,
+            vec![
+                FileMeta { path: "src/sched.rs".into(), additions: 12, deletions: 3 },
+                FileMeta { path: "tests/metrics_test.rs".into(), additions: 85, deletions: 0 },
+                FileMeta { path: "assets/logo.png".into(), additions: 0, deletions: 0 },
+                FileMeta { path: "docs/old_metrics.md".into(), additions: 0, deletions: 42 },
+                FileMeta { path: "src/server.rs".into(), additions: 3, deletions: 1 },
+            ],
+        );
+    }
+
+    #[test]
+    fn parses_numstat_empty_input() {
+        assert!(parse_numstat("").unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_numstat_skips_blank_lines() {
+        let raw = "1\t1\ta.rs\n\n2\t0\tb.rs\n";
+        let got = parse_numstat(raw).unwrap();
+        assert_eq!(got.len(), 2);
+    }
+
+    #[test]
+    fn fake_git_diff_numstat_returns_seeded_value() {
+        use crate::data::git::fakes::FakeGit;
+        use std::path::Path;
+        let mut g = FakeGit::new("/tmp/repo");
+        g.numstats.insert(
+            ("base".into(), "head".into()),
+            vec![crate::data::pr::FileMeta { path: "a.rs".into(), additions: 1, deletions: 2 }],
+        );
+        let v = g.diff_numstat(Path::new("/tmp/repo"), "base", "head").unwrap();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].path, "a.rs");
+    }
+
+    #[test]
+    fn fake_git_diff_numstat_errors_when_missing() {
+        use crate::data::git::fakes::FakeGit;
+        use std::path::Path;
+        let g = FakeGit::new("/tmp/repo");
+        let r = g.diff_numstat(Path::new("/tmp/repo"), "base", "head");
+        assert!(r.is_err());
+    }
 }
 
 #[cfg(test)]
@@ -197,6 +297,8 @@ pub(crate) mod fakes {
         /// Keyed by (base, head, file) → log_patches output. Missing keys
         /// resolve to empty (no PR-commit deletions for that file).
         pub log_patches: HashMap<(String, String, String), String>,
+        /// Keyed by (base, head) → numstat file list.
+        pub numstats: HashMap<(String, String), Vec<crate::data::pr::FileMeta>>,
     }
 
     impl FakeGit {
@@ -209,6 +311,7 @@ pub(crate) mod fakes {
                 blames: HashMap::new(),
                 diffs: HashMap::new(),
                 log_patches: HashMap::new(),
+                numstats: HashMap::new(),
             }
         }
     }
@@ -254,6 +357,17 @@ pub(crate) mod fakes {
                 .get(&(base.into(), head.into(), file.into()))
                 .cloned()
                 .unwrap_or_default())
+        }
+        fn diff_numstat(
+            &self,
+            _root: &Path,
+            base: &str,
+            head: &str,
+        ) -> Result<Vec<crate::data::pr::FileMeta>> {
+            self.numstats
+                .get(&(base.into(), head.into()))
+                .cloned()
+                .ok_or_else(|| anyhow!("no fake numstat for {base}..{head}"))
         }
     }
 }

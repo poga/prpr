@@ -31,7 +31,7 @@ use crate::keys::{Action, FocusedView, MouseAction, dispatch, mouse_dispatch};
 use crate::view::commits_modal::{self, CommitsModalState};
 use crate::view::file_picker::FilePickerState;
 use crate::view::merge_modal::{MergeMethod, MergeModalState, MergingState};
-use crate::view::pr_list::PrListState;
+use crate::view::pr_list::{ExpandedFiles, PrListState};
 use crate::view::pr_review::PrReviewState;
 
 const AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
@@ -125,13 +125,13 @@ impl AppState {
                 branch,
                 prs: vec![],
                 selected: 0,
-                filter_open_only: true,
                 search: None,
                 status: String::new(),
                 loading: false,
                 enriching: false,
                 loading_stage: None,
                 manual_refresh_in_flight: false,
+                expanded: None,
             },
             review: None,
             current_pr: None,
@@ -180,8 +180,25 @@ pub fn restore_terminal() -> Result<()> {
     Ok(())
 }
 
+/// Trigger a fresh `ListFiles` request for whatever row is currently
+/// selected. Always re-issues (no cache).
+fn after_selection_change(app: &App, st: &mut AppState) {
+    let Some((number, base_ref)) = st
+        .list
+        .visible_prs()
+        .get(st.list.selected)
+        .map(|p| (p.number, p.base_ref_name.clone()))
+    else {
+        st.list.expanded = None;
+        return;
+    };
+    st.list.expanded = Some(ExpandedFiles::Loading { number });
+    app.request(Request::ListFiles { number, base_ref });
+}
+
 fn send_refresh(app: &App, st: &mut AppState, silent: bool) {
     st.last_refresh_at = Some(Instant::now());
+    st.list.expanded = None;
     st.list_refresh_in_flight = true;
     st.list.enriching = false;
     if !silent {
@@ -281,6 +298,8 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
                     .collect();
                 st.list.selected =
                     reselect_by_number(prev_selected, &new_numbers, st.list.selected);
+                st.list.expanded = None;
+                after_selection_change(app, st);
             }
             Err(e) => {
                 st.list_refresh_in_flight = false;
@@ -399,10 +418,30 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
             let new_numbers: Vec<u32> =
                 st.list.visible_prs().iter().map(|p| p.number).collect();
             st.list.selected = reselect_by_number(prev_selected, &new_numbers, prev_idx);
+            st.list.expanded = None;
+            after_selection_change(app, st);
         }
         Response::MergeDone { number, result: Err(e) } => {
             st.merging = None;
             st.list.status = format!("merge #{number} failed: {e}");
+        }
+        Response::ListFiles { number, result } => {
+            let sel_number = st
+                .list
+                .visible_prs()
+                .get(st.list.selected)
+                .map(|p| p.number);
+            if sel_number != Some(number) {
+                return;
+            }
+            let exp_number = st.list.expanded.as_ref().map(ExpandedFiles::number);
+            if exp_number != Some(number) {
+                return;
+            }
+            st.list.expanded = Some(match result {
+                Ok(files) => ExpandedFiles::Ready { number, files },
+                Err(e) => ExpandedFiles::Error { number, message: format!("{e:#}") },
+            });
         }
     }
 }
@@ -533,6 +572,7 @@ fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) 
     {
         st.pending_g = false;
         st.list.selected = 0;
+        after_selection_change(app, st);
         return;
     }
     st.pending_g = false;
@@ -549,6 +589,7 @@ fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) 
             crossterm::event::KeyCode::Char(c) => buf.push(c),
             _ => {}
         }
+        after_selection_change(app, st);
         return;
     }
 
@@ -562,12 +603,14 @@ fn handle_action(app: &mut App, st: &mut AppState, action: Action) {
         Action::ListUp => {
             if st.list.selected > 0 {
                 st.list.selected -= 1;
+                after_selection_change(app, st);
             }
         }
         Action::ListDown => {
             let n = st.list.visible_prs().len();
             if st.list.selected + 1 < n {
                 st.list.selected += 1;
+                after_selection_change(app, st);
             }
         }
         Action::ListTop => {
@@ -576,6 +619,7 @@ fn handle_action(app: &mut App, st: &mut AppState, action: Action) {
         Action::ListBottom => {
             let n = st.list.visible_prs().len();
             st.list.selected = n.saturating_sub(1);
+            after_selection_change(app, st);
         }
         Action::ListOpen => {
             if let Some(pr) = st
@@ -614,9 +658,6 @@ fn handle_action(app: &mut App, st: &mut AppState, action: Action) {
         }
         Action::ListSearch => {
             st.list.search = Some(String::new());
-        }
-        Action::ListCycleFilter => {
-            st.list.filter_open_only = !st.list.filter_open_only;
         }
         Action::ListClearFilter => {
             st.list.search = None;
@@ -784,10 +825,14 @@ fn handle_mouse(app: &mut App, st: &mut AppState, ev: crossterm::event::MouseEve
         MouseAction::Scroll(d) => {
             if st.focused == FocusedView::List {
                 let n = st.list.visible_prs().len();
+                let prev = st.list.selected;
                 if d > 0 {
                     st.list.selected = (st.list.selected + d as usize).min(n.saturating_sub(1));
                 } else {
                     st.list.selected = st.list.selected.saturating_sub((-d) as usize);
+                }
+                if st.list.selected != prev {
+                    after_selection_change(app, st);
                 }
             } else {
                 move_review(app, st, d as i32);
@@ -796,8 +841,9 @@ fn handle_mouse(app: &mut App, st: &mut AppState, ev: crossterm::event::MouseEve
         MouseAction::ClickAt { col: _, row } => {
             if st.focused == FocusedView::List && row >= 2 {
                 let idx = (row - 2) as usize;
-                if idx < st.list.visible_prs().len() {
+                if idx < st.list.visible_prs().len() && st.list.selected != idx {
                     st.list.selected = idx;
+                    after_selection_change(app, st);
                 }
             }
         }
@@ -1093,8 +1139,98 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
     use crate::data::cache::Cache;
-    use crate::data::pr::{Author, Pr, PrEnrichment, PrState, StatusCheck};
+    use crate::data::pr::{Author, FileMeta, Pr, PrEnrichment, PrState, StatusCheck};
     use crate::data::worker::Response;
+    use crate::view::pr_list::ExpandedFiles;
+
+    fn make_pr(n: u32) -> Pr {
+        Pr {
+            number: n,
+            title: format!("pr-{n}"),
+            is_draft: false,
+            state: PrState::Open,
+            author: Author { login: "a".into() },
+            created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            updated_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            base_ref_name: "main".into(),
+            head_ref_name: format!("f{n}"),
+            labels: vec![],
+            status_check_rollup: vec![],
+            review_decision: None,
+            mergeable: None,
+        }
+    }
+
+    fn make_app() -> App {
+        use crate::data::gh::fakes::FakeGh;
+        use crate::data::git::fakes::FakeGit;
+        App::new(
+            "/tmp/repo".into(),
+            Arc::new(FakeGh::new()),
+            Arc::new(FakeGit::new("/tmp/repo")),
+            Config::default(),
+        )
+    }
+
+    #[test]
+    fn list_files_response_matching_selection_transitions_to_ready() {
+        let mut app = make_app();
+        let mut st = AppState::new("prpr".into(), "main".into());
+        st.list.prs = vec![make_pr(7), make_pr(8)];
+        st.list.selected = 0;
+        st.list.expanded = Some(ExpandedFiles::Loading { number: 7 });
+
+        let files = vec![FileMeta { path: "a.rs".into(), additions: 1, deletions: 0 }];
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::ListFiles { number: 7, result: Ok(files.clone()) },
+        );
+        match st.list.expanded {
+            Some(ExpandedFiles::Ready { number: 7, files: ref f }) => assert_eq!(f, &files),
+            ref other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_files_response_for_other_pr_is_dropped() {
+        let mut app = make_app();
+        let mut st = AppState::new("prpr".into(), "main".into());
+        st.list.prs = vec![make_pr(7), make_pr(8)];
+        st.list.selected = 0;
+        st.list.expanded = Some(ExpandedFiles::Loading { number: 7 });
+
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::ListFiles { number: 8, result: Ok(vec![]) },
+        );
+        assert!(matches!(
+            st.list.expanded,
+            Some(ExpandedFiles::Loading { number: 7 })
+        ));
+    }
+
+    #[test]
+    fn list_files_error_transitions_to_error_variant() {
+        let mut app = make_app();
+        let mut st = AppState::new("prpr".into(), "main".into());
+        st.list.prs = vec![make_pr(7)];
+        st.list.selected = 0;
+        st.list.expanded = Some(ExpandedFiles::Loading { number: 7 });
+
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::ListFiles { number: 7, result: Err(anyhow::anyhow!("ref missing")) },
+        );
+        match st.list.expanded {
+            Some(ExpandedFiles::Error { number: 7, ref message }) => {
+                assert!(message.contains("ref missing"));
+            }
+            ref other => panic!("expected Error, got {other:?}"),
+        }
+    }
 
     #[test]
     fn cycle_file_uses_detail_files_count_when_files_empty() {

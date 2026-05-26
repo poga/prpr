@@ -18,7 +18,6 @@ pub enum Action {
     ListMerge,
     ListRefresh,
     ListSearch,
-    ListCycleFilter,
     ListClearFilter,
 
     // PR review
@@ -78,7 +77,6 @@ fn list(ev: KeyEvent) -> Action {
         KeyCode::Char('o') => Action::ListOpenInBrowser,
         KeyCode::Char('m') => Action::ListMerge,
         KeyCode::Char('/') => Action::ListSearch,
-        KeyCode::Char('f') => Action::ListCycleFilter,
         KeyCode::Esc => Action::ListClearFilter,
         _ => Action::Nothing,
     }

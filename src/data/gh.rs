@@ -43,13 +43,13 @@ impl GhClient for GhCli {
             "--limit",
             "200",
             "--state",
-            "all",
+            "open",
             "--json",
             PR_LIST_FAST_FIELDS,
         ]))?;
         let prs: Vec<Pr> = serde_json::from_slice(&out.stdout)
             .with_context(|| "parsing `gh pr list --json` (fast) output")?;
-        Ok(prs)
+        Ok(prs.into_iter().filter(|p| p.state == crate::data::pr::PrState::Open).collect())
     }
 
     fn list_prs_enriched(&self, repo_root: &std::path::Path) -> Result<Vec<PrEnrichment>> {
@@ -59,7 +59,7 @@ impl GhClient for GhCli {
             "--limit",
             "200",
             "--state",
-            "all",
+            "open",
             "--json",
             PR_LIST_ENRICHED_FIELDS,
         ]))?;
@@ -108,7 +108,12 @@ pub(crate) mod fakes {
 
     impl GhClient for FakeGh {
         fn list_prs_fast(&self, _root: &std::path::Path) -> Result<Vec<Pr>> {
-            Ok(self.prs_fast.clone())
+            Ok(self
+                .prs_fast
+                .clone()
+                .into_iter()
+                .filter(|p| p.state == crate::data::pr::PrState::Open)
+                .collect())
         }
         fn list_prs_enriched(&self, _root: &std::path::Path) -> Result<Vec<PrEnrichment>> {
             Ok(self.enrichments.clone())
@@ -170,5 +175,31 @@ mod tests {
         assert_eq!(enriched.len(), 1);
         assert_eq!(enriched[0].number, 7);
         assert_eq!(enriched[0].status_check_rollup.len(), 1);
+    }
+
+    #[test]
+    fn fake_drops_non_open_rows_after_parse() {
+        use super::fakes::FakeGh;
+        use crate::data::pr::{Author, Pr, PrState};
+        let mut g = FakeGh::new();
+        g.prs_fast = vec![
+            Pr { number: 1, title: "open".into(), is_draft: false, state: PrState::Open,
+                 author: Author { login: "a".into() },
+                 created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+                 updated_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+                 base_ref_name: "main".into(), head_ref_name: "f".into(),
+                 labels: vec![], status_check_rollup: vec![],
+                 review_decision: None, mergeable: None },
+            Pr { number: 2, title: "merged".into(), is_draft: false, state: PrState::Merged,
+                 author: Author { login: "a".into() },
+                 created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+                 updated_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+                 base_ref_name: "main".into(), head_ref_name: "f2".into(),
+                 labels: vec![], status_check_rollup: vec![],
+                 review_decision: None, mergeable: None },
+        ];
+        let got = super::GhClient::list_prs_fast(&g, std::path::Path::new("/x")).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].number, 1);
     }
 }
