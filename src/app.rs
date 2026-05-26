@@ -418,6 +418,8 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
             let new_numbers: Vec<u32> =
                 st.list.visible_prs().iter().map(|p| p.number).collect();
             st.list.selected = reselect_by_number(prev_selected, &new_numbers, prev_idx);
+            st.list.expanded = None;
+            after_selection_change(app, st);
         }
         Response::MergeDone { number, result: Err(e) } => {
             st.merging = None;
@@ -823,10 +825,14 @@ fn handle_mouse(app: &mut App, st: &mut AppState, ev: crossterm::event::MouseEve
         MouseAction::Scroll(d) => {
             if st.focused == FocusedView::List {
                 let n = st.list.visible_prs().len();
+                let prev = st.list.selected;
                 if d > 0 {
                     st.list.selected = (st.list.selected + d as usize).min(n.saturating_sub(1));
                 } else {
                     st.list.selected = st.list.selected.saturating_sub((-d) as usize);
+                }
+                if st.list.selected != prev {
+                    after_selection_change(app, st);
                 }
             } else {
                 move_review(app, st, d as i32);
@@ -835,8 +841,9 @@ fn handle_mouse(app: &mut App, st: &mut AppState, ev: crossterm::event::MouseEve
         MouseAction::ClickAt { col: _, row } => {
             if st.focused == FocusedView::List && row >= 2 {
                 let idx = (row - 2) as usize;
-                if idx < st.list.visible_prs().len() {
+                if idx < st.list.visible_prs().len() && st.list.selected != idx {
                     st.list.selected = idx;
+                    after_selection_change(app, st);
                 }
             }
         }

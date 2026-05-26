@@ -89,7 +89,7 @@ pub fn render(f: &mut Frame, area: Rect, st: &PrListState, now: DateTime<Utc>) {
 
 fn render_header(f: &mut Frame, area: Rect, st: &PrListState) {
     let visible = st.visible_prs();
-    let count = visible.iter().filter(|p| p.state == PrState::Open).count();
+    let count = visible.len();
     let header = format!(
         "  prpr · {} · {} · {} open",
         st.repo_name, st.branch, count,
