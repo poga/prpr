@@ -142,7 +142,28 @@ fn render_rows(f: &mut Frame, area: Rect, st: &PrListState, now: DateTime<Utc>) 
             }
         }
     }
-    f.render_widget(Paragraph::new(lines), area);
+    // Compute the absolute line index of the selected PR's row, so we
+    // can scroll it into view when the expanded block pushes content
+    // past the viewport. The selected row's index is:
+    //   1 (divider) + selected
+    // (only the selected row has expansion lines, and they appear AFTER
+    // the row, so they don't shift the selected row's own position).
+    let selected_row_idx = 1 + st.selected;
+    let h = area.height as usize;
+    let total = lines.len();
+    let offset = if total <= h {
+        0
+    } else if selected_row_idx + 2 < h {
+        // Selected row already in the upper portion — no scroll needed.
+        0
+    } else {
+        // Keep the selected row ~2 lines from the top of the viewport.
+        let target_top = selected_row_idx.saturating_sub(2);
+        target_top.min(total.saturating_sub(h))
+    };
+    let view: Vec<Line<'static>> =
+        lines.into_iter().skip(offset).take(h).collect();
+    f.render_widget(Paragraph::new(view), area);
 }
 
 fn render_footer(f: &mut Frame, area: Rect, st: &PrListState) {
@@ -633,5 +654,41 @@ mod tests {
             .join("\n");
         assert!(all.contains("error:"), "expected 'error:' prefix in:\n{all}");
         assert!(all.contains("ref missing locally"), "expected error message in:\n{all}");
+    }
+
+    #[test]
+    fn selected_row_stays_visible_when_expanded_block_is_tall() {
+        // 20 PRs; selected = 19 (last); expanded with 20 files; body
+        // area is 14 lines (18 terminal - 4 header/footer). Selected row
+        // sits at line index 20 (1 divider + 19 prior rows) — off-screen
+        // without scrolling. Scroll must bring it into view.
+        use crate::data::pr::{Author, FileMeta, Pr, PrState};
+        let mut st = PrListState::default();
+        st.repo_name = "prpr".into();
+        st.branch = "main".into();
+        st.prs = (0..20).map(|i| Pr {
+            number: 100 + i, title: format!("p{i}"), is_draft: false, state: PrState::Open,
+            author: Author { login: "a".into() }, created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            updated_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            base_ref_name: "main".into(), head_ref_name: "f".into(),
+            labels: vec![], status_check_rollup: vec![],
+            review_decision: None, mergeable: None,
+        }).collect();
+        st.selected = 19;
+        st.expanded = Some(ExpandedFiles::Ready {
+            number: 119,
+            files: (0..20).map(|i| FileMeta {
+                path: format!("file{i}.rs"), additions: 1, deletions: 0,
+            }).collect(),
+        });
+        let mut term = Terminal::new(TestBackend::new(80, 18)).unwrap();
+        let now: DateTime<Utc> = "2026-05-06T00:00:00Z".parse().unwrap();
+        term.draw(|f| { let area = f.area(); render(f, area, &st, now); }).unwrap();
+        let buf = term.backend().buffer();
+        let all: String = (0..buf.area.height)
+            .map(|y| buffer_line(buf, y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(all.contains("#119"), "selected PR #119 must be visible in:\n{all}");
     }
 }
