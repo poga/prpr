@@ -58,7 +58,9 @@ pub trait GitClient: Send + Sync {
     /// per commit. Used to attribute deleted lines to the PR commit that
     /// removed them. Returns raw stdout.
     fn log_patches(&self, repo_root: &Path, base: &str, head: &str, file: &str) -> Result<String>;
-    /// `git diff --numstat <base>..<head>`. Returns one `FileMeta` per changed file.
+    /// Three-dot `git diff --numstat <base>...<head>` so a base that has
+    /// advanced since the PR opened doesn't leak its own changes into the
+    /// PR's file list. Returns one `FileMeta` per changed file.
     fn diff_numstat(&self, repo_root: &Path, base: &str, head: &str) -> Result<Vec<crate::data::pr::FileMeta>>;
 }
 
@@ -211,7 +213,7 @@ impl GitClient for GitCli {
         base: &str,
         head: &str,
     ) -> Result<Vec<crate::data::pr::FileMeta>> {
-        let range = format!("{base}..{head}");
+        let range = format!("{base}...{head}");
         let out = run(Command::new("git").current_dir(repo_root).args([
             "diff", "--numstat", "--no-color", &range,
         ]))?;
@@ -275,6 +277,56 @@ mod tests {
         let g = FakeGit::new("/tmp/repo");
         let r = g.diff_numstat(Path::new("/tmp/repo"), "base", "head");
         assert!(r.is_err());
+    }
+
+    /// When `origin/<base>` advances after a PR is opened, files modified on
+    /// the base must NOT appear in the PR's file list. Only files the PR
+    /// actually touched count — i.e. merge-base → head (three-dot diff).
+    #[test]
+    fn diff_numstat_excludes_files_changed_only_on_base() {
+        use std::process::Command;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let run_git = |args: &[&str]| {
+            let out = Command::new("git")
+                .current_dir(root)
+                .args(args)
+                .output()
+                .expect("spawn git");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap()
+        };
+        run_git(&["init", "-q", "-b", "main"]);
+        run_git(&["config", "user.email", "t@example.com"]);
+        run_git(&["config", "user.name", "t"]);
+        run_git(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(root.join("a.txt"), "a\n").unwrap();
+        run_git(&["add", "."]);
+        run_git(&["commit", "-q", "-m", "c0"]);
+        // PR branches off c0 and adds b.txt.
+        run_git(&["checkout", "-q", "-b", "pr"]);
+        std::fs::write(root.join("b.txt"), "b\n").unwrap();
+        run_git(&["add", "."]);
+        run_git(&["commit", "-q", "-m", "pr1"]);
+        let head = run_git(&["rev-parse", "HEAD"]).trim().to_string();
+        // Base advances on main: modifies a.txt (unrelated to the PR).
+        run_git(&["checkout", "-q", "main"]);
+        std::fs::write(root.join("a.txt"), "a_modified\n").unwrap();
+        run_git(&["commit", "-q", "-am", "main1"]);
+        let base = run_git(&["rev-parse", "HEAD"]).trim().to_string();
+
+        let files = GitCli.diff_numstat(root, &base, &head).unwrap();
+        let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["b.txt"],
+            "PR file list must only include files the PR changed (b.txt); a.txt was \
+             modified on base only and must not appear"
+        );
     }
 }
 
