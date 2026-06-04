@@ -200,7 +200,8 @@ fn send_refresh(app: &App, st: &mut AppState, silent: bool) {
     st.last_refresh_at = Some(Instant::now());
     st.list.expanded = None;
     st.list_refresh_in_flight = true;
-    st.list.enriching = false;
+    // Arm at refresh start so ListFast can't re-arm after ListEnriched clears.
+    st.list.enriching = true;
     if !silent {
         st.list.loading = true;
         st.list.manual_refresh_in_flight = true;
@@ -287,7 +288,6 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
                 st.list.prs = prs.clone();
                 app.cache.set_list(prs);
                 st.list.loading = false;
-                st.list.enriching = true;
                 st.list.loading_stage = None;
                 st.list.status = String::new();
                 let new_numbers: Vec<u32> = st
@@ -1548,6 +1548,27 @@ mod tests {
             },
         );
         assert!(!st.list_refresh_in_flight);
+        assert!(!st.list.enriching);
+    }
+
+    #[test]
+    fn enriching_clears_when_enriched_arrives_before_fast() {
+        // ListEnriched can beat ListFast; footer must not stick on enriching.
+        let mut st = dummy_app_state();
+        let mut cache = Cache::new();
+        let mut app = test_app_for_state(&mut cache);
+        send_refresh(&app, &mut st, false);
+        let g = st.list_gen;
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::ListEnriched { generation: g, result: Ok(vec![]) },
+        );
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::ListFast { generation: g, result: Ok(vec![]) },
+        );
         assert!(!st.list.enriching);
     }
 
