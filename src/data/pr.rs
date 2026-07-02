@@ -83,10 +83,20 @@ pub enum ReviewDecision {
 }
 
 impl Pr {
-    /// True only when GitHub has computed mergeability and reports a conflict.
-    /// "UNKNOWN" or missing values are treated as not-yet-known, not conflicting.
+    /// Tri-state mergeability from the raw wire value. `None` = not yet
+    /// fetched; `Unknown` = GitHub is still computing.
+    pub fn merge_state(&self) -> Option<MergeState> {
+        match self.mergeable.as_deref() {
+            Some("MERGEABLE") => Some(MergeState::Mergeable),
+            Some("CONFLICTING") => Some(MergeState::Conflicting),
+            Some(_) => Some(MergeState::Unknown),
+            None => None,
+        }
+    }
+
+    /// True only when GitHub reports a definite conflict.
     pub fn is_conflicting(&self) -> bool {
-        matches!(self.mergeable.as_deref(), Some("CONFLICTING"))
+        matches!(self.merge_state(), Some(MergeState::Conflicting))
     }
 
     /// Aggregate CI conclusion across status_check_rollup.
@@ -123,6 +133,13 @@ impl Pr {
         self.review_decision = e.review_decision;
         self.mergeable = e.mergeable.clone();
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeState {
+    Mergeable,
+    Conflicting,
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -346,5 +363,26 @@ mod tests {
         assert_eq!(p.mergeable.as_deref(), Some("MERGEABLE"));
         assert_eq!(p.title, "t");
         assert_eq!(p.labels.len(), 1);
+    }
+
+    #[test]
+    fn merge_state_maps_wire_values() {
+        let pr_with = |m: Option<&str>| Pr {
+            number: 1, title: "t".into(), is_draft: false, state: PrState::Open,
+            author: Author { login: "a".into() },
+            created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            updated_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            base_ref_name: String::new(), head_ref_name: String::new(),
+            labels: vec![], status_check_rollup: vec![],
+            review_decision: None, mergeable: m.map(str::to_string),
+        };
+        assert_eq!(pr_with(None).merge_state(), None);
+        assert_eq!(pr_with(Some("MERGEABLE")).merge_state(), Some(MergeState::Mergeable));
+        assert_eq!(pr_with(Some("CONFLICTING")).merge_state(), Some(MergeState::Conflicting));
+        assert_eq!(pr_with(Some("UNKNOWN")).merge_state(), Some(MergeState::Unknown));
+        assert_eq!(pr_with(Some("WEIRD")).merge_state(), Some(MergeState::Unknown));
+        assert!(pr_with(Some("CONFLICTING")).is_conflicting());
+        assert!(!pr_with(Some("UNKNOWN")).is_conflicting());
+        assert!(!pr_with(None).is_conflicting());
     }
 }

@@ -87,12 +87,14 @@ impl GhClient for GhCli {
 pub(crate) mod fakes {
     use super::*;
     use crate::data::pr::PrEnrichment;
+    use std::collections::VecDeque;
     use std::sync::Mutex;
 
     /// In-memory fake. Tests load JSON fixtures and stuff them into this.
     pub struct FakeGh {
         pub prs_fast: Vec<Pr>,
         pub enrichments: Vec<PrEnrichment>,
+        pub enrichment_sequence: Mutex<VecDeque<Vec<PrEnrichment>>>,
         pub merges: Mutex<Vec<(u32, String)>>,
     }
 
@@ -101,8 +103,13 @@ pub(crate) mod fakes {
             Self {
                 prs_fast: vec![],
                 enrichments: vec![],
+                enrichment_sequence: Mutex::new(VecDeque::new()),
                 merges: Mutex::new(vec![]),
             }
+        }
+        /// Queue successive enriched payloads; each call pops the next one.
+        pub fn set_enrichment_sequence(&self, seq: Vec<Vec<PrEnrichment>>) {
+            *self.enrichment_sequence.lock().unwrap() = seq.into();
         }
     }
 
@@ -116,6 +123,9 @@ pub(crate) mod fakes {
                 .collect())
         }
         fn list_prs_enriched(&self, _root: &std::path::Path) -> Result<Vec<PrEnrichment>> {
+            if let Some(next) = self.enrichment_sequence.lock().unwrap().pop_front() {
+                return Ok(next);
+            }
             Ok(self.enrichments.clone())
         }
         fn merge_pr(&self, _root: &std::path::Path, n: u32, m: &str) -> Result<()> {

@@ -7,7 +7,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::data::pr::{CiState, Pr, PrState, ReviewDecision};
+use crate::data::pr::{CiState, MergeState, Pr, PrState, ReviewDecision};
 use crate::data::worker::ListStage;
 use crate::render::spinner;
 use crate::render::style::*;
@@ -210,7 +210,7 @@ fn render_footer(f: &mut Frame, area: Rect, st: &PrListState) {
     } else {
         f.render_widget(
             Paragraph::new(
-                "  state ●open ○draft   ci ✓pass ✗fail …pend   review ✓approved !changes ·pending   ⚠conflict",
+                "  state ●open ○draft   ci ✓pass ✗fail …pend   review ✓approved !changes ·pending   ⚠conflict ?checking",
             )
             .style(Style::default().fg(OVERLAY0)),
             chunks[1],
@@ -251,10 +251,13 @@ fn row_for(pr: &Pr, selected: bool, now: DateTime<Utc>, area_width: u16) -> Line
         }
         _ => Span::styled("·", Style::default().fg(COMMIT_PALETTE[1])),
     };
-    // Conflict marker only fires for OPEN PRs; merged/closed PRs report stale
-    // mergeability that's no longer actionable.
-    let conflict_glyph = if pr.state == PrState::Open && pr.is_conflicting() {
-        Span::styled("⚠", Style::default().fg(DIFF_DEL_FG))
+    // Merge marker for OPEN PRs only; stale mergeability isn't actionable.
+    let conflict_glyph = if pr.state == PrState::Open {
+        match pr.merge_state() {
+            Some(MergeState::Conflicting) => Span::styled("⚠", Style::default().fg(DIFF_DEL_FG)),
+            Some(MergeState::Unknown) => Span::styled("?", Style::default().fg(OVERLAY0)),
+            _ => Span::styled(" ", Style::default()),
+        }
     } else {
         Span::styled(" ", Style::default())
     };
@@ -265,6 +268,7 @@ fn row_for(pr: &Pr, selected: bool, now: DateTime<Utc>, area_width: u16) -> Line
         .first()
         .map(|l| format!("  [{}]  ", l.name))
         .unwrap_or_else(|| "  ".to_string());
+    let draft_str = if pr.is_draft { "draft  ".to_string() } else { String::new() };
     let author_str = format!("{} ", pr.author.login);
     let age = format!(
         "c{} · u{}",
@@ -277,7 +281,10 @@ fn row_for(pr: &Pr, selected: bool, now: DateTime<Utc>, area_width: u16) -> Line
     // long titles in full and a narrow terminal truncates with "…".
     // Fixed left = "  " + state + " " + ci + " " + review + " " + conflict = 9 cells.
     let left_cols = 9 + pr_num.chars().count();
-    let right_cols = label_str.chars().count() + author_str.chars().count() + age.chars().count();
+    let right_cols = label_str.chars().count()
+        + draft_str.chars().count()
+        + author_str.chars().count()
+        + age.chars().count();
     let title_budget = (area_width as usize)
         .saturating_sub(left_cols)
         .saturating_sub(right_cols)
@@ -295,6 +302,7 @@ fn row_for(pr: &Pr, selected: bool, now: DateTime<Utc>, area_width: u16) -> Line
         Span::styled(pr_num, row_bg.fg(COMMIT_PALETTE[1])),
         Span::styled(truncate(&pr.title, title_budget), row_bg.fg(TEXT)),
         Span::styled(label_str, row_bg.fg(COMMIT_PALETTE[4])),
+        Span::styled(draft_str, row_bg.fg(OVERLAY0)),
         Span::styled(author_str, row_bg.fg(COMMIT_PALETTE[0])),
         Span::styled(age, row_bg.fg(OVERLAY0)),
     ])
@@ -745,5 +753,52 @@ mod tests {
             !line.spans.iter().any(|s| s.style.fg == Some(OVERLAY1) && s.content.contains("Cargo.toml")),
             "top-level file should not have a dim path span"
         );
+    }
+
+    #[test]
+    fn draft_pr_shows_draft_badge() {
+        let now: DateTime<Utc> = "2026-05-06T00:00:00Z".parse().unwrap();
+        let mk = |is_draft: bool| Pr {
+            number: 1, title: "t".into(), is_draft, state: PrState::Open,
+            author: crate::data::pr::Author { login: "a".into() },
+            created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            updated_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            base_ref_name: "main".into(), head_ref_name: "f".into(),
+            labels: vec![], status_check_rollup: vec![],
+            review_decision: None, mergeable: None,
+        };
+        let has_badge = |line: &Line| line.spans.iter().any(|s| s.content == "draft  ");
+
+        let draft = row_for(&mk(true), false, now, 80);
+        assert!(has_badge(&draft), "draft PR should show the 'draft' badge");
+
+        let not_draft = row_for(&mk(false), false, now, 80);
+        assert!(!has_badge(&not_draft), "non-draft rows must not show the badge");
+    }
+
+    #[test]
+    fn unknown_mergeable_open_pr_shows_checking_marker() {
+        let now: DateTime<Utc> = "2026-05-06T00:00:00Z".parse().unwrap();
+        let mk = |m: &str| Pr {
+            number: 1, title: "t".into(), is_draft: false, state: PrState::Open,
+            author: crate::data::pr::Author { login: "a".into() },
+            created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            updated_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            base_ref_name: "main".into(), head_ref_name: "f".into(),
+            labels: vec![], status_check_rollup: vec![],
+            review_decision: None, mergeable: Some(m.into()),
+        };
+        let has = |line: &Line, glyph: &str| line.spans.iter().any(|s| s.content == glyph);
+
+        let unknown = row_for(&mk("UNKNOWN"), false, now, 80);
+        assert!(has(&unknown, "?"), "UNKNOWN row should show '?'");
+        assert!(!has(&unknown, "⚠"), "UNKNOWN row must not show '⚠'");
+
+        let conflicting = row_for(&mk("CONFLICTING"), false, now, 80);
+        assert!(has(&conflicting, "⚠"), "CONFLICTING row should show '⚠'");
+
+        let mergeable = row_for(&mk("MERGEABLE"), false, now, 80);
+        assert!(!has(&mergeable, "?"), "MERGEABLE row must not show '?'");
+        assert!(!has(&mergeable, "⚠"), "MERGEABLE row must not show '⚠'");
     }
 }

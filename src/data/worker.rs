@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use anyhow::Result;
 
@@ -112,6 +113,10 @@ pub enum Response {
     },
 }
 
+/// GitHub computes mergeability lazily; re-poll to resolve "UNKNOWN".
+const ENRICH_MAX_ROUNDS: usize = 3;
+const ENRICH_RETRY_DELAY: Duration = Duration::from_secs(2);
+
 pub struct Worker {
     /// Wrapped in `Option` so `Drop` can take and drop the sender BEFORE
     /// joining the thread. Otherwise `recv()` in the worker would never
@@ -128,10 +133,20 @@ impl Worker {
         git: Arc<dyn GitClient>,
         window_size: usize,
     ) -> Self {
+        Self::spawn_with_retry(repo_root, gh, git, window_size, ENRICH_RETRY_DELAY)
+    }
+
+    pub fn spawn_with_retry(
+        repo_root: PathBuf,
+        gh: Arc<dyn GhClient>,
+        git: Arc<dyn GitClient>,
+        window_size: usize,
+        enrich_retry_delay: Duration,
+    ) -> Self {
         let (req_tx, req_rx) = channel();
         let (res_tx, res_rx) = channel();
         let handle = thread::spawn(move || {
-            run_worker(req_rx, res_tx, repo_root, gh, git, window_size);
+            run_worker(req_rx, res_tx, repo_root, gh, git, window_size, enrich_retry_delay);
         });
         Self {
             tx: Some(req_tx),
@@ -167,6 +182,7 @@ fn run_worker(
     gh: Arc<dyn GhClient>,
     git: Arc<dyn GitClient>,
     window_size: usize,
+    enrich_retry_delay: Duration,
 ) {
     while let Ok(req) = req_rx.recv() {
         match req {
@@ -184,12 +200,27 @@ fn run_worker(
                 let repo_enr = repo_root.clone();
                 let tx_enr = res_tx.clone();
                 let gen_enr = generation;
+                let retry_delay = enrich_retry_delay;
                 thread::spawn(move || {
-                    let result = gh_enr.list_prs_enriched(&repo_enr);
-                    let _ = tx_enr.send(Response::ListEnriched {
-                        generation: gen_enr,
-                        result,
-                    });
+                    let mut round = 0usize;
+                    loop {
+                        let result = gh_enr.list_prs_enriched(&repo_enr);
+                        let has_unknown = matches!(
+                            &result,
+                            Ok(es) if es.iter().any(|e| e.mergeable.as_deref() == Some("UNKNOWN"))
+                        );
+                        if tx_enr
+                            .send(Response::ListEnriched { generation: gen_enr, result })
+                            .is_err()
+                        {
+                            return;
+                        }
+                        round += 1;
+                        if !has_unknown || round >= ENRICH_MAX_ROUNDS {
+                            break;
+                        }
+                        thread::sleep(retry_delay);
+                    }
                 });
 
                 let _ = res_tx.send(Response::ListProgress {
@@ -670,5 +701,47 @@ mod tests {
                 other => panic!("unexpected response on generation 42: {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn enrichment_repolls_until_mergeable_resolves() {
+        use crate::data::pr::PrEnrichment;
+
+        let mk_enr = |m: &str| PrEnrichment {
+            number: 7,
+            status_check_rollup: vec![],
+            review_decision: None,
+            mergeable: Some(m.into()),
+        };
+        let gh = FakeGh::new();
+        // First enriched fetch is UNKNOWN → worker must re-poll; second resolves.
+        gh.set_enrichment_sequence(vec![vec![mk_enr("UNKNOWN")], vec![mk_enr("CONFLICTING")]]);
+
+        let git = FakeGit::new("/tmp/repo");
+        let worker = Worker::spawn_with_retry(
+            "/tmp/repo".into(), Arc::new(gh), Arc::new(git), 7, std::time::Duration::from_millis(50),
+        );
+        worker.send(Request::RefreshList { generation: 1 });
+
+        let mut mergeables: Vec<Option<String>> = vec![];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            match worker.rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                Ok(Response::ListEnriched { generation: 1, result: Ok(es) }) => {
+                    mergeables.push(es.first().and_then(|e| e.mergeable.clone()));
+                    if mergeables.iter().any(|m| m.as_deref() == Some("CONFLICTING")) { break; }
+                }
+                Ok(_) => {}
+                Err(_) => {}
+            }
+        }
+        assert_eq!(
+            mergeables.first(), Some(&Some("UNKNOWN".into())),
+            "first ListEnriched should carry UNKNOWN; got {mergeables:?}"
+        );
+        assert!(
+            mergeables.iter().any(|m| m.as_deref() == Some("CONFLICTING")),
+            "re-poll should eventually deliver CONFLICTING; got {mergeables:?}"
+        );
     }
 }
