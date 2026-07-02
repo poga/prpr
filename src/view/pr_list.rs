@@ -265,6 +265,7 @@ fn row_for(pr: &Pr, selected: bool, now: DateTime<Utc>, area_width: u16) -> Line
         .first()
         .map(|l| format!("  [{}]  ", l.name))
         .unwrap_or_else(|| "  ".to_string());
+    let draft_str = if pr.is_draft { "draft  ".to_string() } else { String::new() };
     let author_str = format!("{} ", pr.author.login);
     let age = format!(
         "c{} · u{}",
@@ -277,7 +278,10 @@ fn row_for(pr: &Pr, selected: bool, now: DateTime<Utc>, area_width: u16) -> Line
     // long titles in full and a narrow terminal truncates with "…".
     // Fixed left = "  " + state + " " + ci + " " + review + " " + conflict = 9 cells.
     let left_cols = 9 + pr_num.chars().count();
-    let right_cols = label_str.chars().count() + author_str.chars().count() + age.chars().count();
+    let right_cols = label_str.chars().count()
+        + draft_str.chars().count()
+        + author_str.chars().count()
+        + age.chars().count();
     let title_budget = (area_width as usize)
         .saturating_sub(left_cols)
         .saturating_sub(right_cols)
@@ -295,6 +299,7 @@ fn row_for(pr: &Pr, selected: bool, now: DateTime<Utc>, area_width: u16) -> Line
         Span::styled(pr_num, row_bg.fg(COMMIT_PALETTE[1])),
         Span::styled(truncate(&pr.title, title_budget), row_bg.fg(TEXT)),
         Span::styled(label_str, row_bg.fg(COMMIT_PALETTE[4])),
+        Span::styled(draft_str, row_bg.fg(OVERLAY0)),
         Span::styled(author_str, row_bg.fg(COMMIT_PALETTE[0])),
         Span::styled(age, row_bg.fg(OVERLAY0)),
     ])
@@ -745,5 +750,28 @@ mod tests {
             !line.spans.iter().any(|s| s.style.fg == Some(OVERLAY1) && s.content.contains("Cargo.toml")),
             "top-level file should not have a dim path span"
         );
+    }
+
+    #[test]
+    fn draft_pr_shows_draft_badge() {
+        let now: DateTime<Utc> = "2026-05-06T00:00:00Z".parse().unwrap();
+        let render_all = |st: &PrListState| {
+            let mut term = Terminal::new(TestBackend::new(80, 10)).unwrap();
+            term.draw(|f| { let area = f.area(); render(f, area, st, now); }).unwrap();
+            let buf = term.backend().buffer();
+            (0..buf.area.height).map(|y| buffer_line(buf, y)).collect::<Vec<_>>().join("\n")
+        };
+
+        let mut st = fixture_state();
+        st.prs[0].is_draft = true;
+        let output = render_all(&st);
+        let rows: Vec<&str> = output.lines().skip(3).take(st.prs.len()).collect();
+        assert!(rows[0].contains("draft"), "draft PR should show the 'draft' badge");
+
+        let mut st2 = fixture_state();
+        for p in &mut st2.prs { p.is_draft = false; }
+        let output2 = render_all(&st2);
+        let rows2: Vec<&str> = output2.lines().skip(3).take(st2.prs.len()).collect();
+        assert!(!rows2[0].contains("draft"), "non-draft rows must not show the badge");
     }
 }
