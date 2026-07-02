@@ -26,6 +26,7 @@ use crate::config::Config;
 use crate::data::cache::Cache;
 use crate::data::gh::GhClient;
 use crate::data::git::GitClient;
+use crate::data::pr::{Pr, PrEnrichment};
 use crate::data::worker::{Request, Response, Worker};
 use crate::keys::{Action, FocusedView, MouseAction, dispatch, mouse_dispatch};
 use crate::view::commits_modal::{self, CommitsModalState};
@@ -66,6 +67,15 @@ fn reselect_by_number(prev: Option<u32>, new_numbers: &[u32], old_idx: usize) ->
         return i;
     }
     old_idx.min(new_numbers.len().saturating_sub(1))
+}
+
+/// Merge enriched heavy-fields into matching rows by PR number.
+fn apply_enrichments(prs: &mut [Pr], es: &[PrEnrichment]) {
+    for e in es {
+        if let Some(p) = prs.iter_mut().find(|p| p.number == e.number) {
+            p.apply_enrichment(e);
+        }
+    }
 }
 
 pub type Term = Terminal<CrosstermBackend<Stdout>>;
@@ -114,6 +124,8 @@ pub struct AppState {
     /// Monotonically-incrementing refresh cycle id. Used to drop stale
     /// `ListFast`/`ListEnriched` responses from a superseded refresh.
     pub list_gen: u32,
+    /// Most recent enrichment, kept so a late ListFast can re-apply it.
+    pub enrichment_for_gen: Option<(u32, Vec<PrEnrichment>)>,
 }
 
 impl AppState {
@@ -144,6 +156,7 @@ impl AppState {
             last_refresh_at: None,
             list_refresh_in_flight: false,
             list_gen: 0,
+            enrichment_for_gen: None,
         }
     }
 }
@@ -287,6 +300,11 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
                     .map(|p| p.number);
                 st.list.prs = prs.clone();
                 app.cache.set_list(prs);
+                if let Some((g, es)) = st.enrichment_for_gen.clone()
+                    && g == generation
+                {
+                    apply_enrichments(&mut st.list.prs, &es);
+                }
                 st.list.loading = false;
                 st.list.loading_stage = None;
                 st.list.status = String::new();
@@ -317,13 +335,8 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
             st.list.loading_stage = None;
             st.list.manual_refresh_in_flight = false;
             if let Ok(es) = result {
-                for e in &es {
-                    if let Some(p) =
-                        st.list.prs.iter_mut().find(|p| p.number == e.number)
-                    {
-                        p.apply_enrichment(e);
-                    }
-                }
+                apply_enrichments(&mut st.list.prs, &es);
+                st.enrichment_for_gen = Some((generation, es));
             }
             // Enrichment errors are non-fatal: rows already render with
             // light-fields-only glyphs.
@@ -1518,6 +1531,30 @@ mod tests {
         assert_eq!(by_num[&7].status_check_rollup.len(), 1);
         assert_eq!(by_num[&7].mergeable.as_deref(), Some("CONFLICTING"));
         assert!(by_num[&8].status_check_rollup.is_empty());
+    }
+
+    #[test]
+    fn enrichment_before_fast_is_reapplied_after_fast_lands() {
+        // ListEnriched can beat ListFast within a generation; a resolved
+        // mergeable must survive the wholesale ListFast row replacement.
+        let mut st = dummy_app_state();
+        let mut cache = Cache::new();
+        let mut app = test_app_for_state(&mut cache);
+        st.list_gen = 1;
+        handle_response(&mut app, &mut st, Response::ListEnriched {
+            generation: 1,
+            result: Ok(vec![PrEnrichment {
+                number: 7, status_check_rollup: vec![], review_decision: None,
+                mergeable: Some("CONFLICTING".into()),
+            }]),
+        });
+        handle_response(&mut app, &mut st, Response::ListFast {
+            generation: 1,
+            result: Ok(vec![open_pr(7)]),
+        });
+        let row = st.list.prs.iter().find(|p| p.number == 7).unwrap();
+        assert_eq!(row.mergeable.as_deref(), Some("CONFLICTING"),
+            "enrichment that arrived before ListFast must be re-applied");
     }
 
     #[test]
