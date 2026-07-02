@@ -15,6 +15,8 @@ pub trait GhClient: Send + Sync {
     fn list_prs_enriched(&self, repo_root: &std::path::Path) -> Result<Vec<PrEnrichment>>;
     /// `method` is one of "merge", "squash", "rebase".
     fn merge_pr(&self, repo_root: &std::path::Path, number: u32, method: &str) -> Result<()>;
+    /// Mark ready (draft=false) or convert to draft (draft=true).
+    fn set_pr_draft(&self, repo_root: &std::path::Path, number: u32, draft: bool) -> Result<()>;
 }
 
 pub struct GhCli;
@@ -81,6 +83,16 @@ impl GhClient for GhCli {
             .args(["pr", "merge", &n, flag]))?;
         Ok(())
     }
+
+    fn set_pr_draft(&self, repo_root: &std::path::Path, number: u32, draft: bool) -> Result<()> {
+        let n = number.to_string();
+        let mut args = vec!["pr", "ready", n.as_str()];
+        if draft {
+            args.push("--undo");
+        }
+        run(Command::new("gh").current_dir(repo_root).args(&args))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -96,6 +108,7 @@ pub(crate) mod fakes {
         pub enrichments: Vec<PrEnrichment>,
         pub enrichment_sequence: Mutex<VecDeque<Vec<PrEnrichment>>>,
         pub merges: Mutex<Vec<(u32, String)>>,
+        pub set_drafts: Mutex<Vec<(u32, bool)>>,
     }
 
     impl FakeGh {
@@ -105,6 +118,7 @@ pub(crate) mod fakes {
                 enrichments: vec![],
                 enrichment_sequence: Mutex::new(VecDeque::new()),
                 merges: Mutex::new(vec![]),
+                set_drafts: Mutex::new(vec![]),
             }
         }
         /// Queue successive enriched payloads; each call pops the next one.
@@ -130,6 +144,10 @@ pub(crate) mod fakes {
         }
         fn merge_pr(&self, _root: &std::path::Path, n: u32, m: &str) -> Result<()> {
             self.merges.lock().unwrap().push((n, m.to_string()));
+            Ok(())
+        }
+        fn set_pr_draft(&self, _root: &std::path::Path, n: u32, draft: bool) -> Result<()> {
+            self.set_drafts.lock().unwrap().push((n, draft));
             Ok(())
         }
     }
@@ -211,5 +229,16 @@ mod tests {
         let got = super::GhClient::list_prs_fast(&g, std::path::Path::new("/x")).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].number, 1);
+    }
+
+    #[test]
+    fn fake_records_set_pr_draft_calls() {
+        use super::GhClient;
+        use super::fakes::FakeGh;
+        let g = FakeGh::new();
+        g.set_pr_draft(std::path::Path::new("/x"), 7, true).unwrap();
+        g.set_pr_draft(std::path::Path::new("/x"), 7, false).unwrap();
+        let calls = g.set_drafts.lock().unwrap().clone();
+        assert_eq!(calls, vec![(7, true), (7, false)]);
     }
 }
