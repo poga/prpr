@@ -447,14 +447,15 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
             {
                 d.is_draft = draft;
             }
-            st.list.status = if draft {
+            let msg = if draft {
                 format!("#{number} converted to draft")
             } else {
                 format!("#{number} marked ready for review")
             };
+            set_draft_status(st, number, msg);
         }
         Response::SetDraftDone { number, result: Err(e), .. } => {
-            st.list.status = format!("draft toggle #{number} failed: {e}");
+            set_draft_status(st, number, format!("draft toggle #{number} failed: {e}"));
         }
         Response::ListFiles { number, result } => {
             let sel_number = st
@@ -802,22 +803,38 @@ fn open_merge(st: &mut AppState) {
 }
 
 fn toggle_draft(app: &mut App, st: &mut AppState) {
-    let target = match st.focused {
+    let number = match st.focused {
         FocusedView::Review => st.current_pr,
         _ => st.list.visible_prs().get(st.list.selected).map(|p| p.number),
     };
-    let Some(number) = target else { return };
-    let Some(is_draft) = st.list.prs.iter().find(|p| p.number == number).map(|p| p.is_draft)
-    else {
-        return;
-    };
+    let Some(number) = number else { return };
+    // Prefer the open review detail's flag; fall back to the list row.
+    let is_draft = st
+        .review
+        .as_ref()
+        .and_then(|r| r.detail.as_ref())
+        .filter(|d| d.number == number)
+        .map(|d| d.is_draft)
+        .or_else(|| st.list.prs.iter().find(|p| p.number == number).map(|p| p.is_draft));
+    let Some(is_draft) = is_draft else { return };
     let draft = !is_draft;
     app.request(Request::SetDraft { number, draft });
-    st.list.status = if draft {
+    let msg = if draft {
         format!("converting #{number} to draft…")
     } else {
         format!("marking #{number} ready…")
     };
+    set_draft_status(st, number, msg);
+}
+
+// Route a draft-toggle status to the open review (if it matches) and the list.
+fn set_draft_status(st: &mut AppState, number: u32, msg: String) {
+    if let Some(r) = st.review.as_mut()
+        && r.detail.as_ref().map(|d| d.number) == Some(number)
+    {
+        r.status = msg.clone();
+    }
+    st.list.status = msg;
 }
 
 /// We don't know the precise body height from inside `handle_key`, so we use
@@ -2212,7 +2229,7 @@ mod tests {
         let mut st = dummy_app_state();
         let mut cache = Cache::new();
         let mut app = test_app_for_state(&mut cache);
-        // #7 is ready (open_pr sets is_draft=false); toggling must request draft=true.
+        // open_pr sets is_draft=false, so toggling #7 must request draft=true.
         st.list.prs = vec![open_pr(7)];
         st.list.selected = 0;
         st.focused = FocusedView::List;
@@ -2230,5 +2247,35 @@ mod tests {
             }
         }
         assert!(st.list.status.contains("#7"));
+    }
+
+    #[test]
+    fn toggle_draft_in_review_routes_status_to_review_view() {
+        let mut st = dummy_app_state();
+        let mut cache = Cache::new();
+        let mut app = test_app_for_state(&mut cache);
+        let detail = fixture_pr_detail();
+        let n = detail.number;
+        st.list.prs = vec![open_pr(n)];
+        st.current_pr = Some(n);
+        st.focused = FocusedView::Review;
+        st.review = Some(PrReviewState {
+            detail: Some(detail),
+            status: String::new(),
+            ..Default::default()
+        });
+
+        handle_action(&mut app, &mut st, Action::ToggleDraft);
+        // In-flight message must reach the review view, not just list.status.
+        assert!(st.review.as_ref().unwrap().status.contains(&format!("#{n}")));
+
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::SetDraftDone { number: n, draft: true, result: Ok(()) },
+        );
+        let r = st.review.as_ref().unwrap();
+        assert!(r.detail.as_ref().unwrap().is_draft, "review detail flag flips");
+        assert!(r.status.contains("draft"), "result status shown in review view");
     }
 }
