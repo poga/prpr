@@ -37,6 +37,7 @@ pub enum Request {
         commits: Vec<String>,
     },
     Merge { number: u32, method: String },
+    SetDraft { number: u32, draft: bool },
     ListFiles { number: u32, base_ref: String },
 }
 
@@ -103,6 +104,11 @@ pub enum Response {
     },
     MergeDone {
         number: u32,
+        result: Result<()>,
+    },
+    SetDraftDone {
+        number: u32,
+        draft: bool,
         result: Result<()>,
     },
     /// Inline file list emitted in response to `ListFiles`. `number` is the
@@ -259,6 +265,12 @@ fn run_worker(
             Request::Merge { number, method } => {
                 let result = gh.merge_pr(&repo_root, number, &method);
                 if res_tx.send(Response::MergeDone { number, result }).is_err() {
+                    break;
+                }
+            }
+            Request::SetDraft { number, draft } => {
+                let result = gh.set_pr_draft(&repo_root, number, draft);
+                if res_tx.send(Response::SetDraftDone { number, draft, result }).is_err() {
                     break;
                 }
             }
@@ -701,6 +713,25 @@ mod tests {
                 other => panic!("unexpected response on generation 42: {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn set_draft_request_calls_gh_and_reports_done() {
+        let gh = FakeGh::new();
+        let git = FakeGit::new("/tmp/repo");
+        let worker = Worker::spawn("/tmp/repo".into(), Arc::new(gh), Arc::new(git), 7);
+        worker.send(Request::SetDraft { number: 7, draft: true });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            match worker.rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                Ok(Response::SetDraftDone { number: 7, draft: true, result: Ok(()) }) => return,
+                Ok(Response::SetDraftDone { result: Err(e), .. }) => panic!("unexpected err: {e}"),
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        panic!("never received SetDraftDone");
     }
 
     #[test]

@@ -57,8 +57,13 @@ pub fn render(f: &mut Frame, area: Rect, st: &PrReviewState) {
 fn render_header(f: &mut Frame, area: Rect, st: &PrReviewState) {
     let header = match &st.detail {
         Some(d) => format!(
-            "  prpr · #{} {} · {} · {} ← {}",
-            d.number, d.title, d.author.login, d.base_ref_name, d.head_ref_name,
+            "  prpr · #{} {} · {} · {} ← {}{}",
+            d.number,
+            d.title,
+            d.author.login,
+            d.base_ref_name,
+            d.head_ref_name,
+            if d.is_draft { " · draft" } else { "" },
         ),
         None => "  prpr · loading…".to_string(),
     };
@@ -333,6 +338,34 @@ mod tests {
         let buf = term.backend().buffer();
         let body = buffer_line(buf, 4);
         assert!(body.contains("binary file"), "row 4 was: {:?}", body);
+    }
+
+    #[test]
+    fn header_shows_draft_marker_when_draft() {
+        let mut r = fixture_review_state();
+        r.detail.as_mut().unwrap().is_draft = true;
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| {
+            let area = f.area();
+            render(f, area, &r)
+        })
+        .unwrap();
+        let header = buffer_line(term.backend().buffer(), 0);
+        assert!(header.contains("· draft"), "expected draft marker, got {header:?}");
+    }
+
+    #[test]
+    fn header_hides_draft_marker_when_ready() {
+        let mut r = fixture_review_state();
+        r.detail.as_mut().unwrap().is_draft = false;
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| {
+            let area = f.area();
+            render(f, area, &r)
+        })
+        .unwrap();
+        let header = buffer_line(term.backend().buffer(), 0);
+        assert!(!header.contains("· draft"), "ready PR must not show marker, got {header:?}");
     }
 
     #[test]

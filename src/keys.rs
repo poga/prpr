@@ -16,6 +16,7 @@ pub enum Action {
     ListOpen,
     ListOpenInBrowser,
     ListMerge,
+    ToggleDraft,
     ListRefresh,
     ListSearch,
     ListClearFilter,
@@ -76,6 +77,7 @@ fn list(ev: KeyEvent) -> Action {
         KeyCode::Enter => Action::ListOpen,
         KeyCode::Char('o') => Action::ListOpenInBrowser,
         KeyCode::Char('m') => Action::ListMerge,
+        KeyCode::Char('d') => Action::ToggleDraft,
         KeyCode::Char('/') => Action::ListSearch,
         KeyCode::Esc => Action::ListClearFilter,
         _ => Action::Nothing,
@@ -103,6 +105,7 @@ fn review(ev: KeyEvent) -> Action {
         KeyCode::Char('m') => Action::Merge,
         KeyCode::Char('c') => Action::OpenCommitsModal,
         KeyCode::Char('s') => Action::ToggleShaMargin,
+        KeyCode::Char('d') => Action::ToggleDraft,
         _ => Action::Nothing,
     }
 }
@@ -229,5 +232,15 @@ mod tests {
             dispatch(FocusedView::Review, k('c')),
             Action::OpenCommitsModal,
         );
+    }
+
+    #[test]
+    fn list_d_toggles_draft() {
+        assert_eq!(dispatch(FocusedView::List, k('d')), Action::ToggleDraft);
+    }
+
+    #[test]
+    fn review_d_toggles_draft() {
+        assert_eq!(dispatch(FocusedView::Review, k('d')), Action::ToggleDraft);
     }
 }

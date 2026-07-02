@@ -438,6 +438,25 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
             st.merging = None;
             st.list.status = format!("merge #{number} failed: {e}");
         }
+        Response::SetDraftDone { number, draft, result: Ok(()) } => {
+            if let Some(p) = st.list.prs.iter_mut().find(|p| p.number == number) {
+                p.is_draft = draft;
+            }
+            if let Some(d) = st.review.as_mut().and_then(|r| r.detail.as_mut())
+                && d.number == number
+            {
+                d.is_draft = draft;
+            }
+            let msg = if draft {
+                format!("#{number} converted to draft")
+            } else {
+                format!("#{number} marked ready for review")
+            };
+            set_draft_status(st, number, msg);
+        }
+        Response::SetDraftDone { number, result: Err(e), .. } => {
+            set_draft_status(st, number, format!("draft toggle #{number} failed: {e}"));
+        }
         Response::ListFiles { number, result } => {
             let sel_number = st
                 .list
@@ -666,6 +685,7 @@ fn handle_action(app: &mut App, st: &mut AppState, action: Action) {
             }
         }
         Action::ListMerge => open_merge(st),
+        Action::ToggleDraft => toggle_draft(app, st),
         Action::ListRefresh => {
             send_refresh(app, st, false);
         }
@@ -780,6 +800,41 @@ fn open_merge(st: &mut AppState) {
         });
         st.focused = FocusedView::MergeModal;
     }
+}
+
+fn toggle_draft(app: &mut App, st: &mut AppState) {
+    let number = match st.focused {
+        FocusedView::Review => st.current_pr,
+        _ => st.list.visible_prs().get(st.list.selected).map(|p| p.number),
+    };
+    let Some(number) = number else { return };
+    // Prefer the open review detail's flag; fall back to the list row.
+    let is_draft = st
+        .review
+        .as_ref()
+        .and_then(|r| r.detail.as_ref())
+        .filter(|d| d.number == number)
+        .map(|d| d.is_draft)
+        .or_else(|| st.list.prs.iter().find(|p| p.number == number).map(|p| p.is_draft));
+    let Some(is_draft) = is_draft else { return };
+    let draft = !is_draft;
+    app.request(Request::SetDraft { number, draft });
+    let msg = if draft {
+        format!("converting #{number} to draft…")
+    } else {
+        format!("marking #{number} ready…")
+    };
+    set_draft_status(st, number, msg);
+}
+
+// Route a draft-toggle status to the open review (if it matches) and the list.
+fn set_draft_status(st: &mut AppState, number: u32, msg: String) {
+    if let Some(r) = st.review.as_mut()
+        && r.detail.as_ref().map(|d| d.number) == Some(number)
+    {
+        r.status = msg.clone();
+    }
+    st.list.status = msg;
 }
 
 /// We don't know the precise body height from inside `handle_key`, so we use
@@ -1893,6 +1948,50 @@ mod tests {
     }
 
     #[test]
+    fn set_draft_done_flips_local_flag_without_refresh() {
+        let mut st = dummy_app_state();
+        let mut cache = Cache::new();
+        let mut app = test_app_for_state(&mut cache);
+        st.list_gen = 1;
+        st.list.prs = vec![open_pr(5), open_pr(7), open_pr(8)];
+        let prior_gen = st.list_gen;
+
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::SetDraftDone { number: 7, draft: true, result: Ok(()) },
+        );
+
+        let row = st.list.prs.iter().find(|p| p.number == 7).unwrap();
+        assert!(row.is_draft, "row #7 should now be draft");
+        assert_eq!(st.list_gen, prior_gen, "no new refresh generation");
+        assert!(!st.list_refresh_in_flight);
+        assert!(!st.list.loading);
+        assert!(st.list.status.contains("#7"));
+    }
+
+    #[test]
+    fn set_draft_done_err_leaves_flag_and_shows_error() {
+        let mut st = dummy_app_state();
+        let mut cache = Cache::new();
+        let mut app = test_app_for_state(&mut cache);
+        st.list.prs = vec![open_pr(7)];
+
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::SetDraftDone {
+                number: 7,
+                draft: true,
+                result: Err(anyhow::anyhow!("boom")),
+            },
+        );
+
+        assert!(!st.list.prs[0].is_draft, "flag must not change on failure");
+        assert!(st.list.status.contains("failed"));
+    }
+
+    #[test]
     fn pr_detail_response_populates_review_state_detail() {
         let detail = fixture_pr_detail();
         let number = detail.number;
@@ -2123,5 +2222,60 @@ mod tests {
 
         let r = st.review.as_ref().unwrap();
         assert!(matches!(r.colors.get(&path), Some(crate::view::pr_review::ColorState::Ready(_))));
+    }
+
+    #[test]
+    fn toggle_draft_action_sends_inverted_state() {
+        let mut st = dummy_app_state();
+        let mut cache = Cache::new();
+        let mut app = test_app_for_state(&mut cache);
+        // open_pr sets is_draft=false, so toggling #7 must request draft=true.
+        st.list.prs = vec![open_pr(7)];
+        st.list.selected = 0;
+        st.focused = FocusedView::List;
+
+        handle_action(&mut app, &mut st, Action::ToggleDraft);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            assert!(std::time::Instant::now() < deadline, "no SetDraftDone");
+            if let Ok(Response::SetDraftDone { number: 7, draft, result: Ok(()) }) =
+                app.worker.rx.recv_timeout(std::time::Duration::from_millis(200))
+            {
+                assert!(draft, "ready PR must toggle to draft=true");
+                break;
+            }
+        }
+        assert!(st.list.status.contains("#7"));
+    }
+
+    #[test]
+    fn toggle_draft_in_review_routes_status_to_review_view() {
+        let mut st = dummy_app_state();
+        let mut cache = Cache::new();
+        let mut app = test_app_for_state(&mut cache);
+        let detail = fixture_pr_detail();
+        let n = detail.number;
+        st.list.prs = vec![open_pr(n)];
+        st.current_pr = Some(n);
+        st.focused = FocusedView::Review;
+        st.review = Some(PrReviewState {
+            detail: Some(detail),
+            status: String::new(),
+            ..Default::default()
+        });
+
+        handle_action(&mut app, &mut st, Action::ToggleDraft);
+        // In-flight message must reach the review view, not just list.status.
+        assert!(st.review.as_ref().unwrap().status.contains(&format!("#{n}")));
+
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::SetDraftDone { number: n, draft: true, result: Ok(()) },
+        );
+        let r = st.review.as_ref().unwrap();
+        assert!(r.detail.as_ref().unwrap().is_draft, "review detail flag flips");
+        assert!(r.status.contains("draft"), "result status shown in review view");
     }
 }
