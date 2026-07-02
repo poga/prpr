@@ -113,8 +113,7 @@ pub enum Response {
     },
 }
 
-/// GitHub computes mergeability lazily; the enriched pass often returns
-/// "UNKNOWN" until a background job finishes. Re-poll to resolve it.
+/// GitHub computes mergeability lazily; re-poll to resolve "UNKNOWN".
 const ENRICH_MAX_ROUNDS: usize = 3;
 const ENRICH_RETRY_DELAY: Duration = Duration::from_secs(2);
 
@@ -217,7 +216,7 @@ fn run_worker(
                             return;
                         }
                         round += 1;
-                        if !has_unknown || round == ENRICH_MAX_ROUNDS {
+                        if !has_unknown || round >= ENRICH_MAX_ROUNDS {
                             break;
                         }
                         thread::sleep(retry_delay);
@@ -709,7 +708,9 @@ mod tests {
         use crate::data::pr::PrEnrichment;
 
         let mk_enr = |m: &str| PrEnrichment {
-            number: 7, status_check_rollup: vec![], review_decision: None,
+            number: 7,
+            status_check_rollup: vec![],
+            review_decision: None,
             mergeable: Some(m.into()),
         };
         let gh = FakeGh::new();

@@ -758,24 +758,22 @@ mod tests {
     #[test]
     fn draft_pr_shows_draft_badge() {
         let now: DateTime<Utc> = "2026-05-06T00:00:00Z".parse().unwrap();
-        let render_all = |st: &PrListState| {
-            let mut term = Terminal::new(TestBackend::new(80, 10)).unwrap();
-            term.draw(|f| { let area = f.area(); render(f, area, st, now); }).unwrap();
-            let buf = term.backend().buffer();
-            (0..buf.area.height).map(|y| buffer_line(buf, y)).collect::<Vec<_>>().join("\n")
+        let mk = |is_draft: bool| Pr {
+            number: 1, title: "t".into(), is_draft, state: PrState::Open,
+            author: crate::data::pr::Author { login: "a".into() },
+            created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            updated_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            base_ref_name: "main".into(), head_ref_name: "f".into(),
+            labels: vec![], status_check_rollup: vec![],
+            review_decision: None, mergeable: None,
         };
+        let has_badge = |line: &Line| line.spans.iter().any(|s| s.content == "draft  ");
 
-        let mut st = fixture_state();
-        st.prs[0].is_draft = true;
-        let output = render_all(&st);
-        let rows: Vec<&str> = output.lines().skip(3).take(st.prs.len()).collect();
-        assert!(rows[0].contains("draft"), "draft PR should show the 'draft' badge");
+        let draft = row_for(&mk(true), false, now, 80);
+        assert!(has_badge(&draft), "draft PR should show the 'draft' badge");
 
-        let mut st2 = fixture_state();
-        for p in &mut st2.prs { p.is_draft = false; }
-        let output2 = render_all(&st2);
-        let rows2: Vec<&str> = output2.lines().skip(3).take(st2.prs.len()).collect();
-        assert!(!rows2[0].contains("draft"), "non-draft rows must not show the badge");
+        let not_draft = row_for(&mk(false), false, now, 80);
+        assert!(!has_badge(&not_draft), "non-draft rows must not show the badge");
     }
 
     #[test]
