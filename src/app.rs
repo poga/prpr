@@ -684,6 +684,7 @@ fn handle_action(app: &mut App, st: &mut AppState, action: Action) {
             }
         }
         Action::ListMerge => open_merge(st),
+        Action::ToggleDraft => toggle_draft(app, st),
         Action::ListRefresh => {
             send_refresh(app, st, false);
         }
@@ -798,6 +799,25 @@ fn open_merge(st: &mut AppState) {
         });
         st.focused = FocusedView::MergeModal;
     }
+}
+
+fn toggle_draft(app: &mut App, st: &mut AppState) {
+    let target = match st.focused {
+        FocusedView::Review => st.current_pr,
+        _ => st.list.visible_prs().get(st.list.selected).map(|p| p.number),
+    };
+    let Some(number) = target else { return };
+    let Some(is_draft) = st.list.prs.iter().find(|p| p.number == number).map(|p| p.is_draft)
+    else {
+        return;
+    };
+    let draft = !is_draft;
+    app.request(Request::SetDraft { number, draft });
+    st.list.status = if draft {
+        format!("converting #{number} to draft…")
+    } else {
+        format!("marking #{number} ready…")
+    };
 }
 
 /// We don't know the precise body height from inside `handle_key`, so we use
@@ -2185,5 +2205,30 @@ mod tests {
 
         let r = st.review.as_ref().unwrap();
         assert!(matches!(r.colors.get(&path), Some(crate::view::pr_review::ColorState::Ready(_))));
+    }
+
+    #[test]
+    fn toggle_draft_action_sends_inverted_state() {
+        let mut st = dummy_app_state();
+        let mut cache = Cache::new();
+        let mut app = test_app_for_state(&mut cache);
+        // #7 is ready (open_pr sets is_draft=false); toggling must request draft=true.
+        st.list.prs = vec![open_pr(7)];
+        st.list.selected = 0;
+        st.focused = FocusedView::List;
+
+        handle_action(&mut app, &mut st, Action::ToggleDraft);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            assert!(std::time::Instant::now() < deadline, "no SetDraftDone");
+            if let Ok(Response::SetDraftDone { number: 7, draft, result: Ok(()) }) =
+                app.worker.rx.recv_timeout(std::time::Duration::from_millis(200))
+            {
+                assert!(draft, "ready PR must toggle to draft=true");
+                break;
+            }
+        }
+        assert!(st.list.status.contains("#7"));
     }
 }
