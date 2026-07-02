@@ -7,7 +7,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::data::pr::{CiState, Pr, PrState, ReviewDecision};
+use crate::data::pr::{CiState, MergeState, Pr, PrState, ReviewDecision};
 use crate::data::worker::ListStage;
 use crate::render::spinner;
 use crate::render::style::*;
@@ -210,7 +210,7 @@ fn render_footer(f: &mut Frame, area: Rect, st: &PrListState) {
     } else {
         f.render_widget(
             Paragraph::new(
-                "  state ●open ○draft   ci ✓pass ✗fail …pend   review ✓approved !changes ·pending   ⚠conflict",
+                "  state ●open ○draft   ci ✓pass ✗fail …pend   review ✓approved !changes ·pending   ⚠conflict ?checking",
             )
             .style(Style::default().fg(OVERLAY0)),
             chunks[1],
@@ -251,10 +251,13 @@ fn row_for(pr: &Pr, selected: bool, now: DateTime<Utc>, area_width: u16) -> Line
         }
         _ => Span::styled("·", Style::default().fg(COMMIT_PALETTE[1])),
     };
-    // Conflict marker only fires for OPEN PRs; merged/closed PRs report stale
-    // mergeability that's no longer actionable.
-    let conflict_glyph = if pr.state == PrState::Open && pr.is_conflicting() {
-        Span::styled("⚠", Style::default().fg(DIFF_DEL_FG))
+    // Merge marker for OPEN PRs only; stale mergeability isn't actionable.
+    let conflict_glyph = if pr.state == PrState::Open {
+        match pr.merge_state() {
+            Some(MergeState::Conflicting) => Span::styled("⚠", Style::default().fg(DIFF_DEL_FG)),
+            Some(MergeState::Unknown) => Span::styled("?", Style::default().fg(OVERLAY0)),
+            _ => Span::styled(" ", Style::default()),
+        }
     } else {
         Span::styled(" ", Style::default())
     };
@@ -773,5 +776,31 @@ mod tests {
         let output2 = render_all(&st2);
         let rows2: Vec<&str> = output2.lines().skip(3).take(st2.prs.len()).collect();
         assert!(!rows2[0].contains("draft"), "non-draft rows must not show the badge");
+    }
+
+    #[test]
+    fn unknown_mergeable_open_pr_shows_checking_marker() {
+        let now: DateTime<Utc> = "2026-05-06T00:00:00Z".parse().unwrap();
+        let mk = |m: &str| Pr {
+            number: 1, title: "t".into(), is_draft: false, state: PrState::Open,
+            author: crate::data::pr::Author { login: "a".into() },
+            created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            updated_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            base_ref_name: "main".into(), head_ref_name: "f".into(),
+            labels: vec![], status_check_rollup: vec![],
+            review_decision: None, mergeable: Some(m.into()),
+        };
+        let has = |line: &Line, glyph: &str| line.spans.iter().any(|s| s.content == glyph);
+
+        let unknown = row_for(&mk("UNKNOWN"), false, now, 80);
+        assert!(has(&unknown, "?"), "UNKNOWN row should show '?'");
+        assert!(!has(&unknown, "⚠"), "UNKNOWN row must not show '⚠'");
+
+        let conflicting = row_for(&mk("CONFLICTING"), false, now, 80);
+        assert!(has(&conflicting, "⚠"), "CONFLICTING row should show '⚠'");
+
+        let mergeable = row_for(&mk("MERGEABLE"), false, now, 80);
+        assert!(!has(&mergeable, "?"), "MERGEABLE row must not show '?'");
+        assert!(!has(&mergeable, "⚠"), "MERGEABLE row must not show '⚠'");
     }
 }
