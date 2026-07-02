@@ -438,6 +438,24 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
             st.merging = None;
             st.list.status = format!("merge #{number} failed: {e}");
         }
+        Response::SetDraftDone { number, draft, result: Ok(()) } => {
+            if let Some(p) = st.list.prs.iter_mut().find(|p| p.number == number) {
+                p.is_draft = draft;
+            }
+            if let Some(d) = st.review.as_mut().and_then(|r| r.detail.as_mut())
+                && d.number == number
+            {
+                d.is_draft = draft;
+            }
+            st.list.status = if draft {
+                format!("#{number} converted to draft")
+            } else {
+                format!("#{number} marked ready for review")
+            };
+        }
+        Response::SetDraftDone { number, result: Err(e), .. } => {
+            st.list.status = format!("draft toggle #{number} failed: {e}");
+        }
         Response::ListFiles { number, result } => {
             let sel_number = st
                 .list
@@ -1890,6 +1908,50 @@ mod tests {
         assert_eq!(nums, vec![5, 8]);
         // #5 is still at index 0.
         assert_eq!(st.list.selected, 0);
+    }
+
+    #[test]
+    fn set_draft_done_flips_local_flag_without_refresh() {
+        let mut st = dummy_app_state();
+        let mut cache = Cache::new();
+        let mut app = test_app_for_state(&mut cache);
+        st.list_gen = 1;
+        st.list.prs = vec![open_pr(5), open_pr(7), open_pr(8)];
+        let prior_gen = st.list_gen;
+
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::SetDraftDone { number: 7, draft: true, result: Ok(()) },
+        );
+
+        let row = st.list.prs.iter().find(|p| p.number == 7).unwrap();
+        assert!(row.is_draft, "row #7 should now be draft");
+        assert_eq!(st.list_gen, prior_gen, "no new refresh generation");
+        assert!(!st.list_refresh_in_flight);
+        assert!(!st.list.loading);
+        assert!(st.list.status.contains("#7"));
+    }
+
+    #[test]
+    fn set_draft_done_err_leaves_flag_and_shows_error() {
+        let mut st = dummy_app_state();
+        let mut cache = Cache::new();
+        let mut app = test_app_for_state(&mut cache);
+        st.list.prs = vec![open_pr(7)];
+
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::SetDraftDone {
+                number: 7,
+                draft: true,
+                result: Err(anyhow::anyhow!("boom")),
+            },
+        );
+
+        assert!(!st.list.prs[0].is_draft, "flag must not change on failure");
+        assert!(st.list.status.contains("failed"));
     }
 
     #[test]
