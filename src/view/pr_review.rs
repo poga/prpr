@@ -217,7 +217,7 @@ fn render_status(f: &mut Frame, area: Rect, st: &PrReviewState) {
     );
     f.render_widget(
         Paragraph::new(
-            "  Tab/↵ next file   Shift-Tab prev   f files   c commits   m merge   s sha   ? help   q back",
+            "  Tab/↵ next file   Shift-Tab prev   f files   c commits   m merge   d draft   s sha   ? help   q back",
         )
         .style(Style::default().fg(OVERLAY0)),
         chunks[2],
