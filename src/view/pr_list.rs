@@ -172,7 +172,7 @@ fn render_footer(f: &mut Frame, area: Rect, st: &PrListState) {
         .constraints([Constraint::Length(1), Constraint::Length(1)])
         .split(area);
     f.render_widget(
-        Paragraph::new("  ↵ open   o browser   m merge   r refresh   / search   q quit")
+        Paragraph::new("  ↵ open   o browser   m merge   d draft   r refresh   / search   q quit")
             .style(Style::default().fg(OVERLAY1)),
         chunks[0],
     );
