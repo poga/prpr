@@ -779,6 +779,8 @@ mod tests {
 
         let draft = row_for(&mk(true), false, now, 80);
         assert!(has_badge(&draft), "draft PR should show the 'draft' badge");
+        let badge = draft.spans.iter().find(|s| s.content == "draft  ").unwrap();
+        assert_eq!(badge.style.fg, Some(DRAFT_ACCENT), "draft word must use DRAFT_ACCENT");
 
         let not_draft = row_for(&mk(false), false, now, 80);
         assert!(!has_badge(&not_draft), "non-draft rows must not show the badge");
@@ -803,6 +805,10 @@ mod tests {
         // Ready row does not.
         let ready = row_for(&mk(false), false, now, 80);
         assert_ne!(ready.spans[0].content, "▎", "ready row must not show the rail");
+        // Lead is 2 cells before the state glyph: ▎+space (draft) or two spaces.
+        assert_eq!(draft.spans[1].content, " ");
+        assert_eq!(ready.spans[0].content, " ");
+        assert_eq!(ready.spans[1].content, " ");
     }
 
     #[test]
