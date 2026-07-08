@@ -276,8 +276,7 @@ fn row_for(pr: &Pr, selected: bool, now: DateTime<Utc>, area_width: u16) -> Line
         humanize_age(pr.updated_at, now),
     );
 
-    // Draft rows lead with a peach rail; ready rows keep the blank indent.
-    // Either way it is 1 cell, so the row stays 2 cells before the state glyph.
+    // Rail is 1 cell (▎ for drafts, blank otherwise); row stays 2 cells wide.
     let rail = if pr.is_draft {
         Span::styled("▎", row_bg.fg(DRAFT_ACCENT))
     } else {
@@ -287,7 +286,7 @@ fn row_for(pr: &Pr, selected: bool, now: DateTime<Utc>, area_width: u16) -> Line
     // Layout widths. Title takes whatever's left after the fixed-width
     // glyphs and the variable-width right side, so a wide terminal shows
     // long titles in full and a narrow terminal truncates with "…".
-    // Fixed left = "  " + state + " " + ci + " " + review + " " + conflict = 9 cells.
+    // Fixed left = 9 cells: rail, state, ci, review, conflict + 4 gap spaces.
     let left_cols = 9 + pr_num.chars().count();
     let right_cols = label_str.chars().count()
         + draft_str.chars().count()
