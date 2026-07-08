@@ -233,7 +233,7 @@ fn row_for(pr: &Pr, selected: bool, now: DateTime<Utc>, area_width: u16) -> Line
     };
 
     let state_glyph = match pr.state {
-        _ if pr.is_draft => Span::styled("○", Style::default().fg(OVERLAY0)),
+        _ if pr.is_draft => Span::styled("○", Style::default().fg(DRAFT_ACCENT)),
         PrState::Open => Span::styled("●", Style::default().fg(DIFF_ADD_FG)),
         PrState::Closed => Span::styled("●", Style::default().fg(DIFF_DEL_FG)),
         PrState::Merged => Span::styled("●", Style::default().fg(COMMIT_PALETTE[1])),
@@ -276,6 +276,14 @@ fn row_for(pr: &Pr, selected: bool, now: DateTime<Utc>, area_width: u16) -> Line
         humanize_age(pr.updated_at, now),
     );
 
+    // Draft rows lead with a peach rail; ready rows keep the blank indent.
+    // Either way it is 1 cell, so the row stays 2 cells before the state glyph.
+    let rail = if pr.is_draft {
+        Span::styled("▎", row_bg.fg(DRAFT_ACCENT))
+    } else {
+        Span::styled(" ", row_bg)
+    };
+
     // Layout widths. Title takes whatever's left after the fixed-width
     // glyphs and the variable-width right side, so a wide terminal shows
     // long titles in full and a narrow terminal truncates with "…".
@@ -291,7 +299,8 @@ fn row_for(pr: &Pr, selected: bool, now: DateTime<Utc>, area_width: u16) -> Line
         .max(8);
 
     Line::from(vec![
-        Span::styled("  ", row_bg),
+        rail,
+        Span::styled(" ", row_bg),
         state_glyph,
         Span::styled(" ", row_bg),
         ci_glyph,
@@ -302,7 +311,7 @@ fn row_for(pr: &Pr, selected: bool, now: DateTime<Utc>, area_width: u16) -> Line
         Span::styled(pr_num, row_bg.fg(COMMIT_PALETTE[1])),
         Span::styled(truncate(&pr.title, title_budget), row_bg.fg(TEXT)),
         Span::styled(label_str, row_bg.fg(COMMIT_PALETTE[4])),
-        Span::styled(draft_str, row_bg.fg(OVERLAY0)),
+        Span::styled(draft_str, row_bg.fg(DRAFT_ACCENT)),
         Span::styled(author_str, row_bg.fg(COMMIT_PALETTE[0])),
         Span::styled(age, row_bg.fg(OVERLAY0)),
     ])
@@ -774,6 +783,44 @@ mod tests {
 
         let not_draft = row_for(&mk(false), false, now, 80);
         assert!(!has_badge(&not_draft), "non-draft rows must not show the badge");
+    }
+
+    #[test]
+    fn draft_row_shows_peach_rail() {
+        let now: DateTime<Utc> = "2026-05-06T00:00:00Z".parse().unwrap();
+        let mk = |is_draft: bool| Pr {
+            number: 1, title: "t".into(), is_draft, state: PrState::Open,
+            author: crate::data::pr::Author { login: "a".into() },
+            created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            updated_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            base_ref_name: "main".into(), head_ref_name: "f".into(),
+            labels: vec![], status_check_rollup: vec![],
+            review_decision: None, mergeable: None,
+        };
+        // Draft row leads with the rail glyph, painted in the draft accent.
+        let draft = row_for(&mk(true), false, now, 80);
+        assert_eq!(draft.spans[0].content, "▎", "draft row must lead with the rail glyph");
+        assert_eq!(draft.spans[0].style.fg, Some(DRAFT_ACCENT), "rail must use DRAFT_ACCENT");
+        // Ready row does not.
+        let ready = row_for(&mk(false), false, now, 80);
+        assert_ne!(ready.spans[0].content, "▎", "ready row must not show the rail");
+    }
+
+    #[test]
+    fn draft_state_glyph_is_peach() {
+        let now: DateTime<Utc> = "2026-05-06T00:00:00Z".parse().unwrap();
+        let draft = Pr {
+            number: 1, title: "t".into(), is_draft: true, state: PrState::Open,
+            author: crate::data::pr::Author { login: "a".into() },
+            created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            updated_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            base_ref_name: "main".into(), head_ref_name: "f".into(),
+            labels: vec![], status_check_rollup: vec![],
+            review_decision: None, mergeable: None,
+        };
+        let line = row_for(&draft, false, now, 80);
+        let circle = line.spans.iter().find(|s| s.content == "○").expect("draft shows ○");
+        assert_eq!(circle.style.fg, Some(DRAFT_ACCENT), "draft ○ must use DRAFT_ACCENT");
     }
 
     #[test]
