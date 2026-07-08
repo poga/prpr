@@ -11,6 +11,9 @@ pub const SURFACE2: Color = Color::Rgb(0x58, 0x5b, 0x70);
 pub const OVERLAY0: Color = Color::Rgb(0x6c, 0x70, 0x86);
 pub const OVERLAY1: Color = Color::Rgb(0x7f, 0x84, 0x9c);
 
+// Draft accent — peach; marks draft PRs as a distinct band.
+pub const DRAFT_ACCENT: Color = Color::Rgb(0xfa, 0xb3, 0x87);
+
 // Text
 pub const TEXT: Color = Color::Rgb(0xcd, 0xd6, 0xf4);
 pub const SUBTEXT0: Color = Color::Rgb(0xa6, 0xad, 0xc8);
