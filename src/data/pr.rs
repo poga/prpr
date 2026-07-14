@@ -131,7 +131,19 @@ impl Pr {
     pub fn apply_enrichment(&mut self, e: &PrEnrichment) {
         self.status_check_rollup = e.status_check_rollup.clone();
         self.review_decision = e.review_decision;
-        self.mergeable = e.mergeable.clone();
+        // GitHub answers UNKNOWN while computing; only a definite verdict may
+        // overwrite one we already resolved.
+        let incoming_definite = matches!(
+            e.mergeable.as_deref(),
+            Some("MERGEABLE") | Some("CONFLICTING")
+        );
+        let have_definite = matches!(
+            self.merge_state(),
+            Some(MergeState::Mergeable) | Some(MergeState::Conflicting)
+        );
+        if incoming_definite || !have_definite {
+            self.mergeable = e.mergeable.clone();
+        }
     }
 }
 
@@ -363,6 +375,37 @@ mod tests {
         assert_eq!(p.mergeable.as_deref(), Some("MERGEABLE"));
         assert_eq!(p.title, "t");
         assert_eq!(p.labels.len(), 1);
+    }
+
+    /// A cold `gh pr list` answers UNKNOWN, and that reply lands right after
+    /// the locally-computed state. It must not erase the resolved answer.
+    #[test]
+    fn enrichment_never_downgrades_resolved_mergeable_to_unknown() {
+        let mut p = Pr {
+            number: 7, title: "t".into(), is_draft: false, state: PrState::Open,
+            author: Author { login: "a".into() },
+            created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            updated_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            base_ref_name: String::new(), head_ref_name: String::new(),
+            labels: vec![], status_check_rollup: vec![],
+            review_decision: None, mergeable: Some("CONFLICTING".into()),
+        };
+        let enr = |m: Option<&str>| PrEnrichment {
+            number: 7,
+            status_check_rollup: vec![],
+            review_decision: None,
+            mergeable: m.map(str::to_string),
+        };
+
+        p.apply_enrichment(&enr(Some("UNKNOWN")));
+        assert!(p.is_conflicting(), "UNKNOWN must not clear a known conflict");
+        p.apply_enrichment(&enr(None));
+        assert!(p.is_conflicting(), "a missing mergeable must not clear a known conflict");
+
+        // A definite answer from GitHub still wins: conflicts do get resolved.
+        p.apply_enrichment(&enr(Some("MERGEABLE")));
+        assert_eq!(p.mergeable.as_deref(), Some("MERGEABLE"),
+            "a definite GitHub verdict must override the earlier state");
     }
 
     #[test]
