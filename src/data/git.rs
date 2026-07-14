@@ -62,6 +62,10 @@ pub trait GitClient: Send + Sync {
     /// advanced since the PR opened doesn't leak its own changes into the
     /// PR's file list. Returns one `FileMeta` per changed file.
     fn diff_numstat(&self, repo_root: &Path, base: &str, head: &str) -> Result<Vec<crate::data::pr::FileMeta>>;
+    /// True if merging `head` into `base` conflicts. Answered from the local
+    /// refs because GitHub computes `mergeable` lazily: a cold query says
+    /// UNKNOWN, so the list would otherwise draw with no conflict marker.
+    fn merge_conflicts(&self, repo_root: &Path, base: &str, head: &str) -> Result<bool>;
 }
 
 pub struct GitCli;
@@ -221,6 +225,31 @@ impl GitClient for GitCli {
             .with_context(|| "`git diff --numstat` returned non-UTF-8")?;
         parse_numstat(&raw)
     }
+
+    fn merge_conflicts(&self, repo_root: &Path, base: &str, head: &str) -> Result<bool> {
+        // Merges in memory; the worktree and index are never touched.
+        let out = Command::new("git")
+            .current_dir(repo_root)
+            .args(["merge-tree", "--write-tree", "--no-messages", base, head])
+            .output()
+            .with_context(|| format!("failed to spawn: git merge-tree {base} {head}"))?;
+        // Exit 1 also covers an unmergeable ref, so it can't be trusted alone.
+        // Only a merge git really performed writes a tree oid to stdout.
+        let merged = out
+            .stdout
+            .split(|b| *b == b'\n')
+            .next()
+            .is_some_and(|l| !l.is_empty() && l.iter().all(u8::is_ascii_hexdigit));
+        match out.status.code() {
+            Some(0) if merged => Ok(false),
+            Some(1) if merged => Ok(true),
+            _ => Err(anyhow!(
+                "git merge-tree {base} {head} exited with {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            )),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -328,6 +357,77 @@ mod tests {
              modified on base only and must not appear"
         );
     }
+
+    /// GitHub computes `mergeable` lazily, so a cold `gh pr list` answers
+    /// UNKNOWN. Conflict state must instead come from the local refs, which
+    /// are already fetched before the list draws.
+    #[test]
+    fn merge_conflicts_detects_conflicting_and_clean_merges() {
+        use std::process::Command;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let run_git = |args: &[&str]| {
+            let out = Command::new("git")
+                .current_dir(root)
+                .args(args)
+                .output()
+                .expect("spawn git");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap()
+        };
+        run_git(&["init", "-q", "-b", "main"]);
+        run_git(&["config", "user.email", "t@example.com"]);
+        run_git(&["config", "user.name", "t"]);
+        run_git(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(root.join("a.txt"), "base\n").unwrap();
+        run_git(&["add", "."]);
+        run_git(&["commit", "-q", "-m", "c0"]);
+
+        // Conflicting PR: edits the same line the base later rewrites.
+        run_git(&["checkout", "-q", "-b", "pr-conflict"]);
+        std::fs::write(root.join("a.txt"), "from-pr\n").unwrap();
+        run_git(&["commit", "-q", "-am", "pr edit"]);
+        // Clean PR: branches off the same commit but touches another file.
+        run_git(&["checkout", "-q", "-b", "pr-clean", "main"]);
+        std::fs::write(root.join("b.txt"), "unrelated\n").unwrap();
+        run_git(&["add", "."]);
+        run_git(&["commit", "-q", "-m", "pr add"]);
+        // Base advances, rewriting the line the conflicting PR touched.
+        run_git(&["checkout", "-q", "main"]);
+        std::fs::write(root.join("a.txt"), "from-main\n").unwrap();
+        run_git(&["commit", "-q", "-am", "main edit"]);
+
+        assert!(
+            GitCli.merge_conflicts(root, "main", "pr-conflict").unwrap(),
+            "PR editing the same line as the base must report a conflict"
+        );
+        assert!(
+            !GitCli.merge_conflicts(root, "main", "pr-clean").unwrap(),
+            "PR touching an unrelated file must merge cleanly"
+        );
+    }
+
+    /// An unresolvable ref is an error, not a silent "no conflict" — a bad
+    /// ref must never be reported to the user as a mergeable PR.
+    #[test]
+    fn merge_conflicts_errors_on_unknown_ref() {
+        use std::process::Command;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        Command::new("git")
+            .current_dir(root)
+            .args(["init", "-q", "-b", "main"])
+            .output()
+            .expect("spawn git");
+        assert!(
+            GitCli.merge_conflicts(root, "origin/main", "refs/prpr/pr-999").is_err(),
+            "missing refs must surface as an error"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -351,6 +451,8 @@ pub(crate) mod fakes {
         pub log_patches: HashMap<(String, String, String), String>,
         /// Keyed by (base, head) → numstat file list.
         pub numstats: HashMap<(String, String), Vec<crate::data::pr::FileMeta>>,
+        /// Keyed by (base, head) → conflict verdict. Missing keys merge clean.
+        pub conflicts: HashMap<(String, String), bool>,
     }
 
     impl FakeGit {
@@ -364,6 +466,7 @@ pub(crate) mod fakes {
                 diffs: HashMap::new(),
                 log_patches: HashMap::new(),
                 numstats: HashMap::new(),
+                conflicts: HashMap::new(),
             }
         }
     }
@@ -420,6 +523,13 @@ pub(crate) mod fakes {
                 .get(&(base.into(), head.into()))
                 .cloned()
                 .ok_or_else(|| anyhow!("no fake numstat for {base}..{head}"))
+        }
+        fn merge_conflicts(&self, _root: &Path, base: &str, head: &str) -> Result<bool> {
+            Ok(self
+                .conflicts
+                .get(&(base.into(), head.into()))
+                .copied()
+                .unwrap_or(false))
         }
     }
 }

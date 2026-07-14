@@ -23,6 +23,7 @@ use crate::data::diff::parse_diff;
 use crate::data::gh::GhClient;
 use crate::data::git::GitClient;
 use crate::data::log_patches::parse_deletions;
+use crate::data::pr::Pr;
 use crate::render::attribution::{attribute_file, commit_stats_for_file};
 
 #[derive(Debug)]
@@ -122,6 +123,49 @@ pub enum Response {
 /// GitHub computes mergeability lazily; re-poll to resolve "UNKNOWN".
 const ENRICH_MAX_ROUNDS: usize = 3;
 const ENRICH_RETRY_DELAY: Duration = Duration::from_secs(2);
+
+/// Upper bound on concurrent `git merge-tree` subprocesses.
+const MERGE_CHECK_THREADS: usize = 8;
+
+/// Stamp each open PR's conflict state from the refs just fetched, so the
+/// first draw has it: GitHub computes `mergeable` lazily and answers UNKNOWN
+/// to a cold query. Refs git can't merge stay unset for enrichment to fill.
+fn apply_local_merge_states(git: &dyn GitClient, repo_root: &Path, prs: &mut [Pr]) {
+    let targets: Vec<(usize, String, String)> = prs
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.state == crate::data::pr::PrState::Open)
+        .map(|(i, p)| {
+            (i, format!("origin/{}", p.base_ref_name), format!("refs/prpr/pr-{}", p.number))
+        })
+        .collect();
+    if targets.is_empty() {
+        return;
+    }
+
+    // ~12ms per PR; serial checks would stall the draw on a 200-PR repo.
+    let chunk = targets.len().div_ceil(MERGE_CHECK_THREADS.min(targets.len()));
+    let verdicts: Vec<(usize, bool)> = thread::scope(|s| {
+        let handles: Vec<_> = targets
+            .chunks(chunk)
+            .map(|c| {
+                s.spawn(move || {
+                    c.iter()
+                        .filter_map(|(i, base, head)| {
+                            git.merge_conflicts(repo_root, base, head).ok().map(|c| (*i, c))
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
+    });
+
+    for (i, conflicting) in verdicts {
+        prs[i].mergeable =
+            Some(if conflicting { "CONFLICTING" } else { "MERGEABLE" }.to_string());
+    }
+}
 
 pub struct Worker {
     /// Wrapped in `Option` so `Drop` can take and drop the sender BEFORE
@@ -235,7 +279,7 @@ fn run_worker(
                 });
                 let combined = match gh.list_prs_fast(&repo_root) {
                     Err(e) => Err(e),
-                    Ok(prs) => {
+                    Ok(mut prs) => {
                         let open: Vec<u32> = prs
                             .iter()
                             .filter(|p| p.state == crate::data::pr::PrState::Open)
@@ -246,7 +290,10 @@ fn run_worker(
                             stage: ListStage::FetchingRefs,
                         });
                         match git.fetch_pr_refs(&repo_root, &open) {
-                            Ok(()) => Ok(prs),
+                            Ok(()) => {
+                                apply_local_merge_states(&*git, &repo_root, &mut prs);
+                                Ok(prs)
+                            }
                             Err(e) => Err(anyhow::anyhow!("fetching open PR refs: {e:#}")),
                         }
                     }
@@ -732,6 +779,63 @@ mod tests {
             }
         }
         panic!("never received SetDraftDone");
+    }
+
+    /// The first draw renders `ListFast`, and a cold GitHub says UNKNOWN — so
+    /// those rows must already carry conflict state from the local refs.
+    #[test]
+    fn list_fast_rows_carry_locally_computed_conflict_state() {
+        use crate::data::pr::{Author, Pr, PrState};
+
+        let mk = |number: u32, head: &str| Pr {
+            number,
+            title: "t".into(),
+            is_draft: false,
+            state: PrState::Open,
+            author: Author { login: "a".into() },
+            created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            updated_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+            base_ref_name: "main".into(),
+            head_ref_name: head.into(),
+            labels: vec![],
+            status_check_rollup: vec![],
+            review_decision: None,
+            mergeable: None,
+        };
+        let mut gh = FakeGh::new();
+        gh.prs_fast = vec![mk(7, "conflicting"), mk(8, "clean")];
+        // Cold GitHub: the only thing enrichment can say is "still computing".
+        gh.enrichments = vec![];
+
+        let mut git = FakeGit::new("/tmp/repo");
+        git.conflicts.insert(("origin/main".into(), "refs/prpr/pr-7".into()), true);
+        git.conflicts.insert(("origin/main".into(), "refs/prpr/pr-8".into()), false);
+        let worker = Worker::spawn("/tmp/repo".into(), Arc::new(gh), Arc::new(git), 7);
+
+        worker.send(Request::RefreshList { generation: 1 });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            assert!(std::time::Instant::now() < deadline, "timed out waiting for ListFast");
+            match worker.rx.recv_timeout(std::time::Duration::from_millis(500)) {
+                Ok(Response::ListFast { generation: 1, result: Ok(prs) }) => {
+                    let by: std::collections::HashMap<u32, &Pr> =
+                        prs.iter().map(|p| (p.number, p)).collect();
+                    assert!(
+                        by[&7].is_conflicting(),
+                        "first-draw row for the conflicting PR must show the conflict"
+                    );
+                    assert!(
+                        !by[&8].is_conflicting(),
+                        "cleanly-merging PR must not be flagged as conflicting"
+                    );
+                    return;
+                }
+                Ok(Response::ListFast { result: Err(e), .. }) => panic!("ListFast failed: {e}"),
+                Ok(_) => {}
+                Err(_) => {}
+            }
+        }
     }
 
     #[test]
