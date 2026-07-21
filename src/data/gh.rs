@@ -109,6 +109,10 @@ pub(crate) mod fakes {
         pub enrichment_sequence: Mutex<VecDeque<Vec<PrEnrichment>>>,
         pub merges: Mutex<Vec<(u32, String)>>,
         pub set_drafts: Mutex<Vec<(u32, bool)>>,
+        /// Ordered log across both mutating calls, so tests can pin sequencing.
+        pub calls: Mutex<Vec<String>>,
+        /// When set, `set_pr_draft` fails instead of recording.
+        pub fail_set_draft: Mutex<bool>,
     }
 
     impl FakeGh {
@@ -119,6 +123,8 @@ pub(crate) mod fakes {
                 enrichment_sequence: Mutex::new(VecDeque::new()),
                 merges: Mutex::new(vec![]),
                 set_drafts: Mutex::new(vec![]),
+                calls: Mutex::new(vec![]),
+                fail_set_draft: Mutex::new(false),
             }
         }
         /// Queue successive enriched payloads; each call pops the next one.
@@ -144,10 +150,15 @@ pub(crate) mod fakes {
         }
         fn merge_pr(&self, _root: &std::path::Path, n: u32, m: &str) -> Result<()> {
             self.merges.lock().unwrap().push((n, m.to_string()));
+            self.calls.lock().unwrap().push(format!("merge {n} {m}"));
             Ok(())
         }
         fn set_pr_draft(&self, _root: &std::path::Path, n: u32, draft: bool) -> Result<()> {
+            if *self.fail_set_draft.lock().unwrap() {
+                return Err(anyhow!("set draft failed"));
+            }
             self.set_drafts.lock().unwrap().push((n, draft));
+            self.calls.lock().unwrap().push(format!("ready {n} {draft}"));
             Ok(())
         }
     }

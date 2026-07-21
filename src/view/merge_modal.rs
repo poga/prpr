@@ -56,6 +56,10 @@ pub struct MergeModalState {
     pub pr_number: u32,
     pub default: MergeMethod,
     pub selected: MergeMethod,
+    /// Clear the draft flag before merging. Only meaningful for a draft PR,
+    /// which is also the only time the toggle row renders.
+    pub mark_ready: bool,
+    pub is_draft: bool,
 }
 
 /// Set while a `gh pr merge` subprocess is in flight. Drives the
@@ -65,10 +69,11 @@ pub struct MergeModalState {
 pub struct MergingState {
     pub pr_number: u32,
     pub method: MergeMethod,
+    pub mark_ready: bool,
 }
 
 pub fn render(f: &mut Frame, area: Rect, st: &MergeModalState) {
-    let modal = centered(area, 56, 9);
+    let modal = centered(area, 56, if st.is_draft { 11 } else { 9 });
     f.render_widget(Clear, modal);
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::from(""));
@@ -90,11 +95,27 @@ pub fn render(f: &mut Frame, area: Rect, st: &MergeModalState) {
         };
         lines.push(Line::styled(text, style));
     }
+    // A draft can't be merged at all, so the toggle only earns a row there.
+    if st.is_draft {
+        lines.push(Line::from(""));
+        let check = if st.mark_ready { "✓" } else { " " };
+        let style = if st.mark_ready {
+            Style::default().fg(DRAFT_ACCENT).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(OVERLAY1)
+        };
+        lines.push(Line::styled(
+            format!("   [d] {check} mark ready for review first"),
+            style,
+        ));
+    }
     lines.push(Line::from(""));
-    lines.push(Line::styled(
-        "   ↵ confirm    ↑/↓ select    M/S/R    Esc cancel".to_string(),
-        Style::default().fg(OVERLAY1),
-    ));
+    let hint = if st.is_draft {
+        "   ↵ confirm  ↑/↓ select  M/S/R  d ready  Esc cancel"
+    } else {
+        "   ↵ confirm    ↑/↓ select    M/S/R    Esc cancel"
+    };
+    lines.push(Line::styled(hint.to_string(), Style::default().fg(OVERLAY1)));
 
     let title = format!(" Merge #{}? ", st.pr_number);
     let block = Block::default()
@@ -111,15 +132,20 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
 }
 
 pub fn render_progress(f: &mut Frame, area: Rect, st: &MergingState) {
-    let modal = centered(area, 40, 5);
+    let modal = centered(area, if st.mark_ready { 52 } else { 40 }, 5);
     f.render_widget(Clear, modal);
     let method = match st.method {
         MergeMethod::Merge => "merge",
         MergeMethod::Squash => "squash",
         MergeMethod::Rebase => "rebase",
     };
+    let verb = if st.mark_ready {
+        "marking ready & merging"
+    } else {
+        "merging"
+    };
     let body = format!(
-        "  {} merging #{} ({})…",
+        "  {} {verb} #{} ({})…",
         crate::render::spinner::glyph(),
         st.pr_number,
         method,
@@ -186,6 +212,7 @@ mod tests {
         let st = MergingState {
             pr_number: 482,
             method: MergeMethod::Squash,
+            mark_ready: false,
         };
         let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
         term.draw(|f| {
@@ -198,4 +225,76 @@ mod tests {
         assert!(text.contains("merging"), "buffer was: {:?}", text);
         assert!(text.contains("squash"), "buffer was: {:?}", text);
     }
+
+    /// The overlay is the only feedback during the wait, so it has to name
+    /// the extra step actually being performed.
+    #[test]
+    fn progress_overlay_names_the_ready_step_when_marking_ready() {
+        let st = MergingState {
+            pr_number: 482,
+            method: MergeMethod::Squash,
+            mark_ready: true,
+        };
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        term.draw(|f| {
+            let area = f.area();
+            render_progress(f, area, &st)
+        })
+        .unwrap();
+        let text = buffer_text(term.backend().buffer());
+        assert!(text.contains("marking ready"), "buffer was: {:?}", text);
+        assert!(text.contains("#482"), "buffer was: {:?}", text);
+    }
+
+    fn draw_modal(st: &MergeModalState) -> String {
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| {
+            let area = f.area();
+            render(f, area, st)
+        })
+        .unwrap();
+        buffer_text(term.backend().buffer())
+    }
+
+    fn modal(is_draft: bool, mark_ready: bool) -> MergeModalState {
+        MergeModalState {
+            pr_number: 12,
+            default: MergeMethod::Merge,
+            selected: MergeMethod::Merge,
+            mark_ready,
+            is_draft,
+        }
+    }
+
+    /// Only a draft can be marked ready, so the row must not offer a
+    /// no-op on PRs that are already open for review.
+    #[test]
+    fn ready_toggle_row_renders_only_for_draft_prs() {
+        let draft = draw_modal(&modal(true, true));
+        assert!(draft.contains("mark ready for review"), "buffer was: {draft:?}");
+        assert!(draft.contains('✓'), "checked state missing: {draft:?}");
+
+        let ready = draw_modal(&modal(false, true));
+        assert!(
+            !ready.contains("mark ready for review"),
+            "non-draft must not show the row: {ready:?}"
+        );
+    }
+
+    #[test]
+    fn ready_toggle_row_drops_the_check_when_off() {
+        let text = draw_modal(&modal(true, false));
+        assert!(text.contains("mark ready for review"), "buffer was: {text:?}");
+        assert!(!text.contains('✓'), "unchecked state still shows ✓: {text:?}");
+    }
+
+    /// All three methods stay reachable with the ready step applied.
+    #[test]
+    fn method_rows_survive_the_toggle_row() {
+        let text = draw_modal(&modal(true, true));
+        for label in ["Merge commit", "Squash and merge", "Rebase and merge"] {
+            assert!(text.contains(label), "{label} missing: {text:?}");
+        }
+    }
 }
+

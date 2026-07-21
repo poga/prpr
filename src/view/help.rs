@@ -9,7 +9,8 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use crate::render::style::*;
 
 pub fn render(f: &mut Frame, area: Rect) {
-    let modal = centered(area, 70, 24);
+    // Sized to the text: a fixed height silently clipped the last sections.
+    let modal = centered(area, 70, HELP_TEXT.len() as u16 + 2);
     f.render_widget(Clear, modal);
     let lines: Vec<Line<'static>> = HELP_TEXT
         .iter()
@@ -58,6 +59,11 @@ const HELP_TEXT: &[&str] = &[
     "    c            commits modal",
     "    s            toggle SHA margin",
     "    q / Esc      back to list",
+    "",
+    "  Merge modal",
+    "    ↵            confirm       M/S/R  merge / squash / rebase",
+    "    j/k or ↑/↓   select        d      mark ready first (drafts)",
+    "    Esc          cancel",
     "",
     "  File picker / commits modal (vim mode)",
     "    j/k          move          g g / G   top / bottom",

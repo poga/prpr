@@ -37,7 +37,8 @@ pub enum Request {
         path: String,
         commits: Vec<String>,
     },
-    Merge { number: u32, method: String },
+    /// `mark_ready` clears the draft flag first, since a draft can't merge.
+    Merge { number: u32, method: String, mark_ready: bool },
     SetDraft { number: u32, draft: bool },
     ListFiles { number: u32, base_ref: String },
 }
@@ -309,8 +310,15 @@ fn run_worker(
             Request::BlameFile { number, head_oid, base_oid, path, commits } => {
                 run_blame_file(&*git, &repo_root, &res_tx, number, &head_oid, &base_oid, &path, &commits, window_size);
             }
-            Request::Merge { number, method } => {
-                let result = gh.merge_pr(&repo_root, number, &method);
+            Request::Merge { number, method, mark_ready } => {
+                // Abort on a failed ready call: the PR is still a draft, so
+                // merging on would report a success that never happened.
+                let result = if mark_ready {
+                    gh.set_pr_draft(&repo_root, number, false)
+                        .and_then(|()| gh.merge_pr(&repo_root, number, &method))
+                } else {
+                    gh.merge_pr(&repo_root, number, &method)
+                };
                 if res_tx.send(Response::MergeDone { number, result }).is_err() {
                     break;
                 }
@@ -779,6 +787,63 @@ mod tests {
             }
         }
         panic!("never received SetDraftDone");
+    }
+
+    /// Poll until MergeDone lands, asserting its ok-ness; loud on timeout.
+    fn await_merge_done(worker: &Worker, expect_ok: bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            match worker.rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                Ok(Response::MergeDone { result, .. }) => {
+                    assert_eq!(result.is_ok(), expect_ok, "MergeDone was {result:?}");
+                    return;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        panic!("never received MergeDone");
+    }
+
+    /// A draft can't be merged, so the ready call must land *before* the
+    /// merge — ordering is the contract, not just that both happened.
+    #[test]
+    fn merge_with_mark_ready_clears_draft_before_merging() {
+        let gh = Arc::new(FakeGh::new());
+        let git = FakeGit::new("/tmp/repo");
+        let worker = Worker::spawn("/tmp/repo".into(), gh.clone(), Arc::new(git), 7);
+        worker.send(Request::Merge { number: 7, method: "squash".into(), mark_ready: true });
+
+        await_merge_done(&worker, true);
+        assert_eq!(
+            gh.calls.lock().unwrap().clone(),
+            vec!["ready 7 false".to_string(), "merge 7 squash".to_string()],
+        );
+    }
+
+    #[test]
+    fn merge_without_mark_ready_skips_the_ready_call() {
+        let gh = Arc::new(FakeGh::new());
+        let git = FakeGit::new("/tmp/repo");
+        let worker = Worker::spawn("/tmp/repo".into(), gh.clone(), Arc::new(git), 7);
+        worker.send(Request::Merge { number: 7, method: "merge".into(), mark_ready: false });
+
+        await_merge_done(&worker, true);
+        assert_eq!(gh.calls.lock().unwrap().clone(), vec!["merge 7 merge".to_string()]);
+    }
+
+    /// A failed ready call leaves the PR a draft; merging on would report a
+    /// success that never happened.
+    #[test]
+    fn merge_aborts_when_marking_ready_fails() {
+        let gh = Arc::new(FakeGh::new());
+        *gh.fail_set_draft.lock().unwrap() = true;
+        let git = FakeGit::new("/tmp/repo");
+        let worker = Worker::spawn("/tmp/repo".into(), gh.clone(), Arc::new(git), 7);
+        worker.send(Request::Merge { number: 7, method: "squash".into(), mark_ready: true });
+
+        await_merge_done(&worker, false);
+        assert!(gh.merges.lock().unwrap().is_empty(), "merge must not be attempted");
     }
 
     /// The first draw renders `ListFast`, and a cold GitHub says UNKNOWN — so
