@@ -793,13 +793,27 @@ fn open_merge(st: &mut AppState) {
         .map(|p| p.number)
         .or(st.current_pr)
     {
+        let is_draft = pr_is_draft(st, num).unwrap_or(false);
         st.merge = Some(MergeModalState {
             pr_number: num,
             default: MergeMethod::Merge,
             selected: MergeMethod::Merge,
+            // Drafts are here to be merged; save the separate ready step.
+            mark_ready: true,
+            is_draft,
         });
         st.focused = FocusedView::MergeModal;
     }
+}
+
+/// Prefer the open review detail's flag; fall back to the list row.
+fn pr_is_draft(st: &AppState, number: u32) -> Option<bool> {
+    st.review
+        .as_ref()
+        .and_then(|r| r.detail.as_ref())
+        .filter(|d| d.number == number)
+        .map(|d| d.is_draft)
+        .or_else(|| st.list.prs.iter().find(|p| p.number == number).map(|p| p.is_draft))
 }
 
 fn toggle_draft(app: &mut App, st: &mut AppState) {
@@ -808,15 +822,7 @@ fn toggle_draft(app: &mut App, st: &mut AppState) {
         _ => st.list.visible_prs().get(st.list.selected).map(|p| p.number),
     };
     let Some(number) = number else { return };
-    // Prefer the open review detail's flag; fall back to the list row.
-    let is_draft = st
-        .review
-        .as_ref()
-        .and_then(|r| r.detail.as_ref())
-        .filter(|d| d.number == number)
-        .map(|d| d.is_draft)
-        .or_else(|| st.list.prs.iter().find(|p| p.number == number).map(|p| p.is_draft));
-    let Some(is_draft) = is_draft else { return };
+    let Some(is_draft) = pr_is_draft(st, number) else { return };
     let draft = !is_draft;
     app.request(Request::SetDraft { number, draft });
     let msg = if draft {
@@ -1053,13 +1059,16 @@ fn handle_merge_modal(app: &mut App, st: &mut AppState, ev: crossterm::event::Ke
         KeyCode::Enter => {
             let method = modal.selected;
             let num = modal.pr_number;
+            let mark_ready = modal.mark_ready && modal.is_draft;
             app.request(Request::Merge {
                 number: num,
                 method: method.cli_flag().to_string(),
+                mark_ready,
             });
             st.merging = Some(MergingState {
                 pr_number: num,
                 method,
+                mark_ready,
             });
             close_merge_modal(st);
         }
@@ -1074,6 +1083,9 @@ fn handle_merge_modal(app: &mut App, st: &mut AppState, ev: crossterm::event::Ke
         }
         KeyCode::Char('k') => {
             modal.selected = modal.selected.cycle(-1);
+        }
+        KeyCode::Char('d') | KeyCode::Char('D') => {
+            modal.mark_ready = !modal.mark_ready;
         }
         KeyCode::Char(c) => {
             if let Some(method) = crate::view::merge_modal::from_letter(c) {
@@ -2222,6 +2234,127 @@ mod tests {
 
         let r = st.review.as_ref().unwrap();
         assert!(matches!(r.colors.get(&path), Some(crate::view::pr_review::ColorState::Ready(_))));
+    }
+
+    /// Same as `test_app_for_state`, but keeps the fake reachable so tests
+    /// can assert which gh calls the key path actually produced.
+    fn test_app_with_gh(
+        cache: &mut Cache,
+        gh: std::sync::Arc<crate::data::gh::fakes::FakeGh>,
+    ) -> App {
+        use crate::data::git::fakes::FakeGit;
+        let git: std::sync::Arc<dyn crate::data::git::GitClient> =
+            std::sync::Arc::new(FakeGit::new("/tmp/repo"));
+        let mut app = App::new("/tmp/repo".into(), gh, git, Config::default());
+        std::mem::swap(&mut app.cache, cache);
+        app
+    }
+
+    fn draft_pr(n: u32) -> Pr {
+        Pr { is_draft: true, ..open_pr(n) }
+    }
+
+    fn key(c: char) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char(c))
+    }
+
+    fn enter() -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Enter)
+    }
+
+    fn open_merge_modal_for(st: &mut AppState, pr: Pr) {
+        st.list.prs = vec![pr];
+        st.list.selected = 0;
+        st.focused = FocusedView::List;
+        open_merge(st);
+    }
+
+    #[test]
+    fn merge_modal_defaults_to_marking_a_draft_ready() {
+        let mut st = dummy_app_state();
+        open_merge_modal_for(&mut st, draft_pr(7));
+
+        let m = st.merge.as_ref().expect("modal opened");
+        assert!(m.is_draft, "draft row must be offered the ready step");
+        assert!(m.mark_ready, "ready step is the default for a draft");
+    }
+
+    #[test]
+    fn merge_modal_omits_ready_step_for_a_non_draft_pr() {
+        let mut st = dummy_app_state();
+        open_merge_modal_for(&mut st, open_pr(7));
+
+        assert!(!st.merge.as_ref().expect("modal opened").is_draft);
+    }
+
+    /// Draft PRs are the common case, so confirming straight away must do
+    /// the whole job: clear the draft flag, then merge.
+    #[test]
+    fn confirming_a_draft_merge_marks_ready_then_merges() {
+        let gh = std::sync::Arc::new(crate::data::gh::fakes::FakeGh::new());
+        let mut cache = Cache::new();
+        let mut app = test_app_with_gh(&mut cache, gh.clone());
+        let mut st = dummy_app_state();
+        open_merge_modal_for(&mut st, draft_pr(7));
+
+        handle_merge_modal(&mut app, &mut st, enter());
+
+        await_merge_done(&app);
+        assert_eq!(
+            gh.calls.lock().unwrap().clone(),
+            vec!["ready 7 false".to_string(), "merge 7 merge".to_string()],
+        );
+    }
+
+    /// Turning the toggle off must fall back to a plain merge — no
+    /// surprise state change on a PR the user meant to leave a draft.
+    #[test]
+    fn d_key_turns_off_the_ready_step_before_merging() {
+        let gh = std::sync::Arc::new(crate::data::gh::fakes::FakeGh::new());
+        let mut cache = Cache::new();
+        let mut app = test_app_with_gh(&mut cache, gh.clone());
+        let mut st = dummy_app_state();
+        open_merge_modal_for(&mut st, draft_pr(7));
+
+        handle_merge_modal(&mut app, &mut st, key('d'));
+        assert!(!st.merge.as_ref().expect("modal still open").mark_ready);
+
+        handle_merge_modal(&mut app, &mut st, enter());
+
+        await_merge_done(&app);
+        assert_eq!(gh.calls.lock().unwrap().clone(), vec!["merge 7 merge".to_string()]);
+    }
+
+    /// The ready step composes with any method, not just the default one.
+    #[test]
+    fn squash_still_marks_a_draft_ready_first() {
+        let gh = std::sync::Arc::new(crate::data::gh::fakes::FakeGh::new());
+        let mut cache = Cache::new();
+        let mut app = test_app_with_gh(&mut cache, gh.clone());
+        let mut st = dummy_app_state();
+        open_merge_modal_for(&mut st, draft_pr(7));
+
+        handle_merge_modal(&mut app, &mut st, key('S'));
+        handle_merge_modal(&mut app, &mut st, enter());
+
+        await_merge_done(&app);
+        assert_eq!(
+            gh.calls.lock().unwrap().clone(),
+            vec!["ready 7 false".to_string(), "merge 7 squash".to_string()],
+        );
+    }
+
+    fn await_merge_done(app: &App) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            match app.worker.rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                Ok(Response::MergeDone { result: Ok(()), .. }) => return,
+                Ok(Response::MergeDone { result: Err(e), .. }) => panic!("merge failed: {e}"),
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        panic!("never received MergeDone");
     }
 
     #[test]
