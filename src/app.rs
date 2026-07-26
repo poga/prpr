@@ -62,6 +62,35 @@ fn should_auto_refresh(
     }
 }
 
+/// True while any on-screen spinner is animating and needs redraw ticks.
+fn needs_animation(st: &AppState) -> bool {
+    if st.merging.is_some() {
+        return true;
+    }
+    if st.list.loading
+        || st.list.enriching
+        || st.list.manual_refresh_in_flight
+        || st.list.loading_stage.is_some()
+    {
+        return true;
+    }
+    if crate::render::spinner::looks_in_progress(&st.list.status) {
+        return true;
+    }
+    if matches!(st.list.expanded, Some(ExpandedFiles::Loading { .. })) {
+        return true;
+    }
+    if let Some(r) = &st.review {
+        if r.detail.is_none() || r.files.is_empty() {
+            return true;
+        }
+        if crate::render::spinner::looks_in_progress(&r.status) {
+            return true;
+        }
+    }
+    false
+}
+
 fn reselect_by_number(prev: Option<u32>, new_numbers: &[u32], old_idx: usize) -> usize {
     if let Some(n) = prev
         && let Some(i) = new_numbers.iter().position(|m| *m == n)
@@ -276,10 +305,12 @@ pub fn run(term: &mut Term, app: &mut App, st: &mut AppState) -> Result<()> {
     // "loading PRs…" while the worker thread does the gh subprocess.
     send_refresh(app, st, false);
 
+    let mut dirty = true;
     while st.running {
         // Drain any worker responses before drawing.
         while let Ok(resp) = app.worker.rx.try_recv() {
             handle_response(app, st, resp);
+            dirty = true;
         }
 
         // Silent auto-refresh: while the user is on the list and not in
@@ -294,20 +325,32 @@ pub fn run(term: &mut Term, app: &mut App, st: &mut AppState) -> Result<()> {
             AUTO_REFRESH_INTERVAL,
         ) {
             send_refresh(app, st, true);
+            dirty = true;
         }
 
         if let Some((number, base_ref)) = take_due_files_request(st, Instant::now()) {
             app.request(Request::ListFiles { number, base_ref });
+            dirty = true;
         }
 
-        term.draw(|f| draw(f, app, st))?;
+        // Skip identical frames; spinners still tick via needs_animation.
+        if dirty || needs_animation(st) {
+            term.draw(|f| draw(f, app, st))?;
+            dirty = false;
+        }
 
         // Short timeout so we pick up worker responses promptly.
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
-                Event::Key(k) => handle_key(app, st, k),
-                Event::Mouse(m) => handle_mouse(app, st, m),
-                Event::Resize(_, _) => {}
+                Event::Key(k) => {
+                    handle_key(app, st, k);
+                    dirty = true;
+                }
+                Event::Mouse(m) => {
+                    handle_mouse(app, st, m);
+                    dirty = true;
+                }
+                Event::Resize(_, _) => dirty = true,
                 _ => {}
             }
         }
@@ -2632,5 +2675,46 @@ mod tests {
         let r = st.review.as_ref().unwrap();
         assert!(r.detail.as_ref().unwrap().is_draft, "review detail flag flips");
         assert!(r.status.contains("draft"), "result status shown in review view");
+    }
+
+    #[test]
+    fn idle_list_needs_no_animation() {
+        // fully-loaded quiet state
+        let mut st = AppState::new("repo".into(), "main".into());
+        st.refs_ready = true;
+        st.list.enriching = false;
+        assert!(!needs_animation(&st));
+    }
+
+    #[test]
+    fn spinners_require_animation() {
+        let base = || {
+            let mut s = AppState::new("r".into(), "m".into());
+            s.list.enriching = false;
+            s
+        };
+        let mut a = base();
+        a.list.loading = true;
+        assert!(needs_animation(&a), "list loading spinner");
+
+        let mut b = base();
+        b.list.expanded = Some(ExpandedFiles::Loading { number: 1 });
+        assert!(needs_animation(&b), "expanded files spinner");
+
+        let mut c = base();
+        c.merging = Some(MergingState {
+            pr_number: 1,
+            method: MergeMethod::Merge,
+            mark_ready: false,
+        });
+        assert!(needs_animation(&c), "merge progress spinner");
+
+        let mut d = base();
+        d.review = Some(PrReviewState { status: "loading…".into(), ..Default::default() });
+        assert!(needs_animation(&d), "review loading spinner");
+
+        let mut e = base();
+        e.list.status = "merging #1…".into();
+        assert!(needs_animation(&e), "in-progress status spinner");
     }
 }
