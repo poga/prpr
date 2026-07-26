@@ -49,6 +49,12 @@ fn theme() -> &'static Theme {
     })
 }
 
+/// Force the lazy syntax/theme loads now, off the first diff paint.
+pub fn warm() {
+    let _ = syntax_set();
+    let _ = theme();
+}
+
 /// Highlight one line of code. Returns owned Spans (each `Span<'static>`)
 /// suitable for assembling a `Line<'static>`. If the language can't be
 /// determined or syntect errors out, returns a single un-styled span — the

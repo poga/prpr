@@ -19,10 +19,29 @@ pub fn render_line<'a>(
     file_ext: &str,
 ) -> Line<'a> {
     if line.is_hunk_header {
-        return Line::from(vec![Span::styled(
-            line.text.clone(),
-            Style::default().fg(OVERLAY1).add_modifier(Modifier::DIM),
-        )]);
+        return hunk_header_line(line);
+    }
+    let highlighted = syntax::highlight_line(&line.text, file_ext);
+    render_line_with_spans(line, head_color, base_color, highlighted)
+}
+
+fn hunk_header_line(line: &DiffLine) -> Line<'static> {
+    Line::from(vec![Span::styled(
+        line.text.clone(),
+        Style::default().fg(OVERLAY1).add_modifier(Modifier::DIM),
+    )])
+}
+
+/// Same as `render_line`, but takes pre-highlighted spans so callers can
+/// memoize `highlight_line` output across frames instead of redoing it.
+pub fn render_line_with_spans(
+    line: &DiffLine,
+    head_color: Option<Color>,
+    base_color: Option<Color>,
+    mut highlighted: Vec<Span<'static>>,
+) -> Line<'static> {
+    if line.is_hunk_header {
+        return hunk_header_line(line);
     }
 
     let lineno_str = match (line.old_lineno, line.new_lineno) {
@@ -55,7 +74,6 @@ pub fn render_line<'a>(
         DiffOp::Hunk => None,
     };
 
-    let mut highlighted = syntax::highlight_line(&line.text, file_ext);
     if let Some(bg) = body_bg {
         for span in &mut highlighted {
             span.style = span.style.bg(bg);

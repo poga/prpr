@@ -5,6 +5,7 @@
 //! `Worker` thread and round-trips through channels (see `data::worker`).
 //! The UI drains worker responses each loop iteration.
 
+use std::collections::HashMap;
 use std::io::{self, Stdout};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -26,7 +27,7 @@ use crate::config::Config;
 use crate::data::cache::Cache;
 use crate::data::gh::GhClient;
 use crate::data::git::GitClient;
-use crate::data::pr::{Pr, PrEnrichment};
+use crate::data::pr::{MergeState, Pr, PrEnrichment};
 use crate::data::worker::{Request, Response, Worker};
 use crate::keys::{Action, FocusedView, MouseAction, dispatch, mouse_dispatch};
 use crate::view::commits_modal::{self, CommitsModalState};
@@ -36,6 +37,7 @@ use crate::view::pr_list::{ExpandedFiles, PrListState};
 use crate::view::pr_review::PrReviewState;
 
 const AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const FILES_DEBOUNCE: Duration = Duration::from_millis(100);
 
 fn should_auto_refresh(
     focused: FocusedView,
@@ -58,6 +60,35 @@ fn should_auto_refresh(
         None => false,
         Some(t) => now.duration_since(t) >= interval,
     }
+}
+
+/// True while any on-screen spinner is animating and needs redraw ticks.
+fn needs_animation(st: &AppState) -> bool {
+    if st.merging.is_some() {
+        return true;
+    }
+    if st.list.loading
+        || st.list.enriching
+        || st.list.manual_refresh_in_flight
+        || st.list.loading_stage.is_some()
+    {
+        return true;
+    }
+    if crate::render::spinner::looks_in_progress(&st.list.status) {
+        return true;
+    }
+    if matches!(st.list.expanded, Some(ExpandedFiles::Loading { .. })) {
+        return true;
+    }
+    if let Some(r) = &st.review {
+        if r.detail.is_none() || r.files.is_empty() {
+            return true;
+        }
+        if crate::render::spinner::looks_in_progress(&r.status) {
+            return true;
+        }
+    }
+    false
 }
 
 fn reselect_by_number(prev: Option<u32>, new_numbers: &[u32], old_idx: usize) -> usize {
@@ -108,6 +139,13 @@ impl App {
     }
 }
 
+/// A debounced ListFiles request armed by a selection change.
+pub struct PendingFiles {
+    pub number: u32,
+    pub base_ref: String,
+    pub at: Instant,
+}
+
 pub struct AppState {
     pub focused: FocusedView,
     pub list: PrListState,
@@ -126,6 +164,12 @@ pub struct AppState {
     pub list_gen: u32,
     /// Most recent enrichment, kept so a late ListFast can re-apply it.
     pub enrichment_for_gen: Option<(u32, Vec<PrEnrichment>)>,
+    /// False until the first ListRefsReady; file lists defer on a cold start.
+    pub refs_ready: bool,
+    /// File lists by PR number; valid until refs move (cleared on refs ready).
+    pub files_cache: HashMap<u32, Vec<crate::data::pr::FileMeta>>,
+    /// Debounced ListFiles request; sent once selection rests FILES_DEBOUNCE.
+    pub pending_files: Option<PendingFiles>,
 }
 
 impl AppState {
@@ -157,6 +201,9 @@ impl AppState {
             list_refresh_in_flight: false,
             list_gen: 0,
             enrichment_for_gen: None,
+            refs_ready: false,
+            files_cache: HashMap::new(),
+            pending_files: None,
         }
     }
 }
@@ -193,9 +240,9 @@ pub fn restore_terminal() -> Result<()> {
     Ok(())
 }
 
-/// Trigger a fresh `ListFiles` request for whatever row is currently
-/// selected. Always re-issues (no cache).
-fn after_selection_change(app: &App, st: &mut AppState) {
+/// Refresh the expanded file list for the selected row: serve from cache,
+/// or show a loading row and arm a debounced ListFiles request.
+fn after_selection_change(st: &mut AppState) {
     let Some((number, base_ref)) = st
         .list
         .visible_prs()
@@ -203,15 +250,42 @@ fn after_selection_change(app: &App, st: &mut AppState) {
         .map(|p| (p.number, p.base_ref_name.clone()))
     else {
         st.list.expanded = None;
+        st.pending_files = None;
         return;
     };
+    if let Some(files) = st.files_cache.get(&number) {
+        st.list.expanded = Some(ExpandedFiles::Ready { number, files: files.clone() });
+        st.pending_files = None;
+        return;
+    }
     st.list.expanded = Some(ExpandedFiles::Loading { number });
-    app.request(Request::ListFiles { number, base_ref });
+    // A ListFiles against unfetched refs can only error; wait for refs.
+    if !st.refs_ready {
+        st.pending_files = None;
+        return;
+    }
+    st.pending_files = Some(PendingFiles { number, base_ref, at: Instant::now() });
+}
+
+/// Pop the pending ListFiles request once it has rested a full debounce
+/// window, so holding j/k doesn't fire one subprocess per row.
+fn take_due_files_request(st: &mut AppState, now: Instant) -> Option<(u32, String)> {
+    let due = st
+        .pending_files
+        .as_ref()
+        .is_some_and(|p| now.duration_since(p.at) >= FILES_DEBOUNCE);
+    if !due {
+        return None;
+    }
+    let p = st.pending_files.take().unwrap();
+    Some((p.number, p.base_ref))
 }
 
 fn send_refresh(app: &App, st: &mut AppState, silent: bool) {
     st.last_refresh_at = Some(Instant::now());
     st.list.expanded = None;
+    // A stale debounced ListFiles must not flush mid-refresh.
+    st.pending_files = None;
     st.list_refresh_in_flight = true;
     // Arm at refresh start so ListFast can't re-arm after ListEnriched clears.
     st.list.enriching = true;
@@ -233,10 +307,12 @@ pub fn run(term: &mut Term, app: &mut App, st: &mut AppState) -> Result<()> {
     // "loading PRs…" while the worker thread does the gh subprocess.
     send_refresh(app, st, false);
 
+    let mut dirty = true;
     while st.running {
         // Drain any worker responses before drawing.
         while let Ok(resp) = app.worker.rx.try_recv() {
             handle_response(app, st, resp);
+            dirty = true;
         }
 
         // Silent auto-refresh: while the user is on the list and not in
@@ -251,21 +327,50 @@ pub fn run(term: &mut Term, app: &mut App, st: &mut AppState) -> Result<()> {
             AUTO_REFRESH_INTERVAL,
         ) {
             send_refresh(app, st, true);
+            dirty = true;
         }
 
-        term.draw(|f| draw(f, app, st))?;
+        if let Some((number, base_ref)) = take_due_files_request(st, Instant::now()) {
+            app.request(Request::ListFiles { number, base_ref });
+            dirty = true;
+        }
+
+        // Skip identical frames; spinners still tick via needs_animation.
+        if dirty || needs_animation(st) {
+            term.draw(|f| draw(f, app, st))?;
+            dirty = false;
+        }
 
         // Short timeout so we pick up worker responses promptly.
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
-                Event::Key(k) => handle_key(app, st, k),
-                Event::Mouse(m) => handle_mouse(app, st, m),
-                Event::Resize(_, _) => {}
+                Event::Key(k) => {
+                    handle_key(app, st, k);
+                    dirty = true;
+                }
+                Event::Mouse(m) => {
+                    handle_mouse(app, st, m);
+                    dirty = true;
+                }
+                Event::Resize(_, _) => dirty = true,
                 _ => {}
             }
         }
     }
     Ok(())
+}
+
+// A local edit predates its own in-flight refresh; poison gen, clear flags.
+fn invalidate_stale_refresh(st: &mut AppState) {
+    if !st.list_refresh_in_flight {
+        return;
+    }
+    st.list_gen = st.list_gen.wrapping_add(1);
+    st.list_refresh_in_flight = false;
+    st.list.enriching = false;
+    st.list.loading_stage = None;
+    st.list.manual_refresh_in_flight = false;
+    st.list.loading = false;
 }
 
 fn ensure_blame(app: &App, st: &mut AppState, number: u32, path: &str) {
@@ -306,6 +411,7 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
                     apply_enrichments(&mut st.list.prs, &es);
                 }
                 st.list.loading = false;
+                st.list.manual_refresh_in_flight = false;
                 st.list.loading_stage = None;
                 st.list.status = String::new();
                 let new_numbers: Vec<u32> = st
@@ -317,7 +423,7 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
                 st.list.selected =
                     reselect_by_number(prev_selected, &new_numbers, st.list.selected);
                 st.list.expanded = None;
-                after_selection_change(app, st);
+                after_selection_change(st);
             }
             Err(e) => {
                 st.list_refresh_in_flight = false;
@@ -342,6 +448,29 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
             // light-fields-only glyphs.
         }
         Response::ListEnriched { .. } => { /* stale; drop */ }
+        Response::ListRefsReady { generation, result } if generation == st.list_gen => {
+            match result {
+                Ok(states) => {
+                    for (number, verdict) in states {
+                        if let Some(p) = st.list.prs.iter_mut().find(|p| p.number == number) {
+                            let definite = matches!(
+                                p.merge_state(),
+                                Some(MergeState::Mergeable) | Some(MergeState::Conflicting)
+                            );
+                            if !definite {
+                                p.mergeable = Some(verdict);
+                            }
+                        }
+                    }
+                }
+                Err(e) => st.list.status = format!("fetching refs failed: {e:#}"),
+            }
+            st.list.loading_stage = None;
+            st.refs_ready = true;
+            st.files_cache.clear();
+            after_selection_change(st);
+        }
+        Response::ListRefsReady { .. } => { /* stale; drop */ }
         Response::PrDetail { number, result: Ok(detail) } => {
             if let Some(r) = st.review.as_mut()
                 && st.current_pr == Some(number)
@@ -368,6 +497,7 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
             if st.current_pr == Some(number) {
                 let path = if let Some(r) = st.review.as_mut() {
                     r.files = files;
+                    r.syntax_cache.clear();
                     r.status = format!("{} files", r.files.len());
                     r.files.get(r.file_index).map(|f| f.path.clone())
                 } else {
@@ -432,7 +562,8 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
                 st.list.visible_prs().iter().map(|p| p.number).collect();
             st.list.selected = reselect_by_number(prev_selected, &new_numbers, prev_idx);
             st.list.expanded = None;
-            after_selection_change(app, st);
+            invalidate_stale_refresh(st);
+            after_selection_change(st);
         }
         Response::MergeDone { number, result: Err(e) } => {
             st.merging = None;
@@ -453,11 +584,19 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
                 format!("#{number} marked ready for review")
             };
             set_draft_status(st, number, msg);
+            invalidate_stale_refresh(st);
         }
         Response::SetDraftDone { number, result: Err(e), .. } => {
             set_draft_status(st, number, format!("draft toggle #{number} failed: {e}"));
         }
         Response::ListFiles { number, result } => {
+            // Mid-refresh, this was computed against pre-fetch refs; caching
+            // it would park a stale entry once ListRefsReady clears refs.
+            if let Ok(files) = &result
+                && !st.list_refresh_in_flight
+            {
+                st.files_cache.insert(number, files.clone());
+            }
             let sel_number = st
                 .list
                 .visible_prs()
@@ -478,7 +617,7 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
     }
 }
 
-fn draw(f: &mut ratatui::Frame, _app: &App, st: &AppState) {
+fn draw(f: &mut ratatui::Frame, _app: &App, st: &mut AppState) {
     let area = f.area();
     if area.width < 80 || area.height < 24 {
         let msg = ratatui::widgets::Paragraph::new("terminal too small (need ≥80×24)")
@@ -494,7 +633,7 @@ fn draw(f: &mut ratatui::Frame, _app: &App, st: &AppState) {
         | FocusedView::FilePicker
         | FocusedView::MergeModal
         | FocusedView::CommitsModal => {
-            if let Some(review) = st.review.as_ref() {
+            if let Some(review) = st.review.as_mut() {
                 if review.detail.is_some() {
                     crate::view::pr_review::render(f, area, review);
                 } else {
@@ -604,7 +743,7 @@ fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) 
     {
         st.pending_g = false;
         st.list.selected = 0;
-        after_selection_change(app, st);
+        after_selection_change(st);
         return;
     }
     st.pending_g = false;
@@ -621,7 +760,7 @@ fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) 
             crossterm::event::KeyCode::Char(c) => buf.push(c),
             _ => {}
         }
-        after_selection_change(app, st);
+        after_selection_change(st);
         return;
     }
 
@@ -635,14 +774,14 @@ fn handle_action(app: &mut App, st: &mut AppState, action: Action) {
         Action::ListUp => {
             if st.list.selected > 0 {
                 st.list.selected -= 1;
-                after_selection_change(app, st);
+                after_selection_change(st);
             }
         }
         Action::ListDown => {
             let n = st.list.visible_prs().len();
             if st.list.selected + 1 < n {
                 st.list.selected += 1;
-                after_selection_change(app, st);
+                after_selection_change(st);
             }
         }
         Action::ListTop => {
@@ -651,7 +790,7 @@ fn handle_action(app: &mut App, st: &mut AppState, action: Action) {
         Action::ListBottom => {
             let n = st.list.visible_prs().len();
             st.list.selected = n.saturating_sub(1);
-            after_selection_change(app, st);
+            after_selection_change(st);
         }
         Action::ListOpen => {
             if let Some(pr) = st
@@ -767,6 +906,7 @@ fn handle_action(app: &mut App, st: &mut AppState, action: Action) {
                     r.files.clear();
                     r.colors.clear();
                     r.commit_stats.clear();
+                    r.syntax_cache.clear();
                     r.status = "loading…".into();
                 }
                 app.request(Request::OpenPr(pr));
@@ -906,7 +1046,7 @@ fn handle_mouse(app: &mut App, st: &mut AppState, ev: crossterm::event::MouseEve
                     st.list.selected = st.list.selected.saturating_sub((-d) as usize);
                 }
                 if st.list.selected != prev {
-                    after_selection_change(app, st);
+                    after_selection_change(st);
                 }
             } else {
                 move_review(app, st, d as i32);
@@ -917,7 +1057,7 @@ fn handle_mouse(app: &mut App, st: &mut AppState, ev: crossterm::event::MouseEve
                 let idx = (row - 2) as usize;
                 if idx < st.list.visible_prs().len() && st.list.selected != idx {
                     st.list.selected = idx;
-                    after_selection_change(app, st);
+                    after_selection_change(st);
                 }
             }
         }
@@ -1313,6 +1453,118 @@ mod tests {
     }
 
     #[test]
+    fn selection_change_serves_files_from_cache_without_request() {
+        let mut st = AppState::new("prpr".into(), "main".into());
+        st.refs_ready = true;
+        st.list.prs = vec![make_pr(1)];
+        st.files_cache.insert(
+            1,
+            vec![FileMeta { path: "a.rs".into(), additions: 1, deletions: 0 }],
+        );
+        after_selection_change(&mut st);
+        assert!(matches!(
+            &st.list.expanded,
+            Some(ExpandedFiles::Ready { number: 1, files }) if files.len() == 1
+        ));
+        assert!(st.pending_files.is_none(), "cache hit must not arm a request");
+    }
+
+    #[test]
+    fn uncached_selection_arms_debounce_instead_of_sending() {
+        let mut st = AppState::new("prpr".into(), "main".into());
+        st.refs_ready = true;
+        st.list.prs = vec![make_pr(1)];
+        after_selection_change(&mut st);
+        assert!(matches!(st.list.expanded, Some(ExpandedFiles::Loading { number: 1 })));
+        let p = st.pending_files.as_ref().expect("pending request armed");
+        assert_eq!(p.number, 1);
+    }
+
+    #[test]
+    fn debounce_flushes_only_after_window_elapses() {
+        let mut st = AppState::new("prpr".into(), "main".into());
+        st.refs_ready = true;
+        st.list.prs = vec![make_pr(1)];
+        after_selection_change(&mut st);
+        let armed_at = st.pending_files.as_ref().unwrap().at;
+        assert!(take_due_files_request(&mut st, armed_at).is_none(), "too early");
+        let due = take_due_files_request(&mut st, armed_at + FILES_DEBOUNCE);
+        assert_eq!(due, Some((1, "main".into())));
+        assert!(st.pending_files.is_none(), "flush consumes the pending slot");
+    }
+
+    #[test]
+    fn send_refresh_clears_stale_pending_files() {
+        // A debounced ListFiles armed before the refresh must not flush
+        // mid-refresh against refs that are about to move.
+        let mut st = dummy_app_state();
+        let mut cache = Cache::new();
+        let app = test_app_for_state(&mut cache);
+        st.pending_files = Some(PendingFiles {
+            number: 7,
+            base_ref: "main".into(),
+            at: Instant::now(),
+        });
+        send_refresh(&app, &mut st, true);
+        assert!(st.pending_files.is_none());
+    }
+
+    #[test]
+    fn list_files_response_populates_cache() {
+        let mut app = make_app();
+        let mut st = AppState::new("prpr".into(), "main".into());
+        st.list.prs = vec![make_pr(1)];
+        st.list.expanded = Some(ExpandedFiles::Loading { number: 1 });
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::ListFiles {
+                number: 1,
+                result: Ok(vec![FileMeta { path: "a.rs".into(), additions: 2, deletions: 1 }]),
+            },
+        );
+        assert_eq!(st.files_cache.get(&1).map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn list_files_during_in_flight_refresh_skips_cache_insert() {
+        // Computed against pre-fetch refs; caching it would park a stale
+        // entry once ListRefsReady clears the cache behind it.
+        let mut app = make_app();
+        let mut st = AppState::new("prpr".into(), "main".into());
+        st.list.prs = vec![make_pr(7)];
+        st.list.selected = 0;
+        st.list.expanded = Some(ExpandedFiles::Loading { number: 7 });
+        st.list_refresh_in_flight = true;
+
+        let files = vec![FileMeta { path: "a.rs".into(), additions: 1, deletions: 0 }];
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::ListFiles { number: 7, result: Ok(files.clone()) },
+        );
+        assert!(!st.files_cache.contains_key(&7), "cache insert must be skipped mid-refresh");
+        match st.list.expanded {
+            Some(ExpandedFiles::Ready { number: 7, files: ref f }) => assert_eq!(f, &files),
+            ref other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn refs_ready_invalidates_files_cache() {
+        let mut app = make_app();
+        let mut st = AppState::new("prpr".into(), "main".into());
+        st.files_cache.insert(1, vec![]);
+        let g = st.list_gen;
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::ListRefsReady { generation: g, result: Ok(vec![]) },
+        );
+        assert!(st.files_cache.is_empty(), "new refs mean cached file lists are stale");
+    }
+
+    #[test]
     fn cycle_file_uses_detail_files_count_when_files_empty() {
         let mut st = dummy_app_state();
         let mut cache = Cache::new();
@@ -1677,6 +1929,100 @@ mod tests {
     }
 
     #[test]
+    fn list_fast_unblocks_manual_refresh_before_enrichment() {
+        let mut st = dummy_app_state();
+        let mut cache = Cache::new();
+        let mut app = test_app_for_state(&mut cache);
+        send_refresh(&app, &mut st, false);
+        assert!(st.list.manual_refresh_in_flight);
+        let g = st.list_gen;
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::ListFast {
+                generation: g,
+                result: Ok(vec![make_pr(1)]),
+            },
+        );
+        assert!(
+            !st.list.manual_refresh_in_flight,
+            "rows arrived — input must unblock"
+        );
+        assert!(st.list.enriching, "enrichment is still running");
+    }
+
+    #[test]
+    fn refs_ready_stamps_verdicts_but_never_overwrites_definite_enrichment() {
+        let mut st = dummy_app_state();
+        let mut cache = Cache::new();
+        let mut app = test_app_for_state(&mut cache);
+        // rows present; PR 1 has no verdict, PR 2 was already enriched CONFLICTING
+        st.list.prs = vec![make_pr(1), make_pr(2)];
+        st.list.prs[1].mergeable = Some("CONFLICTING".into());
+        let g = st.list_gen;
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::ListRefsReady {
+                generation: g,
+                result: Ok(vec![(1, "MERGEABLE".into()), (2, "MERGEABLE".into())]),
+            },
+        );
+        assert_eq!(st.list.prs[0].mergeable.as_deref(), Some("MERGEABLE"));
+        assert_eq!(
+            st.list.prs[1].mergeable.as_deref(),
+            Some("CONFLICTING"),
+            "a definite enrichment verdict must not be overwritten by the local check"
+        );
+        assert!(st.refs_ready);
+    }
+
+    #[test]
+    fn refs_ready_err_still_flips_gate_and_reports_failure() {
+        // Anti-strand contract: a failed ref fetch must still flip the gate,
+        // or file lists stay deferred forever after one bad fetch.
+        let mut st = dummy_app_state();
+        let mut cache = Cache::new();
+        let mut app = test_app_for_state(&mut cache);
+        let g = st.list_gen;
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::ListRefsReady {
+                generation: g,
+                result: Err(anyhow::anyhow!("boom")),
+            },
+        );
+        assert!(st.refs_ready, "gate must flip even when the fetch failed");
+        assert!(st.list.status.contains("fetching refs failed"));
+    }
+
+    #[test]
+    fn selection_change_defers_files_request_until_refs_ready() {
+        let mut st = dummy_app_state();
+        let mut cache = Cache::new();
+        let mut app = test_app_for_state(&mut cache);
+        st.list.prs = vec![make_pr(1)];
+        st.refs_ready = false;
+        after_selection_change(&mut st);
+        assert!(matches!(
+            st.list.expanded,
+            Some(ExpandedFiles::Loading { number: 1 })
+        ));
+        // ListRefsReady flips the gate and re-issues the request path.
+        let g = st.list_gen;
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::ListRefsReady {
+                generation: g,
+                result: Ok(vec![]),
+            },
+        );
+        assert!(st.refs_ready);
+    }
+
+    #[test]
     fn auto_refresh_blocked_when_not_on_list() {
         let now = Instant::now();
         let last = Some(now - Duration::from_secs(120));
@@ -1980,6 +2326,137 @@ mod tests {
         assert!(!st.list_refresh_in_flight);
         assert!(!st.list.loading);
         assert!(st.list.status.contains("#7"));
+    }
+
+    #[test]
+    fn merge_done_ok_invalidates_stale_in_flight_refresh() {
+        // A silent auto-refresh doesn't block input (unlike a manual one), so
+        // a merge can land mid-refresh. The refresh's ListFast is a gh
+        // snapshot from before the merge; it must not resurrect the row or
+        // wipe the "merged #N" status once it lands late.
+        let mut st = dummy_app_state();
+        let mut cache = Cache::new();
+        let mut app = test_app_for_state(&mut cache);
+        st.list.prs = vec![open_pr(5), open_pr(7), open_pr(8)];
+        st.list.selected = 1; // pointing at #7
+
+        send_refresh(&app, &mut st, true);
+        let stale_gen = st.list_gen;
+        assert!(st.list_refresh_in_flight);
+
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::MergeDone { number: 7, result: Ok(()) },
+        );
+        assert!(st.list.status.contains("merged #7"));
+
+        // The stale ListFast (captured before the merge) lands late, still
+        // carrying #7 and the pre-merge generation.
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::ListFast {
+                generation: stale_gen,
+                result: Ok(vec![open_pr(5), open_pr(7), open_pr(8)]),
+            },
+        );
+        let nums: Vec<u32> = st.list.prs.iter().map(|p| p.number).collect();
+        assert_eq!(nums, vec![5, 8], "stale ListFast must not resurrect the merged row");
+        assert!(
+            st.list.status.contains("merged #7"),
+            "status must survive the stale response, got {:?}",
+            st.list.status
+        );
+
+        // A fresh refresh afterwards still applies normally.
+        send_refresh(&app, &mut st, true);
+        let fresh_gen = st.list_gen;
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::ListFast {
+                generation: fresh_gen,
+                result: Ok(vec![open_pr(5), open_pr(8)]),
+            },
+        );
+        let nums: Vec<u32> = st.list.prs.iter().map(|p| p.number).collect();
+        assert_eq!(nums, vec![5, 8], "a fresh generation still applies");
+    }
+
+    #[test]
+    fn set_draft_done_ok_invalidates_stale_in_flight_refresh() {
+        // Same shape as the merge race: a silent refresh's stale ListFast
+        // must not revert a draft toggle that landed while it was in flight.
+        let mut st = dummy_app_state();
+        let mut cache = Cache::new();
+        let mut app = test_app_for_state(&mut cache);
+        st.list.prs = vec![open_pr(7)];
+
+        send_refresh(&app, &mut st, true);
+        let stale_gen = st.list_gen;
+
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::SetDraftDone { number: 7, draft: true, result: Ok(()) },
+        );
+        assert!(st.list.prs[0].is_draft);
+
+        let mut stale_row = open_pr(7);
+        stale_row.is_draft = false; // snapshot from before the toggle
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::ListFast { generation: stale_gen, result: Ok(vec![stale_row]) },
+        );
+        assert!(
+            st.list.prs[0].is_draft,
+            "stale ListFast must not revert the draft flip"
+        );
+    }
+
+    #[test]
+    fn set_draft_done_ok_invalidates_stale_manual_refresh_in_flight() {
+        // toggle_draft doesn't block input, so a user can toggle draft then
+        // immediately press `r` (manual refresh: manual_refresh_in_flight =
+        // true, loading = true). When SetDraftDone Ok then lands,
+        // invalidate_stale_refresh bumps the generation, orphaning the
+        // manual refresh's own ListFast. If it only cleared
+        // list_refresh_in_flight/enriching/loading_stage (not
+        // manual_refresh_in_flight/loading), the dropped stale ListFast
+        // would leave input permanently blocked.
+        let mut st = dummy_app_state();
+        let mut cache = Cache::new();
+        let mut app = test_app_for_state(&mut cache);
+        st.list.prs = vec![open_pr(7)];
+
+        // User presses `r`: manual refresh starts.
+        send_refresh(&app, &mut st, false);
+        let stale_gen = st.list_gen;
+        assert!(st.list.manual_refresh_in_flight);
+        assert!(st.list.loading);
+
+        // SetDraftDone Ok for the toggle sent just before `r`.
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::SetDraftDone { number: 7, draft: true, result: Ok(()) },
+        );
+
+        // The manual refresh's own ListFast, now orphaned by the bumped
+        // generation, arrives late and is dropped as stale.
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::ListFast { generation: stale_gen, result: Ok(vec![open_pr(7)]) },
+        );
+
+        assert!(
+            !st.list.manual_refresh_in_flight,
+            "manual refresh flag must not be stuck — permanent input block"
+        );
+        assert!(!st.list.loading, "loading flag must not be stuck");
     }
 
     #[test]
@@ -2410,5 +2887,46 @@ mod tests {
         let r = st.review.as_ref().unwrap();
         assert!(r.detail.as_ref().unwrap().is_draft, "review detail flag flips");
         assert!(r.status.contains("draft"), "result status shown in review view");
+    }
+
+    #[test]
+    fn idle_list_needs_no_animation() {
+        // fully-loaded quiet state
+        let mut st = AppState::new("repo".into(), "main".into());
+        st.refs_ready = true;
+        st.list.enriching = false;
+        assert!(!needs_animation(&st));
+    }
+
+    #[test]
+    fn spinners_require_animation() {
+        let base = || {
+            let mut s = AppState::new("r".into(), "m".into());
+            s.list.enriching = false;
+            s
+        };
+        let mut a = base();
+        a.list.loading = true;
+        assert!(needs_animation(&a), "list loading spinner");
+
+        let mut b = base();
+        b.list.expanded = Some(ExpandedFiles::Loading { number: 1 });
+        assert!(needs_animation(&b), "expanded files spinner");
+
+        let mut c = base();
+        c.merging = Some(MergingState {
+            pr_number: 1,
+            method: MergeMethod::Merge,
+            mark_ready: false,
+        });
+        assert!(needs_animation(&c), "merge progress spinner");
+
+        let mut d = base();
+        d.review = Some(PrReviewState { status: "loading…".into(), ..Default::default() });
+        assert!(needs_animation(&d), "review loading spinner");
+
+        let mut e = base();
+        e.list.status = "merging #1…".into();
+        assert!(needs_animation(&e), "in-progress status spinner");
     }
 }

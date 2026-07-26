@@ -11,7 +11,7 @@ use ratatui::widgets::Paragraph;
 use crate::data::diff::FileDiff;
 use crate::data::pr::PrDetail;
 use crate::render::attribution::{CommitStats, LineColors};
-use crate::render::diff::{ext_of, render_line};
+use crate::render::diff::{ext_of, render_line_with_spans};
 use crate::render::style::*;
 
 #[derive(Debug, Default)]
@@ -21,6 +21,9 @@ pub struct PrReviewState {
     pub files: Vec<FileDiff>,
     pub colors: HashMap<String, ColorState>,
     pub commit_stats: HashMap<String, CommitStats>,
+    /// Memoized syntax spans keyed by (file_index, line index). Cleared
+    /// whenever `files` is replaced.
+    pub syntax_cache: HashMap<(usize, usize), Vec<Span<'static>>>,
 
     // View state.
     pub file_index: usize,
@@ -36,7 +39,7 @@ pub enum ColorState {
     Ready(LineColors),
 }
 
-pub fn render(f: &mut Frame, area: Rect, st: &PrReviewState) {
+pub fn render(f: &mut Frame, area: Rect, st: &mut PrReviewState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -119,7 +122,7 @@ pub fn file_count(st: &PrReviewState) -> usize {
     }
 }
 
-fn render_diff_body(f: &mut Frame, area: Rect, st: &PrReviewState) {
+fn render_diff_body(f: &mut Frame, area: Rect, st: &mut PrReviewState) {
     if st.files.is_empty() {
         f.render_widget(
             Paragraph::new(format!(
@@ -131,7 +134,10 @@ fn render_diff_body(f: &mut Frame, area: Rect, st: &PrReviewState) {
         );
         return;
     }
-    let Some(file) = st.files.get(st.file_index) else {
+    let file_index = st.file_index;
+    let scroll = st.scroll as usize;
+    let PrReviewState { files, colors, syntax_cache, .. } = st;
+    let Some(file) = files.get(file_index) else {
         return;
     };
     if file.binary {
@@ -141,19 +147,33 @@ fn render_diff_body(f: &mut Frame, area: Rect, st: &PrReviewState) {
         );
         return;
     }
-    let lines = body_lines(file, &st.colors);
-    f.render_widget(Paragraph::new(lines).scroll((st.scroll, 0)), area);
+    let lines =
+        visible_body_lines(file, file_index, colors, syntax_cache, scroll, area.height as usize);
+    f.render_widget(Paragraph::new(lines), area);
 }
 
-fn body_lines<'a>(file: &'a FileDiff, colors: &'a HashMap<String, ColorState>) -> Vec<Line<'a>> {
+/// Rows for the visible window only — frame cost scales with screen height,
+/// not file size. Syntax spans are memoized per line in `cache`.
+fn visible_body_lines(
+    file: &FileDiff,
+    file_index: usize,
+    colors: &HashMap<String, ColorState>,
+    cache: &mut HashMap<(usize, usize), Vec<Span<'static>>>,
+    scroll: usize,
+    height: usize,
+) -> Vec<Line<'static>> {
     let lookup = colors.get(&file.path).and_then(|c| match c {
         ColorState::Ready(lc) => Some(lc),
         ColorState::Loading => None,
     });
     let ext = ext_of(&file.path);
-    file.lines
+    let start = scroll.min(file.lines.len());
+    let end = (start + height).min(file.lines.len());
+    file.lines[start..end]
         .iter()
-        .map(|l| {
+        .enumerate()
+        .map(|(off, l)| {
+            let idx = start + off;
             let head = l.new_lineno.and_then(|n| {
                 lookup
                     .and_then(|lc| lc.head.get(n.saturating_sub(1) as usize).copied())
@@ -164,7 +184,14 @@ fn body_lines<'a>(file: &'a FileDiff, colors: &'a HashMap<String, ColorState>) -
             } else {
                 None
             };
-            render_line(l, head, base, ext)
+            if l.is_hunk_header {
+                return render_line_with_spans(l, head, base, vec![]);
+            }
+            let spans = cache
+                .entry((file_index, idx))
+                .or_insert_with(|| crate::render::syntax::highlight_line(&l.text, ext))
+                .clone();
+            render_line_with_spans(l, head, base, spans)
         })
         .collect()
 }
@@ -241,6 +268,7 @@ mod tests {
             files,
             colors: HashMap::new(),
             commit_stats: HashMap::new(),
+            syntax_cache: HashMap::new(),
             file_index: 0,
             cursor_line: 0,
             scroll: 0,
@@ -255,13 +283,65 @@ mod tests {
             .collect::<String>()
     }
 
+    fn big_file(n: u32) -> FileDiff {
+        let lines = (1..=n)
+            .map(|i| crate::data::diff::DiffLine {
+                op: crate::data::diff::DiffOp::Context,
+                old_lineno: Some(i),
+                new_lineno: Some(i),
+                text: format!("let x{i} = {i};"),
+                is_hunk_header: false,
+            })
+            .collect();
+        FileDiff { path: "src/big.rs".into(), lines, binary: false }
+    }
+
+    #[test]
+    fn scrolled_body_starts_at_the_scroll_offset() {
+        let mut r = fixture_review_state();
+        r.files = vec![big_file(200)];
+        r.scroll = 50;
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| render(f, f.area(), &mut r)).unwrap();
+        let buf = term.backend().buffer();
+        // Layout rows: 0 header, 1 spacer, 2-3 file bar, 4.. body.
+        let first_body = buffer_line(buf, 4);
+        assert!(
+            first_body.contains("let x51 = 51;"),
+            "body must start at line index 50, got: {first_body:?}"
+        );
+    }
+
+    #[test]
+    fn render_highlights_only_the_visible_window() {
+        let mut r = fixture_review_state();
+        r.files = vec![big_file(500)];
+        r.scroll = 0;
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| render(f, f.area(), &mut r)).unwrap();
+        // Body height is 24 - 4 (header/bar) - 3 (status) = 17 rows.
+        assert!(
+            !r.syntax_cache.is_empty() && r.syntax_cache.len() <= 17,
+            "cache must cover exactly the visible window, got {} entries",
+            r.syntax_cache.len()
+        );
+        assert!(r.syntax_cache.keys().all(|(_, idx)| *idx < 17));
+
+        // Scrolling exposes new lines; already-seen ones are not redone.
+        r.scroll = 100;
+        let before = r.syntax_cache.len();
+        term.draw(|f| render(f, f.area(), &mut r)).unwrap();
+        assert!(r.syntax_cache.len() <= before + 17);
+        assert!(r.syntax_cache.contains_key(&(0, 100)));
+    }
+
     #[test]
     fn renders_pr_number_in_header() {
-        let r = fixture_review_state();
+        let mut r = fixture_review_state();
         let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
         term.draw(|f| {
             let area = f.area();
-            render(f, area, &r)
+            render(f, area, &mut r)
         })
         .unwrap();
         let buf = term.backend().buffer();
@@ -272,11 +352,11 @@ mod tests {
 
     #[test]
     fn renders_no_commit_strip() {
-        let r = fixture_review_state();
+        let mut r = fixture_review_state();
         let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
         term.draw(|f| {
             let area = f.area();
-            render(f, area, &r);
+            render(f, area, &mut r);
         })
         .unwrap();
         let buf = term.backend().buffer();
@@ -297,7 +377,7 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(120, 20)).unwrap();
         term.draw(|f| {
             let area = f.area();
-            render(f, area, &r);
+            render(f, area, &mut r);
         })
         .unwrap();
         let buf = term.backend().buffer();
@@ -313,7 +393,7 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
         term.draw(|f| {
             let area = f.area();
-            render(f, area, &r);
+            render(f, area, &mut r);
         })
         .unwrap();
         let buf = term.backend().buffer();
@@ -332,7 +412,7 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
         term.draw(|f| {
             let area = f.area();
-            render(f, area, &r)
+            render(f, area, &mut r)
         })
         .unwrap();
         let buf = term.backend().buffer();
@@ -347,7 +427,7 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
         term.draw(|f| {
             let area = f.area();
-            render(f, area, &r)
+            render(f, area, &mut r)
         })
         .unwrap();
         let header = buffer_line(term.backend().buffer(), 0);
@@ -361,7 +441,7 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
         term.draw(|f| {
             let area = f.area();
-            render(f, area, &r)
+            render(f, area, &mut r)
         })
         .unwrap();
         let header = buffer_line(term.backend().buffer(), 0);

@@ -49,10 +49,9 @@ pub struct PrListState {
     /// user sees whether `gh` or `git fetch` is the slow step.
     pub loading_stage: Option<ListStage>,
     /// True from when the user presses `r` (or the initial load fires) until
-    /// the full refresh — fast list **and** enrichment — completes. The
-    /// renderer hides rows behind a full-area loading placeholder and the
-    /// input layer ignores keys other than quit so the user can't act on
-    /// stale data mid-refresh.
+    /// `ListFast` returns rows. The renderer hides rows behind a full-area
+    /// loading placeholder and the input layer ignores keys other than quit
+    /// so the user can't act on stale data mid-refresh.
     pub manual_refresh_in_flight: bool,
     /// Inline files for the selected PR; tagged with the PR number.
     pub expanded: Option<ExpandedFiles>,
@@ -103,8 +102,8 @@ fn render_header(f: &mut Frame, area: Rect, st: &PrListState) {
 fn render_rows(f: &mut Frame, area: Rect, st: &PrListState, now: DateTime<Utc>) {
     // Manual refresh (initial load or pressing `r`) blocks the view: the
     // rows are replaced with a centered loading placeholder until the fast
-    // list AND enrichment have both arrived. Silent auto-refresh keeps the
-    // rows visible — only the user-initiated path is intentionally modal.
+    // list arrives. Silent auto-refresh keeps the rows visible — only the
+    // user-initiated path is intentionally modal.
     if st.manual_refresh_in_flight {
         let body = st
             .loading_stage
@@ -198,6 +197,13 @@ fn render_footer(f: &mut Frame, area: Rect, st: &PrListState) {
             .unwrap_or("refreshing");
         f.render_widget(
             Paragraph::new(format!("  {} {label}…", spinner::glyph()))
+                .style(Style::default().fg(OVERLAY1)),
+            chunks[1],
+        );
+    } else if let Some(stage) = st.loading_stage {
+        // Rows are visible but a pipeline stage is still running.
+        f.render_widget(
+            Paragraph::new(format!("  {} {}…", spinner::glyph(), stage.label()))
                 .style(Style::default().fg(OVERLAY1)),
             chunks[1],
         );

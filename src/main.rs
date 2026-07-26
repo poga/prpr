@@ -71,6 +71,9 @@ fn real_main() -> Result<()> {
     let mut app = App::new(repo_root, gh, git, cfg);
     let mut st = AppState::new(repo_name, branch);
 
+    // Syntax definitions take ~150ms to load; warm them while the list loads.
+    thread::spawn(prpr::render::syntax::warm);
+
     install_panic_hook();
     let mut term = setup_terminal()?;
     let result = run(&mut term, &mut app, &mut st);
