@@ -360,7 +360,7 @@ pub fn run(term: &mut Term, app: &mut App, st: &mut AppState) -> Result<()> {
     Ok(())
 }
 
-// A local edit predates its own in-flight silent refresh; poison the gen.
+// A local edit predates its own in-flight refresh; poison gen, clear flags.
 fn invalidate_stale_refresh(st: &mut AppState) {
     if !st.list_refresh_in_flight {
         return;
@@ -369,6 +369,8 @@ fn invalidate_stale_refresh(st: &mut AppState) {
     st.list_refresh_in_flight = false;
     st.list.enriching = false;
     st.list.loading_stage = None;
+    st.list.manual_refresh_in_flight = false;
+    st.list.loading = false;
 }
 
 fn ensure_blame(app: &App, st: &mut AppState, number: u32, path: &str) {
@@ -2412,6 +2414,49 @@ mod tests {
             st.list.prs[0].is_draft,
             "stale ListFast must not revert the draft flip"
         );
+    }
+
+    #[test]
+    fn set_draft_done_ok_invalidates_stale_manual_refresh_in_flight() {
+        // toggle_draft doesn't block input, so a user can toggle draft then
+        // immediately press `r` (manual refresh: manual_refresh_in_flight =
+        // true, loading = true). When SetDraftDone Ok then lands,
+        // invalidate_stale_refresh bumps the generation, orphaning the
+        // manual refresh's own ListFast. If it only cleared
+        // list_refresh_in_flight/enriching/loading_stage (not
+        // manual_refresh_in_flight/loading), the dropped stale ListFast
+        // would leave input permanently blocked.
+        let mut st = dummy_app_state();
+        let mut cache = Cache::new();
+        let mut app = test_app_for_state(&mut cache);
+        st.list.prs = vec![open_pr(7)];
+
+        // User presses `r`: manual refresh starts.
+        send_refresh(&app, &mut st, false);
+        let stale_gen = st.list_gen;
+        assert!(st.list.manual_refresh_in_flight);
+        assert!(st.list.loading);
+
+        // SetDraftDone Ok for the toggle sent just before `r`.
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::SetDraftDone { number: 7, draft: true, result: Ok(()) },
+        );
+
+        // The manual refresh's own ListFast, now orphaned by the bumped
+        // generation, arrives late and is dropped as stale.
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::ListFast { generation: stale_gen, result: Ok(vec![open_pr(7)]) },
+        );
+
+        assert!(
+            !st.list.manual_refresh_in_flight,
+            "manual refresh flag must not be stuck — permanent input block"
+        );
+        assert!(!st.list.loading, "loading flag must not be stuck");
     }
 
     #[test]
