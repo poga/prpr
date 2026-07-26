@@ -286,11 +286,16 @@ fn run_worker(
                             .filter(|p| p.state == crate::data::pr::PrState::Open)
                             .map(|p| p.number)
                             .collect();
+                        let bases: Vec<String> = prs
+                            .iter()
+                            .filter(|p| p.state == crate::data::pr::PrState::Open)
+                            .map(|p| p.base_ref_name.clone())
+                            .collect();
                         let _ = res_tx.send(Response::ListProgress {
                             generation,
                             stage: ListStage::FetchingRefs,
                         });
-                        match git.fetch_pr_refs(&repo_root, &open) {
+                        match git.fetch_pr_refs(&repo_root, &open, &bases) {
                             Ok(()) => {
                                 apply_local_merge_states(&*git, &repo_root, &mut prs);
                                 Ok(prs)
