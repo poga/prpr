@@ -235,6 +235,9 @@ fn run_worker(
     window_size: usize,
     enrich_retry_delay: Duration,
 ) {
+    // Serializes all `git fetch` invocations: concurrent fetches of the same
+    // ref would race on git's per-ref lock files.
+    let fetch_lock = Arc::new(std::sync::Mutex::new(()));
     while let Ok(req) = req_rx.recv() {
         match req {
             Request::RefreshList { generation } => {
@@ -310,7 +313,7 @@ fn run_worker(
                 });
             }
             Request::OpenPr(pr) => {
-                run_open_pr(&*git, &repo_root, &res_tx, pr);
+                run_open_pr(&*git, &repo_root, &fetch_lock, &res_tx, pr);
             }
             Request::BlameFile { number, head_oid, base_oid, path, commits } => {
                 run_blame_file(&*git, &repo_root, &res_tx, number, &head_oid, &base_oid, &path, &commits, window_size);
@@ -351,30 +354,38 @@ fn run_worker(
 fn run_open_pr(
     git: &dyn GitClient,
     repo_root: &Path,
+    fetch_lock: &std::sync::Mutex<()>,
     res_tx: &Sender<Response>,
     pr: crate::data::pr::Pr,
 ) {
     let number = pr.number;
     let head_ref = format!("refs/prpr/pr-{number}");
     let base_ref = format!("origin/{}", pr.base_ref_name);
-    let head_oid = match git.rev_parse(repo_root, &head_ref) {
-        Ok(o) => o,
-        Err(e) => {
-            let _ = res_tx.send(Response::PrLoadError {
-                number,
-                error: format!("resolving {head_ref} (try `r` to refresh): {e:#}"),
-            });
-            return;
-        }
+    let resolve = |g: &dyn GitClient| -> Result<(String, String)> {
+        Ok((g.rev_parse(repo_root, &head_ref)?, g.rev_parse(repo_root, &base_ref)?))
     };
-    let base_oid = match git.rev_parse(repo_root, &base_ref) {
-        Ok(o) => o,
-        Err(e) => {
-            let _ = res_tx.send(Response::PrLoadError {
-                number,
-                error: format!("resolving {base_ref}: {e:#}"),
-            });
-            return;
+    let (head_oid, base_oid) = match resolve(git) {
+        Ok(oids) => oids,
+        // Cold start: refs not primed yet. Take the fetch lock (waits out any
+        // in-flight bulk fetch), re-check, and fetch just this PR if needed.
+        Err(_) => {
+            let fetched = {
+                let _g = fetch_lock.lock().unwrap();
+                resolve(git).or_else(|_| {
+                    git.fetch_pr_ref(repo_root, number, &pr.base_ref_name)
+                        .and_then(|()| resolve(git))
+                })
+            };
+            match fetched {
+                Ok(oids) => oids,
+                Err(e) => {
+                    let _ = res_tx.send(Response::PrLoadError {
+                        number,
+                        error: format!("resolving {head_ref} (try `r` to refresh): {e:#}"),
+                    });
+                    return;
+                }
+            }
         }
     };
 
@@ -577,8 +588,8 @@ mod tests {
         // FakeGit.refs empty → rev_parse fails → cold-start fallback
         // also can't populate (FakeGit.fetch_pr is a no-op) → PrLoadError.
         let gh = FakeGh::new();
-        let git = FakeGit::new("/tmp/repo");
-        let worker = Worker::spawn("/tmp/repo".into(), Arc::new(gh), Arc::new(git), 7);
+        let git = Arc::new(FakeGit::new("/tmp/repo"));
+        let worker = Worker::spawn("/tmp/repo".into(), Arc::new(gh), git.clone(), 7);
         let pr = crate::data::pr::Pr {
             number: 1,
             title: "t".into(),
@@ -606,6 +617,51 @@ mod tests {
             }
         }
         assert!(saw_error, "did not receive PrLoadError");
+        assert_eq!(
+            git.fetched_prs.lock().unwrap().clone(),
+            vec![1],
+            "missing refs must attempt one on-demand fetch before erroring"
+        );
+    }
+
+    /// Enter can beat the bulk fetch. A missing ref must trigger a targeted
+    /// single-PR fetch and then load normally — not error out.
+    #[test]
+    fn open_pr_fetches_missing_ref_on_demand_then_loads() {
+        let detail = fixture_detail();
+        let head_sha = detail.head_ref_oid.clone();
+        let base_sha = detail.base_ref_oid.clone();
+        let number = detail.number;
+        let pr = pr_from_fixture(&detail);
+
+        let gh = FakeGh::new();
+        let mut git = FakeGit::new("/tmp/repo");
+        // Refs exist only after a fetch — simulates a cold start.
+        git.refs_on_fetch.insert(format!("refs/prpr/pr-{number}"), head_sha.clone());
+        git.refs_on_fetch.insert(format!("origin/{}", pr.base_ref_name), base_sha.clone());
+        git.commits.insert((base_sha.clone(), head_sha.clone()), detail.commits.clone());
+        git.diffs.insert(
+            (base_sha.clone(), head_sha.clone()),
+            include_str!("../../tests/fixtures/diff_basic.patch").to_string(),
+        );
+        let git = Arc::new(git);
+        let worker = Worker::spawn("/tmp/repo".into(), Arc::new(gh), git.clone(), 7);
+        worker.send(Request::OpenPr(pr));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut got_detail = false;
+        while std::time::Instant::now() < deadline && !got_detail {
+            match worker.rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                Ok(Response::PrDetail { number: n, result: Ok(_) }) if n == number => {
+                    got_detail = true;
+                }
+                Ok(Response::PrLoadError { error, .. }) => panic!("unexpected error: {error}"),
+                Ok(_) => {}
+                Err(_) => {}
+            }
+        }
+        assert!(got_detail, "cold-start OpenPr never produced PrDetail");
+        assert_eq!(git.fetched_prs.lock().unwrap().clone(), vec![number]);
     }
 
     #[test]

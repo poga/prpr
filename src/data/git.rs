@@ -64,6 +64,9 @@ pub trait GitClient: Send + Sync {
     /// Fetch the given PR numbers' head refs (into `refs/prpr/pr-<n>`)
     /// plus each listed base branch — all in one git invocation.
     fn fetch_pr_refs(&self, repo_root: &Path, numbers: &[u32], bases: &[String]) -> Result<()>;
+    /// Targeted fetch of one PR's head ref plus its base branch. Used when
+    /// a PR is opened before the bulk fetch has primed its ref.
+    fn fetch_pr_ref(&self, repo_root: &Path, number: u32, base: &str) -> Result<()>;
     /// Three-dot diff between `base` and `head` against local refs.
     /// Mirrors `gh pr diff` but is offline once both oids are fetched.
     fn diff(&self, repo_root: &Path, base: &str, head: &str) -> Result<String>;
@@ -178,6 +181,15 @@ impl GitClient for GitCli {
             vec!["fetch".into(), "--quiet".into(), "origin".into()];
         args.extend(fetch_refspecs(numbers, bases));
         run(Command::new("git").current_dir(repo_root).args(&args))?;
+        Ok(())
+    }
+
+    fn fetch_pr_ref(&self, repo_root: &Path, number: u32, base: &str) -> Result<()> {
+        let head = format!("+refs/pull/{number}/head:refs/prpr/pr-{number}");
+        let base = format!("+refs/heads/{base}:refs/remotes/origin/{base}");
+        run(Command::new("git")
+            .current_dir(repo_root)
+            .args(["fetch", "--quiet", "origin", &head, &base]))?;
         Ok(())
     }
 
@@ -457,12 +469,17 @@ pub(crate) mod fakes {
     use super::*;
     use std::collections::HashMap;
     use std::path::PathBuf;
+    use std::sync::Mutex;
 
     pub struct FakeGit {
         pub root: PathBuf,
         pub has_gh: bool,
         /// Keyed by ref name (e.g. `refs/prpr/pr-7`, `origin/main`) → oid.
         pub refs: HashMap<String, String>,
+        /// Refs that only resolve after a fetch — simulates a cold start.
+        pub refs_on_fetch: HashMap<String, String>,
+        /// PR numbers passed to `fetch_pr_ref`, in call order.
+        pub fetched_prs: Mutex<Vec<u32>>,
         /// Keyed by (base, head) → commits list returned by `log_commits`.
         pub commits: HashMap<(String, String), Vec<Commit>>,
         pub blames: HashMap<(String, String), String>,
@@ -483,6 +500,8 @@ pub(crate) mod fakes {
                 root: root.into(),
                 has_gh: true,
                 refs: HashMap::new(),
+                refs_on_fetch: HashMap::new(),
+                fetched_prs: Mutex::new(vec![]),
                 commits: HashMap::new(),
                 blames: HashMap::new(),
                 diffs: HashMap::new(),
@@ -501,10 +520,15 @@ pub(crate) mod fakes {
             Ok(self.has_gh)
         }
         fn rev_parse(&self, _root: &Path, refname: &str) -> Result<String> {
-            self.refs
-                .get(refname)
-                .cloned()
-                .ok_or_else(|| anyhow!("no fake ref for {refname}"))
+            if let Some(oid) = self.refs.get(refname) {
+                return Ok(oid.clone());
+            }
+            if !self.fetched_prs.lock().unwrap().is_empty()
+                && let Some(oid) = self.refs_on_fetch.get(refname)
+            {
+                return Ok(oid.clone());
+            }
+            Err(anyhow!("no fake ref for {refname}"))
         }
         fn log_commits(&self, _root: &Path, base: &str, head: &str) -> Result<Vec<Commit>> {
             Ok(self
@@ -514,6 +538,10 @@ pub(crate) mod fakes {
                 .unwrap_or_default())
         }
         fn fetch_pr_refs(&self, _root: &Path, _numbers: &[u32], _bases: &[String]) -> Result<()> {
+            Ok(())
+        }
+        fn fetch_pr_ref(&self, _root: &Path, number: u32, _base: &str) -> Result<()> {
+            self.fetched_prs.lock().unwrap().push(number);
             Ok(())
         }
         fn diff(&self, _root: &Path, base: &str, head: &str) -> Result<String> {
