@@ -26,7 +26,7 @@ use crate::config::Config;
 use crate::data::cache::Cache;
 use crate::data::gh::GhClient;
 use crate::data::git::GitClient;
-use crate::data::pr::{Pr, PrEnrichment};
+use crate::data::pr::{MergeState, Pr, PrEnrichment};
 use crate::data::worker::{Request, Response, Worker};
 use crate::keys::{Action, FocusedView, MouseAction, dispatch, mouse_dispatch};
 use crate::view::commits_modal::{self, CommitsModalState};
@@ -126,6 +126,8 @@ pub struct AppState {
     pub list_gen: u32,
     /// Most recent enrichment, kept so a late ListFast can re-apply it.
     pub enrichment_for_gen: Option<(u32, Vec<PrEnrichment>)>,
+    /// False until the first ListRefsReady; file lists defer on a cold start.
+    pub refs_ready: bool,
 }
 
 impl AppState {
@@ -157,6 +159,7 @@ impl AppState {
             list_refresh_in_flight: false,
             list_gen: 0,
             enrichment_for_gen: None,
+            refs_ready: false,
         }
     }
 }
@@ -206,6 +209,10 @@ fn after_selection_change(app: &App, st: &mut AppState) {
         return;
     };
     st.list.expanded = Some(ExpandedFiles::Loading { number });
+    // A ListFiles against unfetched refs can only error; wait for refs.
+    if !st.refs_ready {
+        return;
+    }
     app.request(Request::ListFiles { number, base_ref });
 }
 
@@ -306,6 +313,7 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
                     apply_enrichments(&mut st.list.prs, &es);
                 }
                 st.list.loading = false;
+                st.list.manual_refresh_in_flight = false;
                 st.list.loading_stage = None;
                 st.list.status = String::new();
                 let new_numbers: Vec<u32> = st
@@ -342,7 +350,28 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
             // light-fields-only glyphs.
         }
         Response::ListEnriched { .. } => { /* stale; drop */ }
-        Response::ListRefsReady { .. } => { /* handled in the UI task */ }
+        Response::ListRefsReady { generation, result } if generation == st.list_gen => {
+            match result {
+                Ok(states) => {
+                    for (number, verdict) in states {
+                        if let Some(p) = st.list.prs.iter_mut().find(|p| p.number == number) {
+                            let definite = matches!(
+                                p.merge_state(),
+                                Some(MergeState::Mergeable) | Some(MergeState::Conflicting)
+                            );
+                            if !definite {
+                                p.mergeable = Some(verdict);
+                            }
+                        }
+                    }
+                }
+                Err(e) => st.list.status = format!("fetching refs failed: {e:#}"),
+            }
+            st.list.loading_stage = None;
+            st.refs_ready = true;
+            after_selection_change(app, st);
+        }
+        Response::ListRefsReady { .. } => { /* stale; drop */ }
         Response::PrDetail { number, result: Ok(detail) } => {
             if let Some(r) = st.review.as_mut()
                 && st.current_pr == Some(number)
@@ -1675,6 +1704,80 @@ mod tests {
             Response::ListFast { generation: g, result: Ok(vec![]) },
         );
         assert!(!st.list.enriching);
+    }
+
+    #[test]
+    fn list_fast_unblocks_manual_refresh_before_enrichment() {
+        let mut st = dummy_app_state();
+        let mut cache = Cache::new();
+        let mut app = test_app_for_state(&mut cache);
+        send_refresh(&app, &mut st, false);
+        assert!(st.list.manual_refresh_in_flight);
+        let g = st.list_gen;
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::ListFast {
+                generation: g,
+                result: Ok(vec![make_pr(1)]),
+            },
+        );
+        assert!(
+            !st.list.manual_refresh_in_flight,
+            "rows arrived — input must unblock"
+        );
+        assert!(st.list.enriching, "enrichment is still running");
+    }
+
+    #[test]
+    fn refs_ready_stamps_verdicts_but_never_overwrites_definite_enrichment() {
+        let mut st = dummy_app_state();
+        let mut cache = Cache::new();
+        let mut app = test_app_for_state(&mut cache);
+        // rows present; PR 1 has no verdict, PR 2 was already enriched CONFLICTING
+        st.list.prs = vec![make_pr(1), make_pr(2)];
+        st.list.prs[1].mergeable = Some("CONFLICTING".into());
+        let g = st.list_gen;
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::ListRefsReady {
+                generation: g,
+                result: Ok(vec![(1, "MERGEABLE".into()), (2, "MERGEABLE".into())]),
+            },
+        );
+        assert_eq!(st.list.prs[0].mergeable.as_deref(), Some("MERGEABLE"));
+        assert_eq!(
+            st.list.prs[1].mergeable.as_deref(),
+            Some("CONFLICTING"),
+            "a definite enrichment verdict must not be overwritten by the local check"
+        );
+        assert!(st.refs_ready);
+    }
+
+    #[test]
+    fn selection_change_defers_files_request_until_refs_ready() {
+        let mut st = dummy_app_state();
+        let mut cache = Cache::new();
+        let mut app = test_app_for_state(&mut cache);
+        st.list.prs = vec![make_pr(1)];
+        st.refs_ready = false;
+        after_selection_change(&app, &mut st);
+        assert!(matches!(
+            st.list.expanded,
+            Some(ExpandedFiles::Loading { number: 1 })
+        ));
+        // ListRefsReady flips the gate and re-issues the request path.
+        let g = st.list_gen;
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::ListRefsReady {
+                generation: g,
+                result: Ok(vec![]),
+            },
+        );
+        assert!(st.refs_ready);
     }
 
     #[test]
