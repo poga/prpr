@@ -1,13 +1,13 @@
 //! Worker thread + request/response channels.
 //!
-//! All blocking subprocess work (`gh pr list`, `git fetch`, `git diff`,
-//! `git blame`, `gh pr merge`) runs on a single worker thread.
-//! The UI thread sends `Request`s and drains `Response`s every iteration of
-//! its event loop, so the screen stays redraw-able while subprocess calls
-//! run.
+//! Interactive subprocess work (`git diff`, `git blame`, `gh pr merge`)
+//! runs on a single worker thread, FIFO. `RefreshList` is the exception:
+//! its gh/network/fetch pipeline runs on detached threads (one for the
+//! fast list + ref fetch, one for enrichment) so a slow refresh never
+//! delays opening a PR. All `git fetch` calls share one lock.
 //!
-//! There is exactly one worker. Requests are processed FIFO. The worker
-//! exits cleanly when `Worker` is dropped (the request channel closes).
+//! The UI thread sends `Request`s and drains `Response`s every iteration
+//! of its event loop. The worker exits cleanly when `Worker` is dropped.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -84,6 +84,13 @@ pub enum Response {
         generation: u32,
         result: anyhow::Result<Vec<crate::data::pr::PrEnrichment>>,
     },
+    /// Refs for the current generation are fetched and conflict-checked.
+    /// Carries `(number, "MERGEABLE" | "CONFLICTING")` per open PR git could
+    /// merge; refs git can't merge are absent (enrichment fills them).
+    ListRefsReady {
+        generation: u32,
+        result: anyhow::Result<Vec<(u32, String)>>,
+    },
     /// Granular PR-load events (see worker pipeline).
     PrDetail {
         number: u32,
@@ -128,44 +135,40 @@ const ENRICH_RETRY_DELAY: Duration = Duration::from_secs(2);
 /// Upper bound on concurrent `git merge-tree` subprocesses.
 const MERGE_CHECK_THREADS: usize = 8;
 
-/// Stamp each open PR's conflict state from the refs just fetched, so the
-/// first draw has it: GitHub computes `mergeable` lazily and answers UNKNOWN
-/// to a cold query. Refs git can't merge stay unset for enrichment to fill.
-fn apply_local_merge_states(git: &dyn GitClient, repo_root: &Path, prs: &mut [Pr]) {
-    let targets: Vec<(usize, String, String)> = prs
+/// Locally computed conflict verdicts for the refs just fetched: GitHub
+/// computes `mergeable` lazily and answers UNKNOWN to a cold query. Refs
+/// git can't merge are absent from the result (enrichment fills them).
+fn local_merge_states(git: &dyn GitClient, repo_root: &Path, prs: &[Pr]) -> Vec<(u32, String)> {
+    let targets: Vec<(u32, String, String)> = prs
         .iter()
-        .enumerate()
-        .filter(|(_, p)| p.state == crate::data::pr::PrState::Open)
-        .map(|(i, p)| {
-            (i, format!("origin/{}", p.base_ref_name), format!("refs/prpr/pr-{}", p.number))
+        .filter(|p| p.state == crate::data::pr::PrState::Open)
+        .map(|p| {
+            (p.number, format!("origin/{}", p.base_ref_name), format!("refs/prpr/pr-{}", p.number))
         })
         .collect();
     if targets.is_empty() {
-        return;
+        return vec![];
     }
-
-    // ~12ms per PR; serial checks would stall the draw on a 200-PR repo.
+    // ~12ms per PR; serial checks would stall a 200-PR repo for seconds.
     let chunk = targets.len().div_ceil(MERGE_CHECK_THREADS.min(targets.len()));
-    let verdicts: Vec<(usize, bool)> = thread::scope(|s| {
+    thread::scope(|s| {
         let handles: Vec<_> = targets
             .chunks(chunk)
             .map(|c| {
                 s.spawn(move || {
                     c.iter()
-                        .filter_map(|(i, base, head)| {
-                            git.merge_conflicts(repo_root, base, head).ok().map(|c| (*i, c))
+                        .filter_map(|(n, base, head)| {
+                            git.merge_conflicts(repo_root, base, head).ok().map(|conflicting| {
+                                let v = if conflicting { "CONFLICTING" } else { "MERGEABLE" };
+                                (*n, v.to_string())
+                            })
                         })
                         .collect::<Vec<_>>()
                 })
             })
             .collect();
         handles.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
-    });
-
-    for (i, conflicting) in verdicts {
-        prs[i].mergeable =
-            Some(if conflicting { "CONFLICTING" } else { "MERGEABLE" }.to_string());
-    }
+    })
 }
 
 pub struct Worker {
@@ -241,15 +244,13 @@ fn run_worker(
     while let Ok(req) = req_rx.recv() {
         match req {
             Request::RefreshList { generation } => {
-                // The list renders only after every OPEN PR's head ref
-                // is locally fetched, so subsequent OpenPr is guaranteed
-                // zero-network. Sequence on the worker thread:
-                //   1. list_prs_fast — get the rows and their states.
-                //   2. fetch_pr_refs for open PR numbers (+ origin/*).
-                //   3. emit ListFast.
-                // list_prs_enriched is fired on a detached thread so it
-                // doesn't gate the fast path; its response carries the
-                // same generation and is merged when it arrives.
+                // Two detached threads, neither gating this worker loop:
+                //   - fast: list_prs_fast → emit ListFast rows right away,
+                //     then fetch_pr_refs and emit ListRefsReady with local
+                //     conflict verdicts once refs land.
+                //   - enrichment: list_prs_enriched, re-polled while
+                //     GitHub's mergeable answer is still UNKNOWN.
+                // Both carry `generation`; the UI merges whichever lands.
                 let gh_enr = Arc::clone(&gh);
                 let repo_enr = repo_root.clone();
                 let tx_enr = res_tx.clone();
@@ -277,39 +278,51 @@ fn run_worker(
                     }
                 });
 
-                let _ = res_tx.send(Response::ListProgress {
-                    generation,
-                    stage: ListStage::FetchingList,
-                });
-                let combined = match gh.list_prs_fast(&repo_root) {
-                    Err(e) => Err(e),
-                    Ok(mut prs) => {
-                        let open: Vec<u32> = prs
-                            .iter()
-                            .filter(|p| p.state == crate::data::pr::PrState::Open)
-                            .map(|p| p.number)
-                            .collect();
-                        let bases: Vec<String> = prs
-                            .iter()
-                            .filter(|p| p.state == crate::data::pr::PrState::Open)
-                            .map(|p| p.base_ref_name.clone())
-                            .collect();
-                        let _ = res_tx.send(Response::ListProgress {
-                            generation,
-                            stage: ListStage::FetchingRefs,
-                        });
-                        match git.fetch_pr_refs(&repo_root, &open, &bases) {
-                            Ok(()) => {
-                                apply_local_merge_states(&*git, &repo_root, &mut prs);
-                                Ok(prs)
-                            }
-                            Err(e) => Err(anyhow::anyhow!("fetching open PR refs: {e:#}")),
+                // The fast pipeline also runs detached so interactive
+                // requests (OpenPr, ListFiles) never queue behind network.
+                let gh_fast = Arc::clone(&gh);
+                let git_fast = Arc::clone(&git);
+                let repo_fast = repo_root.clone();
+                let tx_fast = res_tx.clone();
+                let lock = Arc::clone(&fetch_lock);
+                thread::spawn(move || {
+                    let _ = tx_fast.send(Response::ListProgress {
+                        generation,
+                        stage: ListStage::FetchingList,
+                    });
+                    let prs = match gh_fast.list_prs_fast(&repo_fast) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            let _ = tx_fast.send(Response::ListFast { generation, result: Err(e) });
+                            return;
                         }
-                    }
-                };
-                let _ = res_tx.send(Response::ListFast {
-                    generation,
-                    result: combined,
+                    };
+                    let open: Vec<u32> = prs
+                        .iter()
+                        .filter(|p| p.state == crate::data::pr::PrState::Open)
+                        .map(|p| p.number)
+                        .collect();
+                    let bases: Vec<String> = prs
+                        .iter()
+                        .filter(|p| p.state == crate::data::pr::PrState::Open)
+                        .map(|p| p.base_ref_name.clone())
+                        .collect();
+                    // Rows first: the list draws now; refs and conflict
+                    // verdicts stream in behind it.
+                    let _ = tx_fast.send(Response::ListFast { generation, result: Ok(prs.clone()) });
+                    let _ = tx_fast.send(Response::ListProgress {
+                        generation,
+                        stage: ListStage::FetchingRefs,
+                    });
+                    let fetched = {
+                        let _g = lock.lock().unwrap();
+                        git_fast.fetch_pr_refs(&repo_fast, &open, &bases)
+                    };
+                    let result = match fetched {
+                        Ok(()) => Ok(local_merge_states(&*git_fast, &repo_fast, &prs)),
+                        Err(e) => Err(anyhow::anyhow!("fetching open PR refs: {e:#}")),
+                    };
+                    let _ = tx_fast.send(Response::ListRefsReady { generation, result });
                 });
             }
             Request::OpenPr(pr) => {
@@ -664,8 +677,10 @@ mod tests {
         assert_eq!(git.fetched_prs.lock().unwrap().clone(), vec![number]);
     }
 
+    /// Rows must not wait for the ref fetch: ListFast comes right after the
+    /// FetchingList stage, then FetchingRefs and the terminal ListRefsReady.
     #[test]
-    fn refresh_emits_progress_stages_before_list_fast() {
+    fn refresh_emits_rows_before_ref_fetch_stage() {
         use crate::data::pr::{Author, Pr, PrState};
 
         let mut gh = FakeGh::new();
@@ -689,28 +704,29 @@ mod tests {
 
         worker.send(Request::RefreshList { generation: 9 });
 
-        // Collect every progress stage observed before ListFast lands.
-        // ListEnriched runs on a detached thread so it may interleave —
-        // ignore it here.
-        let mut stages: Vec<ListStage> = vec![];
+        let mut events: Vec<String> = vec![];
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            let resp = worker
-                .rx
-                .recv_timeout(std::time::Duration::from_millis(500))
-                .expect("worker stalled");
-            match resp {
-                Response::ListProgress { generation: 9, stage } => stages.push(stage),
-                Response::ListFast { generation: 9, .. } => break,
-                Response::ListEnriched { .. } => {}
-                other => panic!("unexpected response: {other:?}"),
+            assert!(std::time::Instant::now() < deadline, "ListRefsReady never arrived");
+            match worker.rx.recv_timeout(std::time::Duration::from_millis(500)) {
+                Ok(Response::ListProgress { generation: 9, stage }) => {
+                    events.push(format!("stage:{stage:?}"));
+                }
+                Ok(Response::ListFast { generation: 9, result: Ok(_) }) => {
+                    events.push("fast".into());
+                }
+                Ok(Response::ListRefsReady { generation: 9, result: Ok(_) }) => {
+                    events.push("refs".into());
+                    break;
+                }
+                Ok(Response::ListEnriched { .. }) => {}
+                Ok(other) => panic!("unexpected response: {other:?}"),
+                Err(_) => {}
             }
-            assert!(std::time::Instant::now() < deadline, "ListFast never arrived");
         }
         assert_eq!(
-            stages,
-            vec![ListStage::FetchingList, ListStage::FetchingRefs],
-            "expected fetch-list → fetch-refs in order before ListFast"
+            events,
+            vec!["stage:FetchingList", "fast", "stage:FetchingRefs", "refs"],
         );
     }
 
@@ -815,6 +831,7 @@ mod tests {
                 .expect("worker channel closed unexpectedly");
             match resp {
                 Response::ListProgress { generation: 42, .. } => {}
+                Response::ListRefsReady { generation: 42, .. } => {}
                 Response::ListFast { generation: 42, result: Ok(prs) } => {
                     assert_eq!(prs.len(), 1);
                     assert_eq!(prs[0].number, 7);
@@ -907,10 +924,10 @@ mod tests {
         assert!(gh.merges.lock().unwrap().is_empty(), "merge must not be attempted");
     }
 
-    /// The first draw renders `ListFast`, and a cold GitHub says UNKNOWN — so
-    /// those rows must already carry conflict state from the local refs.
+    /// GitHub answers UNKNOWN to a cold mergeable query, so the conflict
+    /// verdicts must come from local git via ListRefsReady.
     #[test]
-    fn list_fast_rows_carry_locally_computed_conflict_state() {
+    fn refs_ready_carries_locally_computed_conflict_state() {
         use crate::data::pr::{Author, Pr, PrState};
 
         let mk = |number: u32, head: &str| Pr {
@@ -942,22 +959,16 @@ mod tests {
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            assert!(std::time::Instant::now() < deadline, "timed out waiting for ListFast");
+            assert!(std::time::Instant::now() < deadline, "timed out waiting for ListRefsReady");
             match worker.rx.recv_timeout(std::time::Duration::from_millis(500)) {
-                Ok(Response::ListFast { generation: 1, result: Ok(prs) }) => {
-                    let by: std::collections::HashMap<u32, &Pr> =
-                        prs.iter().map(|p| (p.number, p)).collect();
-                    assert!(
-                        by[&7].is_conflicting(),
-                        "first-draw row for the conflicting PR must show the conflict"
-                    );
-                    assert!(
-                        !by[&8].is_conflicting(),
-                        "cleanly-merging PR must not be flagged as conflicting"
-                    );
+                Ok(Response::ListRefsReady { generation: 1, result: Ok(states) }) => {
+                    let by: std::collections::HashMap<u32, &str> =
+                        states.iter().map(|(n, s)| (*n, s.as_str())).collect();
+                    assert_eq!(by.get(&7), Some(&"CONFLICTING"));
+                    assert_eq!(by.get(&8), Some(&"MERGEABLE"));
                     return;
                 }
-                Ok(Response::ListFast { result: Err(e), .. }) => panic!("ListFast failed: {e}"),
+                Ok(Response::ListRefsReady { result: Err(e), .. }) => panic!("refs failed: {e}"),
                 Ok(_) => {}
                 Err(_) => {}
             }

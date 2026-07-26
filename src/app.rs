@@ -342,6 +342,7 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
             // light-fields-only glyphs.
         }
         Response::ListEnriched { .. } => { /* stale; drop */ }
+        Response::ListRefsReady { .. } => { /* handled in the UI task */ }
         Response::PrDetail { number, result: Ok(detail) } => {
             if let Some(r) = st.review.as_mut()
                 && st.current_pr == Some(number)
