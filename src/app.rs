@@ -5,6 +5,7 @@
 //! `Worker` thread and round-trips through channels (see `data::worker`).
 //! The UI drains worker responses each loop iteration.
 
+use std::collections::HashMap;
 use std::io::{self, Stdout};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -36,6 +37,7 @@ use crate::view::pr_list::{ExpandedFiles, PrListState};
 use crate::view::pr_review::PrReviewState;
 
 const AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const FILES_DEBOUNCE: Duration = Duration::from_millis(100);
 
 fn should_auto_refresh(
     focused: FocusedView,
@@ -108,6 +110,13 @@ impl App {
     }
 }
 
+/// A debounced ListFiles request armed by a selection change.
+pub struct PendingFiles {
+    pub number: u32,
+    pub base_ref: String,
+    pub at: Instant,
+}
+
 pub struct AppState {
     pub focused: FocusedView,
     pub list: PrListState,
@@ -128,6 +137,10 @@ pub struct AppState {
     pub enrichment_for_gen: Option<(u32, Vec<PrEnrichment>)>,
     /// False until the first ListRefsReady; file lists defer on a cold start.
     pub refs_ready: bool,
+    /// File lists by PR number; valid until refs move (cleared on refs ready).
+    pub files_cache: HashMap<u32, Vec<crate::data::pr::FileMeta>>,
+    /// Debounced ListFiles request; sent once selection rests FILES_DEBOUNCE.
+    pub pending_files: Option<PendingFiles>,
 }
 
 impl AppState {
@@ -160,6 +173,8 @@ impl AppState {
             list_gen: 0,
             enrichment_for_gen: None,
             refs_ready: false,
+            files_cache: HashMap::new(),
+            pending_files: None,
         }
     }
 }
@@ -196,9 +211,9 @@ pub fn restore_terminal() -> Result<()> {
     Ok(())
 }
 
-/// Trigger a fresh `ListFiles` request for whatever row is currently
-/// selected. Always re-issues (no cache).
-fn after_selection_change(app: &App, st: &mut AppState) {
+/// Refresh the expanded file list for the selected row: serve from cache,
+/// or show a loading row and arm a debounced ListFiles request.
+fn after_selection_change(st: &mut AppState) {
     let Some((number, base_ref)) = st
         .list
         .visible_prs()
@@ -206,14 +221,35 @@ fn after_selection_change(app: &App, st: &mut AppState) {
         .map(|p| (p.number, p.base_ref_name.clone()))
     else {
         st.list.expanded = None;
+        st.pending_files = None;
         return;
     };
+    if let Some(files) = st.files_cache.get(&number) {
+        st.list.expanded = Some(ExpandedFiles::Ready { number, files: files.clone() });
+        st.pending_files = None;
+        return;
+    }
     st.list.expanded = Some(ExpandedFiles::Loading { number });
     // A ListFiles against unfetched refs can only error; wait for refs.
     if !st.refs_ready {
+        st.pending_files = None;
         return;
     }
-    app.request(Request::ListFiles { number, base_ref });
+    st.pending_files = Some(PendingFiles { number, base_ref, at: Instant::now() });
+}
+
+/// Pop the pending ListFiles request once it has rested a full debounce
+/// window, so holding j/k doesn't fire one subprocess per row.
+fn take_due_files_request(st: &mut AppState, now: Instant) -> Option<(u32, String)> {
+    let due = st
+        .pending_files
+        .as_ref()
+        .is_some_and(|p| now.duration_since(p.at) >= FILES_DEBOUNCE);
+    if !due {
+        return None;
+    }
+    let p = st.pending_files.take().unwrap();
+    Some((p.number, p.base_ref))
 }
 
 fn send_refresh(app: &App, st: &mut AppState, silent: bool) {
@@ -258,6 +294,10 @@ pub fn run(term: &mut Term, app: &mut App, st: &mut AppState) -> Result<()> {
             AUTO_REFRESH_INTERVAL,
         ) {
             send_refresh(app, st, true);
+        }
+
+        if let Some((number, base_ref)) = take_due_files_request(st, Instant::now()) {
+            app.request(Request::ListFiles { number, base_ref });
         }
 
         term.draw(|f| draw(f, app, st))?;
@@ -325,7 +365,7 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
                 st.list.selected =
                     reselect_by_number(prev_selected, &new_numbers, st.list.selected);
                 st.list.expanded = None;
-                after_selection_change(app, st);
+                after_selection_change(st);
             }
             Err(e) => {
                 st.list_refresh_in_flight = false;
@@ -369,7 +409,8 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
             }
             st.list.loading_stage = None;
             st.refs_ready = true;
-            after_selection_change(app, st);
+            st.files_cache.clear();
+            after_selection_change(st);
         }
         Response::ListRefsReady { .. } => { /* stale; drop */ }
         Response::PrDetail { number, result: Ok(detail) } => {
@@ -462,7 +503,7 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
                 st.list.visible_prs().iter().map(|p| p.number).collect();
             st.list.selected = reselect_by_number(prev_selected, &new_numbers, prev_idx);
             st.list.expanded = None;
-            after_selection_change(app, st);
+            after_selection_change(st);
         }
         Response::MergeDone { number, result: Err(e) } => {
             st.merging = None;
@@ -488,6 +529,9 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
             set_draft_status(st, number, format!("draft toggle #{number} failed: {e}"));
         }
         Response::ListFiles { number, result } => {
+            if let Ok(files) = &result {
+                st.files_cache.insert(number, files.clone());
+            }
             let sel_number = st
                 .list
                 .visible_prs()
@@ -634,7 +678,7 @@ fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) 
     {
         st.pending_g = false;
         st.list.selected = 0;
-        after_selection_change(app, st);
+        after_selection_change(st);
         return;
     }
     st.pending_g = false;
@@ -651,7 +695,7 @@ fn handle_key(app: &mut App, st: &mut AppState, ev: crossterm::event::KeyEvent) 
             crossterm::event::KeyCode::Char(c) => buf.push(c),
             _ => {}
         }
-        after_selection_change(app, st);
+        after_selection_change(st);
         return;
     }
 
@@ -665,14 +709,14 @@ fn handle_action(app: &mut App, st: &mut AppState, action: Action) {
         Action::ListUp => {
             if st.list.selected > 0 {
                 st.list.selected -= 1;
-                after_selection_change(app, st);
+                after_selection_change(st);
             }
         }
         Action::ListDown => {
             let n = st.list.visible_prs().len();
             if st.list.selected + 1 < n {
                 st.list.selected += 1;
-                after_selection_change(app, st);
+                after_selection_change(st);
             }
         }
         Action::ListTop => {
@@ -681,7 +725,7 @@ fn handle_action(app: &mut App, st: &mut AppState, action: Action) {
         Action::ListBottom => {
             let n = st.list.visible_prs().len();
             st.list.selected = n.saturating_sub(1);
-            after_selection_change(app, st);
+            after_selection_change(st);
         }
         Action::ListOpen => {
             if let Some(pr) = st
@@ -936,7 +980,7 @@ fn handle_mouse(app: &mut App, st: &mut AppState, ev: crossterm::event::MouseEve
                     st.list.selected = st.list.selected.saturating_sub((-d) as usize);
                 }
                 if st.list.selected != prev {
-                    after_selection_change(app, st);
+                    after_selection_change(st);
                 }
             } else {
                 move_review(app, st, d as i32);
@@ -947,7 +991,7 @@ fn handle_mouse(app: &mut App, st: &mut AppState, ev: crossterm::event::MouseEve
                 let idx = (row - 2) as usize;
                 if idx < st.list.visible_prs().len() && st.list.selected != idx {
                     st.list.selected = idx;
-                    after_selection_change(app, st);
+                    after_selection_change(st);
                 }
             }
         }
@@ -1340,6 +1384,78 @@ mod tests {
             }
             ref other => panic!("expected Error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn selection_change_serves_files_from_cache_without_request() {
+        let mut st = AppState::new("prpr".into(), "main".into());
+        st.refs_ready = true;
+        st.list.prs = vec![make_pr(1)];
+        st.files_cache.insert(
+            1,
+            vec![FileMeta { path: "a.rs".into(), additions: 1, deletions: 0 }],
+        );
+        after_selection_change(&mut st);
+        assert!(matches!(
+            &st.list.expanded,
+            Some(ExpandedFiles::Ready { number: 1, files }) if files.len() == 1
+        ));
+        assert!(st.pending_files.is_none(), "cache hit must not arm a request");
+    }
+
+    #[test]
+    fn uncached_selection_arms_debounce_instead_of_sending() {
+        let mut st = AppState::new("prpr".into(), "main".into());
+        st.refs_ready = true;
+        st.list.prs = vec![make_pr(1)];
+        after_selection_change(&mut st);
+        assert!(matches!(st.list.expanded, Some(ExpandedFiles::Loading { number: 1 })));
+        let p = st.pending_files.as_ref().expect("pending request armed");
+        assert_eq!(p.number, 1);
+    }
+
+    #[test]
+    fn debounce_flushes_only_after_window_elapses() {
+        let mut st = AppState::new("prpr".into(), "main".into());
+        st.refs_ready = true;
+        st.list.prs = vec![make_pr(1)];
+        after_selection_change(&mut st);
+        let armed_at = st.pending_files.as_ref().unwrap().at;
+        assert!(take_due_files_request(&mut st, armed_at).is_none(), "too early");
+        let due = take_due_files_request(&mut st, armed_at + FILES_DEBOUNCE);
+        assert_eq!(due, Some((1, "main".into())));
+        assert!(st.pending_files.is_none(), "flush consumes the pending slot");
+    }
+
+    #[test]
+    fn list_files_response_populates_cache() {
+        let mut app = make_app();
+        let mut st = AppState::new("prpr".into(), "main".into());
+        st.list.prs = vec![make_pr(1)];
+        st.list.expanded = Some(ExpandedFiles::Loading { number: 1 });
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::ListFiles {
+                number: 1,
+                result: Ok(vec![FileMeta { path: "a.rs".into(), additions: 2, deletions: 1 }]),
+            },
+        );
+        assert_eq!(st.files_cache.get(&1).map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn refs_ready_invalidates_files_cache() {
+        let mut app = make_app();
+        let mut st = AppState::new("prpr".into(), "main".into());
+        st.files_cache.insert(1, vec![]);
+        let g = st.list_gen;
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::ListRefsReady { generation: g, result: Ok(vec![]) },
+        );
+        assert!(st.files_cache.is_empty(), "new refs mean cached file lists are stale");
     }
 
     #[test]
@@ -1762,7 +1878,7 @@ mod tests {
         let mut app = test_app_for_state(&mut cache);
         st.list.prs = vec![make_pr(1)];
         st.refs_ready = false;
-        after_selection_change(&app, &mut st);
+        after_selection_change(&mut st);
         assert!(matches!(
             st.list.expanded,
             Some(ExpandedFiles::Loading { number: 1 })
