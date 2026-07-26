@@ -439,6 +439,7 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
             if st.current_pr == Some(number) {
                 let path = if let Some(r) = st.review.as_mut() {
                     r.files = files;
+                    r.syntax_cache.clear();
                     r.status = format!("{} files", r.files.len());
                     r.files.get(r.file_index).map(|f| f.path.clone())
                 } else {
@@ -552,7 +553,7 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
     }
 }
 
-fn draw(f: &mut ratatui::Frame, _app: &App, st: &AppState) {
+fn draw(f: &mut ratatui::Frame, _app: &App, st: &mut AppState) {
     let area = f.area();
     if area.width < 80 || area.height < 24 {
         let msg = ratatui::widgets::Paragraph::new("terminal too small (need ≥80×24)")
@@ -568,7 +569,7 @@ fn draw(f: &mut ratatui::Frame, _app: &App, st: &AppState) {
         | FocusedView::FilePicker
         | FocusedView::MergeModal
         | FocusedView::CommitsModal => {
-            if let Some(review) = st.review.as_ref() {
+            if let Some(review) = st.review.as_mut() {
                 if review.detail.is_some() {
                     crate::view::pr_review::render(f, area, review);
                 } else {
@@ -841,6 +842,7 @@ fn handle_action(app: &mut App, st: &mut AppState, action: Action) {
                     r.files.clear();
                     r.colors.clear();
                     r.commit_stats.clear();
+                    r.syntax_cache.clear();
                     r.status = "loading…".into();
                 }
                 app.request(Request::OpenPr(pr));
