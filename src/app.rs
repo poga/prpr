@@ -284,6 +284,8 @@ fn take_due_files_request(st: &mut AppState, now: Instant) -> Option<(u32, Strin
 fn send_refresh(app: &App, st: &mut AppState, silent: bool) {
     st.last_refresh_at = Some(Instant::now());
     st.list.expanded = None;
+    // A stale debounced ListFiles must not flush mid-refresh.
+    st.pending_files = None;
     st.list_refresh_in_flight = true;
     // Arm at refresh start so ListFast can't re-arm after ListEnriched clears.
     st.list.enriching = true;
@@ -356,6 +358,17 @@ pub fn run(term: &mut Term, app: &mut App, st: &mut AppState) -> Result<()> {
         }
     }
     Ok(())
+}
+
+// A local edit predates its own in-flight silent refresh; poison the gen.
+fn invalidate_stale_refresh(st: &mut AppState) {
+    if !st.list_refresh_in_flight {
+        return;
+    }
+    st.list_gen = st.list_gen.wrapping_add(1);
+    st.list_refresh_in_flight = false;
+    st.list.enriching = false;
+    st.list.loading_stage = None;
 }
 
 fn ensure_blame(app: &App, st: &mut AppState, number: u32, path: &str) {
@@ -547,6 +560,7 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
                 st.list.visible_prs().iter().map(|p| p.number).collect();
             st.list.selected = reselect_by_number(prev_selected, &new_numbers, prev_idx);
             st.list.expanded = None;
+            invalidate_stale_refresh(st);
             after_selection_change(st);
         }
         Response::MergeDone { number, result: Err(e) } => {
@@ -568,12 +582,17 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
                 format!("#{number} marked ready for review")
             };
             set_draft_status(st, number, msg);
+            invalidate_stale_refresh(st);
         }
         Response::SetDraftDone { number, result: Err(e), .. } => {
             set_draft_status(st, number, format!("draft toggle #{number} failed: {e}"));
         }
         Response::ListFiles { number, result } => {
-            if let Ok(files) = &result {
+            // Mid-refresh, this was computed against pre-fetch refs; caching
+            // it would park a stale entry once ListRefsReady clears refs.
+            if let Ok(files) = &result
+                && !st.list_refresh_in_flight
+            {
                 st.files_cache.insert(number, files.clone());
             }
             let sel_number = st
@@ -1473,6 +1492,22 @@ mod tests {
     }
 
     #[test]
+    fn send_refresh_clears_stale_pending_files() {
+        // A debounced ListFiles armed before the refresh must not flush
+        // mid-refresh against refs that are about to move.
+        let mut st = dummy_app_state();
+        let mut cache = Cache::new();
+        let app = test_app_for_state(&mut cache);
+        st.pending_files = Some(PendingFiles {
+            number: 7,
+            base_ref: "main".into(),
+            at: Instant::now(),
+        });
+        send_refresh(&app, &mut st, true);
+        assert!(st.pending_files.is_none());
+    }
+
+    #[test]
     fn list_files_response_populates_cache() {
         let mut app = make_app();
         let mut st = AppState::new("prpr".into(), "main".into());
@@ -1487,6 +1522,30 @@ mod tests {
             },
         );
         assert_eq!(st.files_cache.get(&1).map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn list_files_during_in_flight_refresh_skips_cache_insert() {
+        // Computed against pre-fetch refs; caching it would park a stale
+        // entry once ListRefsReady clears the cache behind it.
+        let mut app = make_app();
+        let mut st = AppState::new("prpr".into(), "main".into());
+        st.list.prs = vec![make_pr(7)];
+        st.list.selected = 0;
+        st.list.expanded = Some(ExpandedFiles::Loading { number: 7 });
+        st.list_refresh_in_flight = true;
+
+        let files = vec![FileMeta { path: "a.rs".into(), additions: 1, deletions: 0 }];
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::ListFiles { number: 7, result: Ok(files.clone()) },
+        );
+        assert!(!st.files_cache.contains_key(&7), "cache insert must be skipped mid-refresh");
+        match st.list.expanded {
+            Some(ExpandedFiles::Ready { number: 7, files: ref f }) => assert_eq!(f, &files),
+            ref other => panic!("expected Ready, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1917,6 +1976,26 @@ mod tests {
     }
 
     #[test]
+    fn refs_ready_err_still_flips_gate_and_reports_failure() {
+        // Anti-strand contract: a failed ref fetch must still flip the gate,
+        // or file lists stay deferred forever after one bad fetch.
+        let mut st = dummy_app_state();
+        let mut cache = Cache::new();
+        let mut app = test_app_for_state(&mut cache);
+        let g = st.list_gen;
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::ListRefsReady {
+                generation: g,
+                result: Err(anyhow::anyhow!("boom")),
+            },
+        );
+        assert!(st.refs_ready, "gate must flip even when the fetch failed");
+        assert!(st.list.status.contains("fetching refs failed"));
+    }
+
+    #[test]
     fn selection_change_defers_files_request_until_refs_ready() {
         let mut st = dummy_app_state();
         let mut cache = Cache::new();
@@ -2245,6 +2324,94 @@ mod tests {
         assert!(!st.list_refresh_in_flight);
         assert!(!st.list.loading);
         assert!(st.list.status.contains("#7"));
+    }
+
+    #[test]
+    fn merge_done_ok_invalidates_stale_in_flight_refresh() {
+        // A silent auto-refresh doesn't block input (unlike a manual one), so
+        // a merge can land mid-refresh. The refresh's ListFast is a gh
+        // snapshot from before the merge; it must not resurrect the row or
+        // wipe the "merged #N" status once it lands late.
+        let mut st = dummy_app_state();
+        let mut cache = Cache::new();
+        let mut app = test_app_for_state(&mut cache);
+        st.list.prs = vec![open_pr(5), open_pr(7), open_pr(8)];
+        st.list.selected = 1; // pointing at #7
+
+        send_refresh(&app, &mut st, true);
+        let stale_gen = st.list_gen;
+        assert!(st.list_refresh_in_flight);
+
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::MergeDone { number: 7, result: Ok(()) },
+        );
+        assert!(st.list.status.contains("merged #7"));
+
+        // The stale ListFast (captured before the merge) lands late, still
+        // carrying #7 and the pre-merge generation.
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::ListFast {
+                generation: stale_gen,
+                result: Ok(vec![open_pr(5), open_pr(7), open_pr(8)]),
+            },
+        );
+        let nums: Vec<u32> = st.list.prs.iter().map(|p| p.number).collect();
+        assert_eq!(nums, vec![5, 8], "stale ListFast must not resurrect the merged row");
+        assert!(
+            st.list.status.contains("merged #7"),
+            "status must survive the stale response, got {:?}",
+            st.list.status
+        );
+
+        // A fresh refresh afterwards still applies normally.
+        send_refresh(&app, &mut st, true);
+        let fresh_gen = st.list_gen;
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::ListFast {
+                generation: fresh_gen,
+                result: Ok(vec![open_pr(5), open_pr(8)]),
+            },
+        );
+        let nums: Vec<u32> = st.list.prs.iter().map(|p| p.number).collect();
+        assert_eq!(nums, vec![5, 8], "a fresh generation still applies");
+    }
+
+    #[test]
+    fn set_draft_done_ok_invalidates_stale_in_flight_refresh() {
+        // Same shape as the merge race: a silent refresh's stale ListFast
+        // must not revert a draft toggle that landed while it was in flight.
+        let mut st = dummy_app_state();
+        let mut cache = Cache::new();
+        let mut app = test_app_for_state(&mut cache);
+        st.list.prs = vec![open_pr(7)];
+
+        send_refresh(&app, &mut st, true);
+        let stale_gen = st.list_gen;
+
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::SetDraftDone { number: 7, draft: true, result: Ok(()) },
+        );
+        assert!(st.list.prs[0].is_draft);
+
+        let mut stale_row = open_pr(7);
+        stale_row.is_draft = false; // snapshot from before the toggle
+        handle_response(
+            &mut app,
+            &mut st,
+            Response::ListFast { generation: stale_gen, result: Ok(vec![stale_row]) },
+        );
+        assert!(
+            st.list.prs[0].is_draft,
+            "stale ListFast must not revert the draft flip"
+        );
     }
 
     #[test]

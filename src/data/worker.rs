@@ -315,7 +315,8 @@ fn run_worker(
                         stage: ListStage::FetchingRefs,
                     });
                     let fetched = {
-                        let _g = lock.lock().unwrap();
+                        // A poisoned lock must not permanently kill refresh.
+                        let _g = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                         git_fast.fetch_pr_refs(&repo_fast, &open, &bases)
                     };
                     let result = match fetched {
@@ -383,7 +384,8 @@ fn run_open_pr(
         // in-flight bulk fetch), re-check, and fetch just this PR if needed.
         Err(_) => {
             let fetched = {
-                let _g = fetch_lock.lock().unwrap();
+                // A poisoned lock must not permanently kill OpenPr.
+                let _g = fetch_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 resolve(git).or_else(|_| {
                     git.fetch_pr_ref(repo_root, number, &pr.base_ref_name)
                         .and_then(|()| resolve(git))
