@@ -28,6 +28,7 @@ mod tests {
     fn pr(n: u32) -> Pr {
         Pr {
             number: n,
+            repo: "repo".into(),
             title: "t".into(),
             is_draft: false,
             state: PrState::Open,

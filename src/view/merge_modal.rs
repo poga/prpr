@@ -6,6 +6,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
+use crate::data::pr::PrId;
 use crate::render::style::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,7 +54,9 @@ pub fn from_letter(c: char) -> Option<MergeMethod> {
 
 #[derive(Debug)]
 pub struct MergeModalState {
-    pub pr_number: u32,
+    pub pr: PrId,
+    /// Display name: `#N`, or `repo#N` across projects.
+    pub label: String,
     pub default: MergeMethod,
     pub selected: MergeMethod,
     /// Clear the draft flag before merging. Only meaningful for a draft PR,
@@ -67,7 +70,9 @@ pub struct MergeModalState {
 /// they wait, regardless of which view they triggered the merge from.
 #[derive(Debug)]
 pub struct MergingState {
-    pub pr_number: u32,
+    pub pr: PrId,
+    /// Display name: `#N`, or `repo#N` across projects.
+    pub label: String,
     pub method: MergeMethod,
     pub mark_ready: bool,
 }
@@ -117,7 +122,7 @@ pub fn render(f: &mut Frame, area: Rect, st: &MergeModalState) {
     };
     lines.push(Line::styled(hint.to_string(), Style::default().fg(OVERLAY1)));
 
-    let title = format!(" Merge #{}? ", st.pr_number);
+    let title = format!(" Merge {}? ", st.label);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(SURFACE2))
@@ -145,9 +150,9 @@ pub fn render_progress(f: &mut Frame, area: Rect, st: &MergingState) {
         "merging"
     };
     let body = format!(
-        "  {} {verb} #{} ({})…",
+        "  {} {verb} {} ({})…",
         crate::render::spinner::glyph(),
-        st.pr_number,
+        st.label,
         method,
     );
     let lines = vec![
@@ -210,7 +215,8 @@ mod tests {
     #[test]
     fn progress_overlay_shows_pr_number_and_merging_text() {
         let st = MergingState {
-            pr_number: 482,
+            pr: PrId::new("r", 482),
+            label: "#482".into(),
             method: MergeMethod::Squash,
             mark_ready: false,
         };
@@ -231,7 +237,8 @@ mod tests {
     #[test]
     fn progress_overlay_names_the_ready_step_when_marking_ready() {
         let st = MergingState {
-            pr_number: 482,
+            pr: PrId::new("r", 482),
+            label: "#482".into(),
             method: MergeMethod::Squash,
             mark_ready: true,
         };
@@ -258,7 +265,8 @@ mod tests {
 
     fn modal(is_draft: bool, mark_ready: bool) -> MergeModalState {
         MergeModalState {
-            pr_number: 12,
+            pr: PrId::new("r", 12),
+            label: "#12".into(),
             default: MergeMethod::Merge,
             selected: MergeMethod::Merge,
             mark_ready,

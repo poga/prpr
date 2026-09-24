@@ -27,7 +27,8 @@ use crate::config::Config;
 use crate::data::cache::Cache;
 use crate::data::gh::GhClient;
 use crate::data::git::GitClient;
-use crate::data::pr::{MergeState, Pr, PrEnrichment};
+use crate::data::pr::{MergeState, Pr, PrEnrichment, PrId};
+use crate::data::projects::Repo;
 use crate::data::worker::{Request, Response, Worker};
 use crate::keys::{Action, FocusedView, MouseAction, dispatch, mouse_dispatch};
 use crate::view::commits_modal::{self, CommitsModalState};
@@ -91,22 +92,30 @@ fn needs_animation(st: &AppState) -> bool {
     false
 }
 
-fn reselect_by_number(prev: Option<u32>, new_numbers: &[u32], old_idx: usize) -> usize {
+fn reselect_by_id(prev: Option<&PrId>, new_ids: &[PrId], old_idx: usize) -> usize {
     if let Some(n) = prev
-        && let Some(i) = new_numbers.iter().position(|m| *m == n)
+        && let Some(i) = new_ids.iter().position(|m| m == n)
     {
         return i;
     }
-    old_idx.min(new_numbers.len().saturating_sub(1))
+    old_idx.min(new_ids.len().saturating_sub(1))
 }
 
-/// Merge enriched heavy-fields into matching rows by PR number.
+/// Merge enriched heavy-fields into matching rows by PR identity.
 fn apply_enrichments(prs: &mut [Pr], es: &[PrEnrichment]) {
     for e in es {
-        if let Some(p) = prs.iter_mut().find(|p| p.number == e.number) {
+        if let Some(p) = prs
+            .iter_mut()
+            .find(|p| p.number == e.number && p.repo == e.repo)
+        {
             p.apply_enrichment(e);
         }
     }
+}
+
+/// Newest activity first, stable so equal timestamps keep `gh` order.
+fn sort_by_updated(prs: &mut [Pr]) {
+    prs.sort_by_key(|p| std::cmp::Reverse(p.updated_at));
 }
 
 pub type Term = Terminal<CrosstermBackend<Stdout>>;
@@ -115,33 +124,37 @@ pub struct App {
     pub cache: Cache,
     pub config: Config,
     pub worker: Worker,
-    pub repo_root: std::path::PathBuf,
+    pub repos: Vec<Repo>,
 }
 
 impl App {
     pub fn new(
-        repo_root: std::path::PathBuf,
+        repos: Vec<Repo>,
         gh: Arc<dyn GhClient>,
         git: Arc<dyn GitClient>,
         config: Config,
     ) -> Self {
-        let worker = Worker::spawn(repo_root.clone(), gh, git, config.window_size);
+        let worker = Worker::spawn(repos.clone(), gh, git, config.window_size);
         Self {
             cache: Cache::new(),
             config,
             worker,
-            repo_root,
+            repos,
         }
     }
 
     fn request(&self, req: Request) {
         self.worker.send(req);
     }
+
+    fn repo_root(&self, repo: &str) -> Option<&std::path::Path> {
+        self.repos.iter().find(|r| r.name == repo).map(|r| r.root.as_path())
+    }
 }
 
 /// A debounced ListFiles request armed by a selection change.
 pub struct PendingFiles {
-    pub number: u32,
+    pub id: PrId,
     pub base_ref: String,
     pub at: Instant,
 }
@@ -150,7 +163,7 @@ pub struct AppState {
     pub focused: FocusedView,
     pub list: PrListState,
     pub review: Option<PrReviewState>,
-    pub current_pr: Option<u32>,
+    pub current_pr: Option<PrId>,
     pub picker: Option<FilePickerState>,
     pub merge: Option<MergeModalState>,
     pub merging: Option<MergingState>,
@@ -166,29 +179,38 @@ pub struct AppState {
     pub enrichment_for_gen: Option<(u32, Vec<PrEnrichment>)>,
     /// False until the first ListRefsReady; file lists defer on a cold start.
     pub refs_ready: bool,
-    /// File lists by PR number; valid until refs move (cleared on refs ready).
-    pub files_cache: HashMap<u32, Vec<crate::data::pr::FileMeta>>,
+    /// File lists by PR; valid until refs move (cleared on refs ready).
+    pub files_cache: HashMap<PrId, Vec<crate::data::pr::FileMeta>>,
     /// Debounced ListFiles request; sent once selection rests FILES_DEBOUNCE.
     pub pending_files: Option<PendingFiles>,
 }
 
 impl AppState {
+    /// Single-repo mode: the header names the clone and its branch.
     pub fn new(repo_name: String, branch: String) -> Self {
+        Self::with_list(PrListState {
+            repo_name,
+            branch,
+            repo_count: 1,
+            projects: false,
+            ..Default::default()
+        })
+    }
+
+    /// Projects mode: the header names the parent folder and clone count.
+    pub fn new_projects(folder: String, repo_count: usize) -> Self {
+        Self::with_list(PrListState {
+            repo_name: folder,
+            repo_count,
+            projects: true,
+            ..Default::default()
+        })
+    }
+
+    fn with_list(list: PrListState) -> Self {
         Self {
             focused: FocusedView::List,
-            list: PrListState {
-                repo_name,
-                branch,
-                prs: vec![],
-                selected: 0,
-                search: None,
-                status: String::new(),
-                loading: false,
-                enriching: false,
-                loading_stage: None,
-                manual_refresh_in_flight: false,
-                expanded: None,
-            },
+            list,
             review: None,
             current_pr: None,
             picker: None,
@@ -243,33 +265,33 @@ pub fn restore_terminal() -> Result<()> {
 /// Refresh the expanded file list for the selected row: serve from cache,
 /// or show a loading row and arm a debounced ListFiles request.
 fn after_selection_change(st: &mut AppState) {
-    let Some((number, base_ref)) = st
+    let Some((id, base_ref)) = st
         .list
         .visible_prs()
         .get(st.list.selected)
-        .map(|p| (p.number, p.base_ref_name.clone()))
+        .map(|p| (p.id(), p.base_ref_name.clone()))
     else {
         st.list.expanded = None;
         st.pending_files = None;
         return;
     };
-    if let Some(files) = st.files_cache.get(&number) {
-        st.list.expanded = Some(ExpandedFiles::Ready { number, files: files.clone() });
+    if let Some(files) = st.files_cache.get(&id) {
+        st.list.expanded = Some(ExpandedFiles::Ready { id, files: files.clone() });
         st.pending_files = None;
         return;
     }
-    st.list.expanded = Some(ExpandedFiles::Loading { number });
+    st.list.expanded = Some(ExpandedFiles::Loading { id: id.clone() });
     // A ListFiles against unfetched refs can only error; wait for refs.
     if !st.refs_ready {
         st.pending_files = None;
         return;
     }
-    st.pending_files = Some(PendingFiles { number, base_ref, at: Instant::now() });
+    st.pending_files = Some(PendingFiles { id, base_ref, at: Instant::now() });
 }
 
 /// Pop the pending ListFiles request once it has rested a full debounce
 /// window, so holding j/k doesn't fire one subprocess per row.
-fn take_due_files_request(st: &mut AppState, now: Instant) -> Option<(u32, String)> {
+fn take_due_files_request(st: &mut AppState, now: Instant) -> Option<(PrId, String)> {
     let due = st
         .pending_files
         .as_ref()
@@ -278,7 +300,16 @@ fn take_due_files_request(st: &mut AppState, now: Instant) -> Option<(u32, Strin
         return None;
     }
     let p = st.pending_files.take().unwrap();
-    Some((p.number, p.base_ref))
+    Some((p.id, p.base_ref))
+}
+
+/// The user-facing name of a PR: `#N` alone, or `repo#N` across projects.
+fn pr_label(st: &AppState, id: &PrId) -> String {
+    if st.list.projects {
+        format!("{}#{}", id.repo, id.number)
+    } else {
+        format!("#{}", id.number)
+    }
 }
 
 fn send_refresh(app: &App, st: &mut AppState, silent: bool) {
@@ -297,6 +328,7 @@ fn send_refresh(app: &App, st: &mut AppState, silent: bool) {
     // shows what step is running. The worker's own ListProgress arrives a
     // moment later and may overwrite this — that's fine.
     st.list.loading_stage = Some(crate::data::worker::ListStage::FetchingList);
+    st.list.loading_progress = (0, app.repos.len());
     st.list_gen = st.list_gen.wrapping_add(1);
     let g = st.list_gen;
     app.request(Request::RefreshList { generation: g });
@@ -330,8 +362,8 @@ pub fn run(term: &mut Term, app: &mut App, st: &mut AppState) -> Result<()> {
             dirty = true;
         }
 
-        if let Some((number, base_ref)) = take_due_files_request(st, Instant::now()) {
-            app.request(Request::ListFiles { number, base_ref });
+        if let Some((id, base_ref)) = take_due_files_request(st, Instant::now()) {
+            app.request(Request::ListFiles { id, base_ref });
             dirty = true;
         }
 
@@ -373,7 +405,7 @@ fn invalidate_stale_refresh(st: &mut AppState) {
     st.list.loading = false;
 }
 
-fn ensure_blame(app: &App, st: &mut AppState, number: u32, path: &str) {
+fn ensure_blame(app: &App, st: &mut AppState, id: &PrId, path: &str) {
     let Some(r) = st.review.as_mut() else { return };
     let Some(d) = r.detail.as_ref() else { return };
     if r.colors.contains_key(path) { return; }
@@ -382,7 +414,7 @@ fn ensure_blame(app: &App, st: &mut AppState, number: u32, path: &str) {
     let base_oid = d.base_ref_oid.clone();
     r.colors.insert(path.to_string(), crate::view::pr_review::ColorState::Loading);
     app.request(Request::BlameFile {
-        number,
+        id: id.clone(),
         head_oid,
         base_oid,
         path: path.to_string(),
@@ -390,19 +422,32 @@ fn ensure_blame(app: &App, st: &mut AppState, number: u32, path: &str) {
     });
 }
 
+fn selected_id(st: &AppState) -> Option<PrId> {
+    st.list.visible_prs().get(st.list.selected).map(|p| p.id())
+}
+
+fn visible_ids(st: &AppState) -> Vec<PrId> {
+    st.list.visible_prs().iter().map(|p| p.id()).collect()
+}
+
 fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
     match resp {
-        Response::ListProgress { generation, stage } if generation == st.list_gen => {
+        Response::ListProgress { generation, stage, done, total } if generation == st.list_gen => {
             st.list.loading_stage = Some(stage);
+            st.list.loading_progress = (done, total);
         }
         Response::ListProgress { .. } => { /* stale; drop */ }
-        Response::ListFast { generation, result } if generation == st.list_gen => match result {
-            Ok(prs) => {
-                let prev_selected = st
-                    .list
-                    .visible_prs()
-                    .get(st.list.selected)
-                    .map(|p| p.number);
+        Response::ListFast { generation, result, stale } if generation == st.list_gen => match result {
+            Ok(mut prs) => {
+                let prev_selected = selected_id(st);
+                // A clone that failed this round keeps its last known rows
+                // rather than blinking out on a transient error.
+                if !stale.is_empty() {
+                    prs.extend(
+                        st.list.prs.iter().filter(|p| stale.contains(&p.repo)).cloned(),
+                    );
+                }
+                sort_by_updated(&mut prs);
                 st.list.prs = prs.clone();
                 app.cache.set_list(prs);
                 if let Some((g, es)) = st.enrichment_for_gen.clone()
@@ -414,14 +459,9 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
                 st.list.manual_refresh_in_flight = false;
                 st.list.loading_stage = None;
                 st.list.status = String::new();
-                let new_numbers: Vec<u32> = st
-                    .list
-                    .visible_prs()
-                    .iter()
-                    .map(|p| p.number)
-                    .collect();
+                let new_ids = visible_ids(st);
                 st.list.selected =
-                    reselect_by_number(prev_selected, &new_numbers, st.list.selected);
+                    reselect_by_id(prev_selected.as_ref(), &new_ids, st.list.selected);
                 st.list.expanded = None;
                 after_selection_change(st);
             }
@@ -451,8 +491,8 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
         Response::ListRefsReady { generation, result } if generation == st.list_gen => {
             match result {
                 Ok(states) => {
-                    for (number, verdict) in states {
-                        if let Some(p) = st.list.prs.iter_mut().find(|p| p.number == number) {
+                    for (id, verdict) in states {
+                        if let Some(p) = st.list.prs.iter_mut().find(|p| p.id() == id) {
                             let definite = matches!(
                                 p.merge_state(),
                                 Some(MergeState::Mergeable) | Some(MergeState::Conflicting)
@@ -471,9 +511,9 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
             after_selection_change(st);
         }
         Response::ListRefsReady { .. } => { /* stale; drop */ }
-        Response::PrDetail { number, result: Ok(detail) } => {
+        Response::PrDetail { id, result: Ok(detail) } => {
             if let Some(r) = st.review.as_mut()
-                && st.current_pr == Some(number)
+                && st.current_pr.as_ref() == Some(&id)
             {
                 let zero_stats = detail
                     .commits
@@ -485,16 +525,16 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
                 r.status = "loading diff…".into();
             }
         }
-        Response::PrDetail { number, result: Err(e) } => {
+        Response::PrDetail { id, result: Err(e) } => {
             if let Some(r) = st.review.as_mut()
-                && st.current_pr == Some(number)
+                && st.current_pr.as_ref() == Some(&id)
             {
                 r.status = format!("load failed: {e}");
             }
-            st.list.status = format!("load #{number} failed: {e}");
+            st.list.status = format!("load {} failed: {e}", pr_label(st, &id));
         }
-        Response::PrDiff { number, result: Ok(files) } => {
-            if st.current_pr == Some(number) {
+        Response::PrDiff { id, result: Ok(files) } => {
+            if st.current_pr.as_ref() == Some(&id) {
                 let path = if let Some(r) = st.review.as_mut() {
                     r.files = files;
                     r.syntax_cache.clear();
@@ -504,26 +544,26 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
                     None
                 };
                 if let Some(path) = path {
-                    ensure_blame(app, st, number, &path);
+                    ensure_blame(app, st, &id, &path);
                 }
             }
         }
-        Response::PrDiff { number, result: Err(e) } => {
+        Response::PrDiff { id, result: Err(e) } => {
             if let Some(r) = st.review.as_mut()
-                && st.current_pr == Some(number)
+                && st.current_pr.as_ref() == Some(&id)
             {
                 r.status = format!("diff failed: {e}");
             }
         }
         Response::PrFileColors {
-            number,
+            id,
             head_oid: _,
             path,
             colors,
             stats,
         } => {
             if let Some(r) = st.review.as_mut()
-                && st.current_pr == Some(number)
+                && st.current_pr.as_ref() == Some(&id)
             {
                 r.colors.insert(path, crate::view::pr_review::ColorState::Ready(colors));
                 for (oid, s) in stats {
@@ -533,22 +573,18 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
                 }
             }
         }
-        Response::PrLoadError { number, error } => {
+        Response::PrLoadError { id, error } => {
             if let Some(r) = st.review.as_mut()
-                && st.current_pr == Some(number)
+                && st.current_pr.as_ref() == Some(&id)
             {
                 r.status = format!("load failed: {error}");
             }
-            st.list.status = format!("load #{number} failed: {error}");
+            st.list.status = format!("load {} failed: {error}", pr_label(st, &id));
         }
-        Response::MergeDone { number, result: Ok(()) } => {
+        Response::MergeDone { id, result: Ok(()) } => {
             // Remove the merged PR locally. No network refresh — fresh data
             // only arrives via startup, manual refresh, or auto-refresh.
-            let prev_selected = st
-                .list
-                .visible_prs()
-                .get(st.list.selected)
-                .map(|p| p.number);
+            let prev_selected = selected_id(st);
             let prev_idx = st.list.selected;
             st.focused = FocusedView::List;
             st.review = None;
@@ -556,62 +592,58 @@ fn handle_response(app: &mut App, st: &mut AppState, resp: Response) {
             st.merge = None;
             st.merging = None;
             st.picker = None;
-            st.list.status = format!("merged #{number}");
-            st.list.prs.retain(|p| p.number != number);
-            let new_numbers: Vec<u32> =
-                st.list.visible_prs().iter().map(|p| p.number).collect();
-            st.list.selected = reselect_by_number(prev_selected, &new_numbers, prev_idx);
+            st.list.status = format!("merged {}", pr_label(st, &id));
+            st.list.prs.retain(|p| p.id() != id);
+            let new_ids = visible_ids(st);
+            st.list.selected = reselect_by_id(prev_selected.as_ref(), &new_ids, prev_idx);
             st.list.expanded = None;
             invalidate_stale_refresh(st);
             after_selection_change(st);
         }
-        Response::MergeDone { number, result: Err(e) } => {
+        Response::MergeDone { id, result: Err(e) } => {
             st.merging = None;
-            st.list.status = format!("merge #{number} failed: {e}");
+            st.list.status = format!("merge {} failed: {e}", pr_label(st, &id));
         }
-        Response::SetDraftDone { number, draft, result: Ok(()) } => {
-            if let Some(p) = st.list.prs.iter_mut().find(|p| p.number == number) {
+        Response::SetDraftDone { id, draft, result: Ok(()) } => {
+            if let Some(p) = st.list.prs.iter_mut().find(|p| p.id() == id) {
                 p.is_draft = draft;
             }
             if let Some(d) = st.review.as_mut().and_then(|r| r.detail.as_mut())
-                && d.number == number
+                && st.current_pr.as_ref() == Some(&id)
             {
                 d.is_draft = draft;
             }
+            let label = pr_label(st, &id);
             let msg = if draft {
-                format!("#{number} converted to draft")
+                format!("{label} converted to draft")
             } else {
-                format!("#{number} marked ready for review")
+                format!("{label} marked ready for review")
             };
-            set_draft_status(st, number, msg);
+            set_draft_status(st, &id, msg);
             invalidate_stale_refresh(st);
         }
-        Response::SetDraftDone { number, result: Err(e), .. } => {
-            set_draft_status(st, number, format!("draft toggle #{number} failed: {e}"));
+        Response::SetDraftDone { id, result: Err(e), .. } => {
+            let msg = format!("draft toggle {} failed: {e}", pr_label(st, &id));
+            set_draft_status(st, &id, msg);
         }
-        Response::ListFiles { number, result } => {
+        Response::ListFiles { id, result } => {
             // Mid-refresh, this was computed against pre-fetch refs; caching
             // it would park a stale entry once ListRefsReady clears refs.
             if let Ok(files) = &result
                 && !st.list_refresh_in_flight
             {
-                st.files_cache.insert(number, files.clone());
+                st.files_cache.insert(id.clone(), files.clone());
             }
-            let sel_number = st
-                .list
-                .visible_prs()
-                .get(st.list.selected)
-                .map(|p| p.number);
-            if sel_number != Some(number) {
+            if selected_id(st).as_ref() != Some(&id) {
                 return;
             }
-            let exp_number = st.list.expanded.as_ref().map(ExpandedFiles::number);
-            if exp_number != Some(number) {
+            let exp_id = st.list.expanded.as_ref().map(ExpandedFiles::id);
+            if exp_id != Some(&id) {
                 return;
             }
             st.list.expanded = Some(match result {
-                Ok(files) => ExpandedFiles::Ready { number, files },
-                Err(e) => ExpandedFiles::Error { number, message: format!("{e:#}") },
+                Ok(files) => ExpandedFiles::Ready { id, files },
+                Err(e) => ExpandedFiles::Error { id, message: format!("{e:#}") },
             });
         }
     }
@@ -799,8 +831,7 @@ fn handle_action(app: &mut App, st: &mut AppState, action: Action) {
                 .get(st.list.selected)
                 .map(|p| (*p).clone())
             {
-                let num = pr.number;
-                st.current_pr = Some(num);
+                st.current_pr = Some(pr.id());
                 st.review = Some(PrReviewState {
                     file_index: 0,
                     cursor_line: 0,
@@ -814,13 +845,10 @@ fn handle_action(app: &mut App, st: &mut AppState, action: Action) {
             }
         }
         Action::ListOpenInBrowser => {
-            if let Some(num) = st
-                .list
-                .visible_prs()
-                .get(st.list.selected)
-                .map(|p| p.number)
+            if let Some(id) = selected_id(st)
+                && let Some(root) = app.repo_root(&id.repo)
             {
-                open_pr_in_browser(&app.repo_root, num);
+                open_pr_in_browser(root, id.number);
             }
         }
         Action::ListMerge => open_merge(st),
@@ -898,8 +926,8 @@ fn handle_action(app: &mut App, st: &mut AppState, action: Action) {
             st.focused = FocusedView::HelpOverlay;
         }
         Action::Refresh => {
-            if let Some(num) = st.current_pr
-                && let Some(pr) = st.list.prs.iter().find(|p| p.number == num).cloned()
+            if let Some(id) = st.current_pr.clone()
+                && let Some(pr) = st.list.prs.iter().find(|p| p.id() == id).cloned()
             {
                 if let Some(r) = st.review.as_mut() {
                     r.detail = None;
@@ -926,16 +954,11 @@ fn open_pr_in_browser(repo_root: &std::path::Path, number: u32) {
 }
 
 fn open_merge(st: &mut AppState) {
-    if let Some(num) = st
-        .list
-        .visible_prs()
-        .get(st.list.selected)
-        .map(|p| p.number)
-        .or(st.current_pr)
-    {
-        let is_draft = pr_is_draft(st, num).unwrap_or(false);
+    if let Some(id) = selected_id(st).or_else(|| st.current_pr.clone()) {
+        let is_draft = pr_is_draft(st, &id).unwrap_or(false);
         st.merge = Some(MergeModalState {
-            pr_number: num,
+            label: pr_label(st, &id),
+            pr: id,
             default: MergeMethod::Merge,
             selected: MergeMethod::Merge,
             // Drafts are here to be merged; save the separate ready step.
@@ -947,36 +970,38 @@ fn open_merge(st: &mut AppState) {
 }
 
 /// Prefer the open review detail's flag; fall back to the list row.
-fn pr_is_draft(st: &AppState, number: u32) -> Option<bool> {
+fn pr_is_draft(st: &AppState, id: &PrId) -> Option<bool> {
     st.review
         .as_ref()
         .and_then(|r| r.detail.as_ref())
-        .filter(|d| d.number == number)
+        .filter(|_| st.current_pr.as_ref() == Some(id))
         .map(|d| d.is_draft)
-        .or_else(|| st.list.prs.iter().find(|p| p.number == number).map(|p| p.is_draft))
+        .or_else(|| st.list.prs.iter().find(|p| p.id() == *id).map(|p| p.is_draft))
 }
 
 fn toggle_draft(app: &mut App, st: &mut AppState) {
-    let number = match st.focused {
-        FocusedView::Review => st.current_pr,
-        _ => st.list.visible_prs().get(st.list.selected).map(|p| p.number),
+    let id = match st.focused {
+        FocusedView::Review => st.current_pr.clone(),
+        _ => selected_id(st),
     };
-    let Some(number) = number else { return };
-    let Some(is_draft) = pr_is_draft(st, number) else { return };
+    let Some(id) = id else { return };
+    let Some(is_draft) = pr_is_draft(st, &id) else { return };
     let draft = !is_draft;
-    app.request(Request::SetDraft { number, draft });
+    app.request(Request::SetDraft { id: id.clone(), draft });
+    let label = pr_label(st, &id);
     let msg = if draft {
-        format!("converting #{number} to draft…")
+        format!("converting {label} to draft…")
     } else {
-        format!("marking #{number} ready…")
+        format!("marking {label} ready…")
     };
-    set_draft_status(st, number, msg);
+    set_draft_status(st, &id, msg);
 }
 
 // Route a draft-toggle status to the open review (if it matches) and the list.
-fn set_draft_status(st: &mut AppState, number: u32, msg: String) {
+fn set_draft_status(st: &mut AppState, id: &PrId, msg: String) {
     if let Some(r) = st.review.as_mut()
-        && r.detail.as_ref().map(|d| d.number) == Some(number)
+        && r.detail.is_some()
+        && st.current_pr.as_ref() == Some(id)
     {
         r.status = msg.clone();
     }
@@ -1015,7 +1040,7 @@ fn move_review(_app: &App, st: &mut AppState, delta: i32) {
 }
 
 fn cycle_file(app: &App, st: &mut AppState, delta: i32) {
-    let Some(num) = st.current_pr else { return };
+    let Some(id) = st.current_pr.clone() else { return };
     let path_for_blame = {
         let Some(r) = st.review.as_mut() else { return };
         let n = crate::view::pr_review::file_count(r) as i32;
@@ -1027,7 +1052,7 @@ fn cycle_file(app: &App, st: &mut AppState, delta: i32) {
         r.files.get(new_idx).map(|f| f.path.clone())
     };
     if let Some(path) = path_for_blame {
-        ensure_blame(app, st, num, &path);
+        ensure_blame(app, st, &id, &path);
     }
 }
 
@@ -1089,8 +1114,8 @@ fn handle_file_picker(app: &App, st: &mut AppState, ev: crossterm::event::KeyEve
                     r.files.get(idx).map(|f| f.path.clone())
                 } else { None }
             } else { None };
-            if let (Some(path), Some(num)) = (blame_target, st.current_pr) {
-                ensure_blame(app, st, num, &path);
+            if let (Some(path), Some(id)) = (blame_target, st.current_pr.clone()) {
+                ensure_blame(app, st, &id, &path);
             }
             st.picker = None;
             st.focused = FocusedView::Review;
@@ -1198,15 +1223,17 @@ fn handle_merge_modal(app: &mut App, st: &mut AppState, ev: crossterm::event::Ke
         }
         KeyCode::Enter => {
             let method = modal.selected;
-            let num = modal.pr_number;
+            let id = modal.pr.clone();
+            let label = modal.label.clone();
             let mark_ready = modal.mark_ready && modal.is_draft;
             app.request(Request::Merge {
-                number: num,
+                id: id.clone(),
                 method: method.cli_flag().to_string(),
                 mark_ready,
             });
             st.merging = Some(MergingState {
-                pr_number: num,
+                pr: id,
+                label,
                 method,
                 mark_ready,
             });
@@ -1363,9 +1390,22 @@ mod tests {
     use crate::data::worker::Response;
     use crate::view::pr_list::ExpandedFiles;
 
+    fn pid(n: u32) -> PrId {
+        PrId::new("repo", n)
+    }
+
+    fn repos(root: &str) -> Vec<Repo> {
+        vec![Repo::from_root(root.into())]
+    }
+
+    fn ids(ns: &[u32]) -> Vec<PrId> {
+        ns.iter().map(|n| pid(*n)).collect()
+    }
+
     fn make_pr(n: u32) -> Pr {
         Pr {
             number: n,
+            repo: "repo".into(),
             title: format!("pr-{n}"),
             is_draft: false,
             state: PrState::Open,
@@ -1385,7 +1425,7 @@ mod tests {
         use crate::data::gh::fakes::FakeGh;
         use crate::data::git::fakes::FakeGit;
         App::new(
-            "/tmp/repo".into(),
+            repos("/tmp/repo"),
             Arc::new(FakeGh::new()),
             Arc::new(FakeGit::new("/tmp/repo")),
             Config::default(),
@@ -1398,16 +1438,16 @@ mod tests {
         let mut st = AppState::new("prpr".into(), "main".into());
         st.list.prs = vec![make_pr(7), make_pr(8)];
         st.list.selected = 0;
-        st.list.expanded = Some(ExpandedFiles::Loading { number: 7 });
+        st.list.expanded = Some(ExpandedFiles::Loading { id: pid(7) });
 
         let files = vec![FileMeta { path: "a.rs".into(), additions: 1, deletions: 0 }];
         handle_response(
             &mut app,
             &mut st,
-            Response::ListFiles { number: 7, result: Ok(files.clone()) },
+            Response::ListFiles { id: pid(7), result: Ok(files.clone()) },
         );
         match st.list.expanded {
-            Some(ExpandedFiles::Ready { number: 7, files: ref f }) => assert_eq!(f, &files),
+            Some(ExpandedFiles::Ready { ref id, files: ref f }) if *id == pid(7) => assert_eq!(f, &files),
             ref other => panic!("expected Ready, got {other:?}"),
         }
     }
@@ -1418,16 +1458,16 @@ mod tests {
         let mut st = AppState::new("prpr".into(), "main".into());
         st.list.prs = vec![make_pr(7), make_pr(8)];
         st.list.selected = 0;
-        st.list.expanded = Some(ExpandedFiles::Loading { number: 7 });
+        st.list.expanded = Some(ExpandedFiles::Loading { id: pid(7) });
 
         handle_response(
             &mut app,
             &mut st,
-            Response::ListFiles { number: 8, result: Ok(vec![]) },
+            Response::ListFiles { id: pid(8), result: Ok(vec![]) },
         );
         assert!(matches!(
             st.list.expanded,
-            Some(ExpandedFiles::Loading { number: 7 })
+            Some(ExpandedFiles::Loading { ref id }) if *id == pid(7)
         ));
     }
 
@@ -1437,15 +1477,15 @@ mod tests {
         let mut st = AppState::new("prpr".into(), "main".into());
         st.list.prs = vec![make_pr(7)];
         st.list.selected = 0;
-        st.list.expanded = Some(ExpandedFiles::Loading { number: 7 });
+        st.list.expanded = Some(ExpandedFiles::Loading { id: pid(7) });
 
         handle_response(
             &mut app,
             &mut st,
-            Response::ListFiles { number: 7, result: Err(anyhow::anyhow!("ref missing")) },
+            Response::ListFiles { id: pid(7), result: Err(anyhow::anyhow!("ref missing")) },
         );
         match st.list.expanded {
-            Some(ExpandedFiles::Error { number: 7, ref message }) => {
+            Some(ExpandedFiles::Error { ref id, ref message }) if *id == pid(7) => {
                 assert!(message.contains("ref missing"));
             }
             ref other => panic!("expected Error, got {other:?}"),
@@ -1458,13 +1498,13 @@ mod tests {
         st.refs_ready = true;
         st.list.prs = vec![make_pr(1)];
         st.files_cache.insert(
-            1,
+            pid(1),
             vec![FileMeta { path: "a.rs".into(), additions: 1, deletions: 0 }],
         );
         after_selection_change(&mut st);
         assert!(matches!(
             &st.list.expanded,
-            Some(ExpandedFiles::Ready { number: 1, files }) if files.len() == 1
+            Some(ExpandedFiles::Ready { id, files }) if *id == pid(1) && files.len() == 1
         ));
         assert!(st.pending_files.is_none(), "cache hit must not arm a request");
     }
@@ -1475,9 +1515,9 @@ mod tests {
         st.refs_ready = true;
         st.list.prs = vec![make_pr(1)];
         after_selection_change(&mut st);
-        assert!(matches!(st.list.expanded, Some(ExpandedFiles::Loading { number: 1 })));
+        assert!(matches!(st.list.expanded, Some(ExpandedFiles::Loading { ref id }) if *id == pid(1)));
         let p = st.pending_files.as_ref().expect("pending request armed");
-        assert_eq!(p.number, 1);
+        assert_eq!(p.id, pid(1));
     }
 
     #[test]
@@ -1489,7 +1529,7 @@ mod tests {
         let armed_at = st.pending_files.as_ref().unwrap().at;
         assert!(take_due_files_request(&mut st, armed_at).is_none(), "too early");
         let due = take_due_files_request(&mut st, armed_at + FILES_DEBOUNCE);
-        assert_eq!(due, Some((1, "main".into())));
+        assert_eq!(due, Some((pid(1), "main".into())));
         assert!(st.pending_files.is_none(), "flush consumes the pending slot");
     }
 
@@ -1501,7 +1541,7 @@ mod tests {
         let mut cache = Cache::new();
         let app = test_app_for_state(&mut cache);
         st.pending_files = Some(PendingFiles {
-            number: 7,
+            id: pid(7),
             base_ref: "main".into(),
             at: Instant::now(),
         });
@@ -1514,16 +1554,16 @@ mod tests {
         let mut app = make_app();
         let mut st = AppState::new("prpr".into(), "main".into());
         st.list.prs = vec![make_pr(1)];
-        st.list.expanded = Some(ExpandedFiles::Loading { number: 1 });
+        st.list.expanded = Some(ExpandedFiles::Loading { id: pid(1) });
         handle_response(
             &mut app,
             &mut st,
             Response::ListFiles {
-                number: 1,
+                id: pid(1),
                 result: Ok(vec![FileMeta { path: "a.rs".into(), additions: 2, deletions: 1 }]),
             },
         );
-        assert_eq!(st.files_cache.get(&1).map(Vec::len), Some(1));
+        assert_eq!(st.files_cache.get(&pid(1)).map(Vec::len), Some(1));
     }
 
     #[test]
@@ -1534,18 +1574,18 @@ mod tests {
         let mut st = AppState::new("prpr".into(), "main".into());
         st.list.prs = vec![make_pr(7)];
         st.list.selected = 0;
-        st.list.expanded = Some(ExpandedFiles::Loading { number: 7 });
+        st.list.expanded = Some(ExpandedFiles::Loading { id: pid(7) });
         st.list_refresh_in_flight = true;
 
         let files = vec![FileMeta { path: "a.rs".into(), additions: 1, deletions: 0 }];
         handle_response(
             &mut app,
             &mut st,
-            Response::ListFiles { number: 7, result: Ok(files.clone()) },
+            Response::ListFiles { id: pid(7), result: Ok(files.clone()) },
         );
-        assert!(!st.files_cache.contains_key(&7), "cache insert must be skipped mid-refresh");
+        assert!(!st.files_cache.contains_key(&pid(7)), "cache insert must be skipped mid-refresh");
         match st.list.expanded {
-            Some(ExpandedFiles::Ready { number: 7, files: ref f }) => assert_eq!(f, &files),
+            Some(ExpandedFiles::Ready { ref id, files: ref f }) if *id == pid(7) => assert_eq!(f, &files),
             ref other => panic!("expected Ready, got {other:?}"),
         }
     }
@@ -1554,7 +1594,7 @@ mod tests {
     fn refs_ready_invalidates_files_cache() {
         let mut app = make_app();
         let mut st = AppState::new("prpr".into(), "main".into());
-        st.files_cache.insert(1, vec![]);
+        st.files_cache.insert(pid(1), vec![]);
         let g = st.list_gen;
         handle_response(
             &mut app,
@@ -1573,7 +1613,7 @@ mod tests {
         let n_detail_files = detail.files.len();
         let number = detail.number;
         let app = test_app_for_state(&mut cache);
-        st.current_pr = Some(number);
+        st.current_pr = Some(pid(number));
         st.review = Some(PrReviewState {
             detail: Some(detail),
             file_index: 0,
@@ -1601,7 +1641,7 @@ mod tests {
         let detail: crate::data::pr::PrDetail = serde_json::from_str(json).unwrap();
         let number = detail.number;
         let app = test_app_for_state(&mut cache);
-        st.current_pr = Some(number);
+        st.current_pr = Some(pid(number));
         st.review = Some(PrReviewState {
             detail: Some(detail),
             file_index: 0,
@@ -1627,7 +1667,7 @@ mod tests {
         assert!(files.len() >= 2, "fixture needs at least 2 files for this test");
 
         let mut st = dummy_app_state();
-        st.current_pr = Some(number);
+        st.current_pr = Some(pid(number));
         st.review = Some(PrReviewState {
             detail: Some(detail.clone()),
             files: files.clone(),
@@ -1654,6 +1694,7 @@ mod tests {
     fn open_pr(n: u32) -> Pr {
         Pr {
             number: n,
+            repo: "repo".into(),
             title: format!("#{n}"),
             is_draft: false,
             state: PrState::Open,
@@ -1675,7 +1716,7 @@ mod tests {
         let gh: std::sync::Arc<dyn crate::data::gh::GhClient> = std::sync::Arc::new(FakeGh::new());
         let git: std::sync::Arc<dyn crate::data::git::GitClient> =
             std::sync::Arc::new(FakeGit::new("/tmp/repo"));
-        let mut app = App::new("/tmp/repo".into(), gh, git, Config::default());
+        let mut app = App::new(repos("/tmp/repo"), gh, git, Config::default());
         std::mem::swap(&mut app.cache, cache);
         app
     }
@@ -1693,6 +1734,7 @@ mod tests {
             &mut app,
             &mut st,
             Response::ListProgress {
+                done: 0, total: 1,
                 generation: 3,
                 stage: ListStage::FetchingList,
             },
@@ -1703,6 +1745,7 @@ mod tests {
             &mut app,
             &mut st,
             Response::ListProgress {
+                done: 0, total: 1,
                 generation: 3,
                 stage: ListStage::FetchingRefs,
             },
@@ -1713,6 +1756,7 @@ mod tests {
             &mut app,
             &mut st,
             Response::ListFast {
+                stale: vec![],
                 generation: 3,
                 result: Ok(vec![]),
             },
@@ -1735,6 +1779,7 @@ mod tests {
             &mut app,
             &mut st,
             Response::ListProgress {
+                done: 0, total: 1,
                 generation: 1,
                 stage: ListStage::FetchingRefs,
             },
@@ -1756,6 +1801,7 @@ mod tests {
             &mut app,
             &mut st,
             Response::ListFast {
+                stale: vec![],
                 generation: 2,
                 result: Err(anyhow::anyhow!("boom")),
             },
@@ -1772,6 +1818,7 @@ mod tests {
         st.list_gen = 5;
         // A response from a much older generation arrives.
         let stale = Response::ListFast {
+            stale: vec![],
             generation: 1,
             result: Ok(vec![open_pr(1)]),
         };
@@ -1794,6 +1841,7 @@ mod tests {
             generation: 1,
             result: Ok(vec![PrEnrichment {
                 number: 7,
+                repo: "repo".into(),
                 status_check_rollup: vec![StatusCheck {
                     status: Some("COMPLETED".into()),
                     conclusion: Some("FAILURE".into()),
@@ -1821,6 +1869,7 @@ mod tests {
             &mut app,
             &mut st,
             Response::ListFast {
+                stale: vec![],
                 generation: 1,
                 result: Ok(vec![open_pr(7), open_pr(8)]),
             },
@@ -1832,6 +1881,7 @@ mod tests {
                 generation: 1,
                 result: Ok(vec![PrEnrichment {
                     number: 7,
+                    repo: "repo".into(),
                     status_check_rollup: vec![StatusCheck {
                         status: Some("COMPLETED".into()),
                         conclusion: Some("FAILURE".into()),
@@ -1863,11 +1913,12 @@ mod tests {
         handle_response(&mut app, &mut st, Response::ListEnriched {
             generation: 1,
             result: Ok(vec![PrEnrichment {
-                number: 7, status_check_rollup: vec![], review_decision: None,
+                number: 7, repo: "repo".into(), status_check_rollup: vec![], review_decision: None,
                 mergeable: Some("CONFLICTING".into()),
             }]),
         });
         handle_response(&mut app, &mut st, Response::ListFast {
+            stale: vec![],
             generation: 1,
             result: Ok(vec![open_pr(7)]),
         });
@@ -1888,6 +1939,7 @@ mod tests {
             &mut app,
             &mut st,
             Response::ListFast {
+                stale: vec![],
                 generation: 1,
                 result: Ok(vec![]),
             },
@@ -1923,7 +1975,7 @@ mod tests {
         handle_response(
             &mut app,
             &mut st,
-            Response::ListFast { generation: g, result: Ok(vec![]) },
+            Response::ListFast { stale: vec![], generation: g, result: Ok(vec![]) },
         );
         assert!(!st.list.enriching);
     }
@@ -1940,6 +1992,7 @@ mod tests {
             &mut app,
             &mut st,
             Response::ListFast {
+                stale: vec![],
                 generation: g,
                 result: Ok(vec![make_pr(1)]),
             },
@@ -1965,7 +2018,7 @@ mod tests {
             &mut st,
             Response::ListRefsReady {
                 generation: g,
-                result: Ok(vec![(1, "MERGEABLE".into()), (2, "MERGEABLE".into())]),
+                result: Ok(vec![(pid(1), "MERGEABLE".into()), (pid(2), "MERGEABLE".into())]),
             },
         );
         assert_eq!(st.list.prs[0].mergeable.as_deref(), Some("MERGEABLE"));
@@ -2007,7 +2060,7 @@ mod tests {
         after_selection_change(&mut st);
         assert!(matches!(
             st.list.expanded,
-            Some(ExpandedFiles::Loading { number: 1 })
+            Some(ExpandedFiles::Loading { ref id }) if *id == pid(1)
         ));
         // ListRefsReady flips the gate and re-issues the request path.
         let g = st.list_gen;
@@ -2121,35 +2174,35 @@ mod tests {
 
     #[test]
     fn reselect_keeps_position_when_pr_still_present() {
-        let new = [101u32, 99, 42, 7];
+        let new = ids(&[101, 99, 42, 7]);
         // prev = 42, was at index 1; now at index 2
-        assert_eq!(reselect_by_number(Some(42), &new, 1), 2);
+        assert_eq!(reselect_by_id(Some(&pid(42)), &new, 1), 2);
     }
 
     #[test]
     fn reselect_falls_back_to_clamped_old_idx_when_pr_gone() {
-        let new = [101u32, 99, 7];
+        let new = ids(&[101, 99, 7]);
         // prev = 42 no longer in the list; old_idx 1 stays valid
-        assert_eq!(reselect_by_number(Some(42), &new, 1), 1);
+        assert_eq!(reselect_by_id(Some(&pid(42)), &new, 1), 1);
     }
 
     #[test]
     fn reselect_clamps_old_idx_when_list_shrinks() {
-        let new = [101u32, 99];
+        let new = ids(&[101, 99]);
         // prev = 42 gone, old_idx 5 clamped to len-1 = 1
-        assert_eq!(reselect_by_number(Some(42), &new, 5), 1);
+        assert_eq!(reselect_by_id(Some(&pid(42)), &new, 5), 1);
     }
 
     #[test]
     fn reselect_handles_empty_list() {
-        let new: [u32; 0] = [];
-        assert_eq!(reselect_by_number(Some(42), &new, 3), 0);
+        let new: Vec<PrId> = vec![];
+        assert_eq!(reselect_by_id(Some(&pid(42)), &new, 3), 0);
     }
 
     #[test]
     fn reselect_with_no_prev_clamps_old_idx() {
-        let new = [101u32, 99, 7];
-        assert_eq!(reselect_by_number(None, &new, 5), 2);
+        let new = ids(&[101, 99, 7]);
+        assert_eq!(reselect_by_id(None, &new, 5), 2);
     }
 
     #[test]
@@ -2170,13 +2223,13 @@ mod tests {
         );
 
         let mut app = App::new(
-            "/tmp/repo".into(),
+            repos("/tmp/repo"),
             std::sync::Arc::new(gh),
             std::sync::Arc::new(git),
             crate::config::Config::default(),
         );
         let mut st = AppState::new("repo".into(), "main".into());
-        st.current_pr = Some(number);
+        st.current_pr = Some(pid(number));
         st.review = Some(PrReviewState {
             status: "loading…".into(),
             ..Default::default()
@@ -2184,6 +2237,7 @@ mod tests {
 
         let pr = crate::data::pr::Pr {
             number: detail.number,
+            repo: "repo".into(),
             title: detail.title.clone(),
             is_draft: detail.is_draft,
             state: detail.state,
@@ -2232,14 +2286,14 @@ mod tests {
         st.list_gen = 1;
         st.list.prs = vec![open_pr(5), open_pr(7), open_pr(8)];
         st.list.selected = 1; // pointing at #7
-        st.current_pr = Some(7);
+        st.current_pr = Some(pid(7));
         let prior_gen = st.list_gen;
         let prior_last_refresh = st.last_refresh_at;
 
         handle_response(
             &mut app,
             &mut st,
-            Response::MergeDone { number: 7, result: Ok(()) },
+            Response::MergeDone { id: pid(7), result: Ok(()) },
         );
 
         let nums: Vec<u32> = st.list.prs.iter().map(|p| p.number).collect();
@@ -2273,7 +2327,7 @@ mod tests {
         handle_response(
             &mut app,
             &mut st,
-            Response::MergeDone { number: 8, result: Ok(()) },
+            Response::MergeDone { id: pid(8), result: Ok(()) },
         );
 
         let nums: Vec<u32> = st.list.prs.iter().map(|p| p.number).collect();
@@ -2291,12 +2345,12 @@ mod tests {
         st.list_gen = 1;
         st.list.prs = vec![open_pr(5), open_pr(7), open_pr(8)];
         st.list.selected = 0; // pointing at #5
-        st.current_pr = Some(7); // but viewing #7 in review
+        st.current_pr = Some(pid(7)); // but viewing #7 in review
 
         handle_response(
             &mut app,
             &mut st,
-            Response::MergeDone { number: 7, result: Ok(()) },
+            Response::MergeDone { id: pid(7), result: Ok(()) },
         );
 
         let nums: Vec<u32> = st.list.prs.iter().map(|p| p.number).collect();
@@ -2317,7 +2371,7 @@ mod tests {
         handle_response(
             &mut app,
             &mut st,
-            Response::SetDraftDone { number: 7, draft: true, result: Ok(()) },
+            Response::SetDraftDone { id: pid(7), draft: true, result: Ok(()) },
         );
 
         let row = st.list.prs.iter().find(|p| p.number == 7).unwrap();
@@ -2347,7 +2401,7 @@ mod tests {
         handle_response(
             &mut app,
             &mut st,
-            Response::MergeDone { number: 7, result: Ok(()) },
+            Response::MergeDone { id: pid(7), result: Ok(()) },
         );
         assert!(st.list.status.contains("merged #7"));
 
@@ -2357,6 +2411,7 @@ mod tests {
             &mut app,
             &mut st,
             Response::ListFast {
+                stale: vec![],
                 generation: stale_gen,
                 result: Ok(vec![open_pr(5), open_pr(7), open_pr(8)]),
             },
@@ -2376,6 +2431,7 @@ mod tests {
             &mut app,
             &mut st,
             Response::ListFast {
+                stale: vec![],
                 generation: fresh_gen,
                 result: Ok(vec![open_pr(5), open_pr(8)]),
             },
@@ -2399,7 +2455,7 @@ mod tests {
         handle_response(
             &mut app,
             &mut st,
-            Response::SetDraftDone { number: 7, draft: true, result: Ok(()) },
+            Response::SetDraftDone { id: pid(7), draft: true, result: Ok(()) },
         );
         assert!(st.list.prs[0].is_draft);
 
@@ -2408,7 +2464,7 @@ mod tests {
         handle_response(
             &mut app,
             &mut st,
-            Response::ListFast { generation: stale_gen, result: Ok(vec![stale_row]) },
+            Response::ListFast { stale: vec![], generation: stale_gen, result: Ok(vec![stale_row]) },
         );
         assert!(
             st.list.prs[0].is_draft,
@@ -2441,7 +2497,7 @@ mod tests {
         handle_response(
             &mut app,
             &mut st,
-            Response::SetDraftDone { number: 7, draft: true, result: Ok(()) },
+            Response::SetDraftDone { id: pid(7), draft: true, result: Ok(()) },
         );
 
         // The manual refresh's own ListFast, now orphaned by the bumped
@@ -2449,7 +2505,7 @@ mod tests {
         handle_response(
             &mut app,
             &mut st,
-            Response::ListFast { generation: stale_gen, result: Ok(vec![open_pr(7)]) },
+            Response::ListFast { stale: vec![], generation: stale_gen, result: Ok(vec![open_pr(7)]) },
         );
 
         assert!(
@@ -2470,7 +2526,7 @@ mod tests {
             &mut app,
             &mut st,
             Response::SetDraftDone {
-                number: 7,
+                id: pid(7),
                 draft: true,
                 result: Err(anyhow::anyhow!("boom")),
             },
@@ -2485,7 +2541,7 @@ mod tests {
         let detail = fixture_pr_detail();
         let number = detail.number;
         let mut st = dummy_app_state();
-        st.current_pr = Some(number);
+        st.current_pr = Some(pid(number));
         st.review = Some(PrReviewState {
             status: "loading…".into(),
             ..Default::default()
@@ -2496,7 +2552,7 @@ mod tests {
         handle_response(
             &mut app,
             &mut st,
-            Response::PrDetail { number, result: Ok(detail.clone()) },
+            Response::PrDetail { id: pid(number), result: Ok(detail.clone()) },
         );
 
         let r = st.review.as_ref().unwrap();
@@ -2513,7 +2569,7 @@ mod tests {
             include_str!("../tests/fixtures/diff_basic.patch")
         ).unwrap();
         let mut st = dummy_app_state();
-        st.current_pr = Some(number);
+        st.current_pr = Some(pid(number));
         st.review = Some(PrReviewState {
             detail: Some(detail.clone()),
             status: "loading diff…".into(),
@@ -2525,7 +2581,7 @@ mod tests {
         handle_response(
             &mut app,
             &mut st,
-            Response::PrDiff { number, result: Ok(files.clone()) },
+            Response::PrDiff { id: pid(number), result: Ok(files.clone()) },
         );
 
         let r = st.review.as_ref().unwrap();
@@ -2542,7 +2598,7 @@ mod tests {
         let first_path = files[0].path.clone();
 
         let mut st = dummy_app_state();
-        st.current_pr = Some(number);
+        st.current_pr = Some(pid(number));
         st.review = Some(PrReviewState {
             detail: Some(detail.clone()),
             ..Default::default()
@@ -2553,7 +2609,7 @@ mod tests {
         handle_response(
             &mut app,
             &mut st,
-            Response::PrDiff { number, result: Ok(files.clone()) },
+            Response::PrDiff { id: pid(number), result: Ok(files.clone()) },
         );
 
         let r = st.review.as_ref().unwrap();
@@ -2574,7 +2630,7 @@ mod tests {
         let second_path = files[1].path.clone();
 
         let mut st = dummy_app_state();
-        st.current_pr = Some(number);
+        st.current_pr = Some(pid(number));
         st.review = Some(PrReviewState {
             detail: Some(detail),
             files: files.clone(),
@@ -2612,7 +2668,7 @@ mod tests {
         colors.insert(second_path.clone(), ready);
 
         let mut st = dummy_app_state();
-        st.current_pr = Some(number);
+        st.current_pr = Some(pid(number));
         st.review = Some(PrReviewState {
             detail: Some(detail),
             files,
@@ -2638,7 +2694,7 @@ mod tests {
         let detail = fixture_pr_detail();
         let number = detail.number;
         let pr = crate::data::pr::Pr {
-            number, title: detail.title.clone(), is_draft: detail.is_draft,
+            number, repo: "repo".into(), title: detail.title.clone(), is_draft: detail.is_draft,
             state: detail.state, author: detail.author.clone(),
             created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
             updated_at: "2026-01-01T00:00:00Z".parse().unwrap(),
@@ -2649,7 +2705,7 @@ mod tests {
         };
 
         let mut st = dummy_app_state();
-        st.current_pr = Some(number);
+        st.current_pr = Some(pid(number));
         st.list.prs = vec![pr.clone()];
         let mut colors = std::collections::HashMap::new();
         colors.insert("src/sched.rs".into(), crate::view::pr_review::ColorState::Ready(
@@ -2688,7 +2744,7 @@ mod tests {
         ).unwrap();
         let path = files[0].path.clone();
         let mut st = dummy_app_state();
-        st.current_pr = Some(number);
+        st.current_pr = Some(pid(number));
         st.review = Some(PrReviewState {
             detail: Some(detail.clone()),
             files: files.clone(),
@@ -2701,7 +2757,7 @@ mod tests {
             &mut app,
             &mut st,
             Response::PrFileColors {
-                number,
+                id: pid(number),
                 head_oid: head_oid.clone(),
                 path: path.clone(),
                 colors: LineColors { head: vec![], delete: std::collections::HashMap::new() },
@@ -2722,7 +2778,7 @@ mod tests {
         use crate::data::git::fakes::FakeGit;
         let git: std::sync::Arc<dyn crate::data::git::GitClient> =
             std::sync::Arc::new(FakeGit::new("/tmp/repo"));
-        let mut app = App::new("/tmp/repo".into(), gh, git, Config::default());
+        let mut app = App::new(repos("/tmp/repo"), gh, git, Config::default());
         std::mem::swap(&mut app.cache, cache);
         app
     }
@@ -2849,10 +2905,10 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
             assert!(std::time::Instant::now() < deadline, "no SetDraftDone");
-            if let Ok(Response::SetDraftDone { number: 7, draft, result: Ok(()) }) =
+            if let Ok(Response::SetDraftDone { id, draft, result: Ok(()) }) =
                 app.worker.rx.recv_timeout(std::time::Duration::from_millis(200))
             {
-                assert!(draft, "ready PR must toggle to draft=true");
+                assert_eq!(id, pid(7)); assert!(draft, "ready PR must toggle to draft=true");
                 break;
             }
         }
@@ -2867,7 +2923,7 @@ mod tests {
         let detail = fixture_pr_detail();
         let n = detail.number;
         st.list.prs = vec![open_pr(n)];
-        st.current_pr = Some(n);
+        st.current_pr = Some(pid(n));
         st.focused = FocusedView::Review;
         st.review = Some(PrReviewState {
             detail: Some(detail),
@@ -2882,7 +2938,7 @@ mod tests {
         handle_response(
             &mut app,
             &mut st,
-            Response::SetDraftDone { number: n, draft: true, result: Ok(()) },
+            Response::SetDraftDone { id: pid(n), draft: true, result: Ok(()) },
         );
         let r = st.review.as_ref().unwrap();
         assert!(r.detail.as_ref().unwrap().is_draft, "review detail flag flips");
@@ -2910,12 +2966,13 @@ mod tests {
         assert!(needs_animation(&a), "list loading spinner");
 
         let mut b = base();
-        b.list.expanded = Some(ExpandedFiles::Loading { number: 1 });
+        b.list.expanded = Some(ExpandedFiles::Loading { id: pid(1) });
         assert!(needs_animation(&b), "expanded files spinner");
 
         let mut c = base();
         c.merging = Some(MergingState {
-            pr_number: 1,
+            pr: pid(1),
+            label: "#1".into(),
             method: MergeMethod::Merge,
             mark_ready: false,
         });
@@ -2928,5 +2985,181 @@ mod tests {
         let mut e = base();
         e.list.status = "merging #1…".into();
         assert!(needs_animation(&e), "in-progress status spinner");
+    }
+
+    // ---- projects mode: rows from several clones in one list ----
+
+    fn pr_in(repo: &str, n: u32, updated: &str) -> Pr {
+        let mut p = make_pr(n);
+        p.repo = repo.into();
+        p.updated_at = updated.parse().unwrap();
+        p
+    }
+
+    #[test]
+    fn list_fast_keeps_last_rows_of_a_stale_clone() {
+        let mut st = AppState::new_projects("work".into(), 2);
+        let mut cache = Cache::new();
+        let mut app = test_app_for_state(&mut cache);
+        st.list.prs = vec![
+            pr_in("a", 1, "2026-01-01T00:00:00Z"),
+            pr_in("b", 1, "2026-01-02T00:00:00Z"),
+        ];
+        st.list_gen = 1;
+        handle_response(&mut app, &mut st, Response::ListFast {
+            generation: 1,
+            result: Ok(vec![pr_in("a", 2, "2026-01-03T00:00:00Z")]),
+            stale: vec!["b".into()],
+        });
+        let ids: Vec<PrId> = st.list.prs.iter().map(Pr::id).collect();
+        assert_eq!(ids, vec![PrId::new("a", 2), PrId::new("b", 1)]);
+        assert!(st.list.status.is_empty(), "a stale clone is not an error");
+    }
+
+    #[test]
+    fn list_fast_orders_rows_newest_activity_first_across_clones() {
+        let mut st = AppState::new_projects("work".into(), 2);
+        let mut cache = Cache::new();
+        let mut app = test_app_for_state(&mut cache);
+        st.list_gen = 1;
+        handle_response(&mut app, &mut st, Response::ListFast {
+            generation: 1,
+            result: Ok(vec![
+                pr_in("a", 1, "2026-01-01T00:00:00Z"),
+                pr_in("a", 2, "2026-01-05T00:00:00Z"),
+                pr_in("b", 1, "2026-01-03T00:00:00Z"),
+            ]),
+            stale: vec![],
+        });
+        let ids: Vec<PrId> = st.list.prs.iter().map(Pr::id).collect();
+        assert_eq!(ids, vec![PrId::new("a", 2), PrId::new("b", 1), PrId::new("a", 1)]);
+    }
+
+    #[test]
+    fn list_fast_reselects_by_repo_and_number_not_number_alone() {
+        let mut st = AppState::new_projects("work".into(), 2);
+        let mut cache = Cache::new();
+        let mut app = test_app_for_state(&mut cache);
+        st.list.prs = vec![
+            pr_in("a", 7, "2026-01-02T00:00:00Z"),
+            pr_in("b", 7, "2026-01-01T00:00:00Z"),
+        ];
+        st.list.selected = 1; // b#7
+        st.list_gen = 1;
+        handle_response(&mut app, &mut st, Response::ListFast {
+            generation: 1,
+            result: Ok(vec![
+                pr_in("b", 7, "2026-01-09T00:00:00Z"),
+                pr_in("a", 7, "2026-01-02T00:00:00Z"),
+            ]),
+            stale: vec![],
+        });
+        assert_eq!(selected_id(&st), Some(PrId::new("b", 7)));
+    }
+
+    #[test]
+    fn enrichment_and_verdicts_apply_to_the_matching_clone_only() {
+        let mut st = AppState::new_projects("work".into(), 2);
+        let mut cache = Cache::new();
+        let mut app = test_app_for_state(&mut cache);
+        st.list.prs = vec![
+            pr_in("a", 7, "2026-01-02T00:00:00Z"),
+            pr_in("b", 7, "2026-01-01T00:00:00Z"),
+        ];
+        st.list_gen = 1;
+        handle_response(&mut app, &mut st, Response::ListEnriched {
+            generation: 1,
+            result: Ok(vec![PrEnrichment {
+                number: 7,
+                repo: "b".into(),
+                status_check_rollup: vec![],
+                review_decision: None,
+                mergeable: Some("CONFLICTING".into()),
+            }]),
+        });
+        handle_response(&mut app, &mut st, Response::ListRefsReady {
+            generation: 1,
+            result: Ok(vec![(PrId::new("a", 7), "MERGEABLE".into())]),
+        });
+        let m = |repo: &str| {
+            st.list.prs.iter().find(|p| p.repo == repo).unwrap().mergeable.clone()
+        };
+        assert_eq!(m("a").as_deref(), Some("MERGEABLE"));
+        assert_eq!(m("b").as_deref(), Some("CONFLICTING"));
+    }
+
+    #[test]
+    fn pr_detail_for_same_number_in_another_clone_is_dropped() {
+        let mut st = AppState::new_projects("work".into(), 2);
+        let mut cache = Cache::new();
+        let mut app = test_app_for_state(&mut cache);
+        let detail = fixture_pr_detail();
+        st.current_pr = Some(PrId::new("a", detail.number));
+        st.review = Some(PrReviewState::default());
+        handle_response(&mut app, &mut st, Response::PrDetail {
+            id: PrId::new("b", detail.number),
+            result: Ok(detail),
+        });
+        assert!(st.review.as_ref().unwrap().detail.is_none());
+    }
+
+    #[test]
+    fn merge_done_removes_only_the_row_from_that_clone() {
+        let mut st = AppState::new_projects("work".into(), 2);
+        let mut cache = Cache::new();
+        let mut app = test_app_for_state(&mut cache);
+        st.list.prs = vec![
+            pr_in("a", 5, "2026-01-02T00:00:00Z"),
+            pr_in("b", 5, "2026-01-01T00:00:00Z"),
+        ];
+        handle_response(&mut app, &mut st, Response::MergeDone {
+            id: PrId::new("a", 5),
+            result: Ok(()),
+        });
+        let ids: Vec<PrId> = st.list.prs.iter().map(Pr::id).collect();
+        assert_eq!(ids, vec![PrId::new("b", 5)]);
+        assert_eq!(st.list.status, "merged a#5");
+    }
+
+    #[test]
+    fn files_cache_separates_clones_that_share_a_pr_number() {
+        let mut st = AppState::new_projects("work".into(), 2);
+        st.refs_ready = true;
+        st.list.prs = vec![
+            pr_in("a", 3, "2026-01-02T00:00:00Z"),
+            pr_in("b", 3, "2026-01-01T00:00:00Z"),
+        ];
+        st.files_cache.insert(
+            PrId::new("a", 3),
+            vec![FileMeta { path: "a.rs".into(), additions: 1, deletions: 0 }],
+        );
+        st.list.selected = 1; // b#3, not cached
+        after_selection_change(&mut st);
+        assert!(matches!(st.list.expanded, Some(ExpandedFiles::Loading { ref id }) if *id == PrId::new("b", 3)));
+        assert_eq!(st.pending_files.as_ref().map(|p| p.id.clone()), Some(PrId::new("b", 3)));
+    }
+
+    #[test]
+    fn projects_mode_labels_status_with_repo_and_single_mode_without() {
+        let mut cache = Cache::new();
+        let mut app = test_app_for_state(&mut cache);
+
+        let mut multi = AppState::new_projects("work".into(), 2);
+        multi.list.prs = vec![pr_in("a", 5, "2026-01-02T00:00:00Z")];
+        handle_response(&mut app, &mut multi, Response::SetDraftDone {
+            id: PrId::new("a", 5),
+            draft: true,
+            result: Ok(()),
+        });
+        assert_eq!(multi.list.status, "a#5 converted to draft");
+
+        let mut single = AppState::new("repo".into(), "main".into());
+        single.list.prs = vec![make_pr(5)];
+        handle_response(&mut app, &mut single, Response::SetDraftDone {
+            id: pid(5),
+            draft: true,
+            result: Ok(()),
+        });
+        assert_eq!(single.list.status, "#5 converted to draft");
     }
 }

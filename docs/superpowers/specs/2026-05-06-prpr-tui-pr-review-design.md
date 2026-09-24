@@ -31,7 +31,9 @@ came from.
 ## Non-goals (v1)
 
 - Inline review comments, posting reviews, replying to threads.
-- Cross-repo PR queue (e.g. all PRs assigned to me across GitHub).
+- Cross-repo PR queue via GitHub search (e.g. all PRs assigned to me).
+  A local-clones variant landed later as `--projects`; see
+  `2026-09-25-projects-mode-design.md`.
 - Side-by-side diff view.
 - Light-theme switching at runtime (config-file only in v1).
 - Background polling for PR updates.

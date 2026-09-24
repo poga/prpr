@@ -480,6 +480,8 @@ pub(crate) mod fakes {
         pub refs_on_fetch: HashMap<String, String>,
         /// PR numbers passed to `fetch_pr_ref`, in call order.
         pub fetched_prs: Mutex<Vec<u32>>,
+        /// Roots passed to `fetch_pr_refs`, in call order.
+        pub bulk_fetch_roots: Mutex<Vec<PathBuf>>,
         /// Keyed by (base, head) → commits list returned by `log_commits`.
         pub commits: HashMap<(String, String), Vec<Commit>>,
         pub blames: HashMap<(String, String), String>,
@@ -502,6 +504,7 @@ pub(crate) mod fakes {
                 refs: HashMap::new(),
                 refs_on_fetch: HashMap::new(),
                 fetched_prs: Mutex::new(vec![]),
+                bulk_fetch_roots: Mutex::new(vec![]),
                 commits: HashMap::new(),
                 blames: HashMap::new(),
                 diffs: HashMap::new(),
@@ -537,7 +540,8 @@ pub(crate) mod fakes {
                 .cloned()
                 .unwrap_or_default())
         }
-        fn fetch_pr_refs(&self, _root: &Path, _numbers: &[u32], _bases: &[String]) -> Result<()> {
+        fn fetch_pr_refs(&self, root: &Path, _numbers: &[u32], _bases: &[String]) -> Result<()> {
+            self.bulk_fetch_roots.lock().unwrap().push(root.to_path_buf());
             Ok(())
         }
         fn fetch_pr_ref(&self, _root: &Path, number: u32, _base: &str) -> Result<()> {

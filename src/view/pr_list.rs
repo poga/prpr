@@ -7,33 +7,39 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::data::pr::{CiState, MergeState, Pr, PrState, ReviewDecision};
+use crate::data::pr::{CiState, MergeState, Pr, PrId, PrState, ReviewDecision};
 use crate::data::worker::ListStage;
 use crate::render::spinner;
 use crate::render::style::*;
 
-/// Inline file data for the selected PR; tagged with the PR number.
+/// Widest the repo column gets before names are cut with "…".
+const REPO_COL_MAX: usize = 16;
+
+/// Inline file data for the selected PR; tagged with the PR identity.
 #[derive(Debug, Clone)]
 pub enum ExpandedFiles {
-    Loading { number: u32 },
-    Ready { number: u32, files: Vec<crate::data::pr::FileMeta> },
-    Error { number: u32, message: String },
+    Loading { id: PrId },
+    Ready { id: PrId, files: Vec<crate::data::pr::FileMeta> },
+    Error { id: PrId, message: String },
 }
 
 impl ExpandedFiles {
-    pub fn number(&self) -> u32 {
+    pub fn id(&self) -> &PrId {
         match self {
-            Self::Loading { number }
-            | Self::Ready { number, .. }
-            | Self::Error { number, .. } => *number,
+            Self::Loading { id } | Self::Ready { id, .. } | Self::Error { id, .. } => id,
         }
     }
 }
 
 #[derive(Debug, Default)]
 pub struct PrListState {
+    /// Clone name in single-repo mode; parent folder name across projects.
     pub repo_name: String,
     pub branch: String,
+    /// True when rows come from several clones: adds the repo column and
+    /// swaps the branch in the header for a clone count.
+    pub projects: bool,
+    pub repo_count: usize,
     pub prs: Vec<Pr>,
     pub selected: usize,
     pub search: Option<String>,
@@ -48,6 +54,9 @@ pub struct PrListState {
     /// Renderer prefers this label over the generic "loading PRs…" so the
     /// user sees whether `gh` or `git fetch` is the slow step.
     pub loading_stage: Option<ListStage>,
+    /// Clones done / clones total for the current stage. Shown only when
+    /// more than one clone is in play.
+    pub loading_progress: (usize, usize),
     /// True from when the user presses `r` (or the initial load fires) until
     /// `ListFast` returns rows. The renderer hides rows behind a full-area
     /// loading placeholder and the input layer ignores keys other than quit
@@ -64,11 +73,36 @@ impl PrListState {
             .iter()
             .filter(|p| match &q {
                 Some(s) => {
-                    p.title.to_lowercase().contains(s) || p.author.login.to_lowercase().contains(s)
+                    p.title.to_lowercase().contains(s)
+                        || p.author.login.to_lowercase().contains(s)
+                        || p.repo.to_lowercase().contains(s)
                 }
                 None => true,
             })
             .collect()
+    }
+
+    /// Stage label plus a clone counter when several clones are in play.
+    fn stage_label(&self, stage: ListStage) -> String {
+        let (done, total) = self.loading_progress;
+        if total > 1 {
+            format!("{} {done}/{total} repos", stage.label())
+        } else {
+            stage.label().to_string()
+        }
+    }
+
+    /// Repo column width for the visible rows; 0 hides the column.
+    fn repo_col(&self, visible: &[&Pr]) -> usize {
+        if !self.projects {
+            return 0;
+        }
+        visible
+            .iter()
+            .map(|p| p.repo.chars().count())
+            .max()
+            .unwrap_or(0)
+            .min(REPO_COL_MAX)
     }
 }
 
@@ -89,10 +123,13 @@ pub fn render(f: &mut Frame, area: Rect, st: &PrListState, now: DateTime<Utc>) {
 fn render_header(f: &mut Frame, area: Rect, st: &PrListState) {
     let visible = st.visible_prs();
     let count = visible.len();
-    let header = format!(
-        "  prpr · {} · {} · {} open",
-        st.repo_name, st.branch, count,
-    );
+    let header = if st.projects {
+        let n = st.repo_count;
+        let noun = if n == 1 { "repo" } else { "repos" };
+        format!("  prpr · {} · {n} {noun} · {count} open", st.repo_name)
+    } else {
+        format!("  prpr · {} · {} · {count} open", st.repo_name, st.branch)
+    };
     f.render_widget(
         Paragraph::new(header).style(Style::default().fg(OVERLAY1)),
         area,
@@ -107,8 +144,8 @@ fn render_rows(f: &mut Frame, area: Rect, st: &PrListState, now: DateTime<Utc>) 
     if st.manual_refresh_in_flight {
         let body = st
             .loading_stage
-            .map(|s| s.label())
-            .unwrap_or("loading PRs");
+            .map(|s| st.stage_label(s))
+            .unwrap_or_else(|| "loading PRs".into());
         f.render_widget(
             Paragraph::new(format!("{} {body}…", spinner::glyph()))
                 .style(Style::default().fg(OVERLAY1))
@@ -118,23 +155,25 @@ fn render_rows(f: &mut Frame, area: Rect, st: &PrListState, now: DateTime<Utc>) 
         return;
     }
     let visible = st.visible_prs();
+    let repo_col = st.repo_col(&visible);
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(visible.len() + 1);
     lines.push(divider(area.width as usize));
     for (i, pr) in visible.iter().enumerate() {
-        lines.push(row_for(pr, i == st.selected, now, area.width));
+        lines.push(row_for(pr, i == st.selected, now, area.width, repo_col));
         if i == st.selected {
+            let matches = |id: &PrId| id.repo == pr.repo && id.number == pr.number;
             match &st.expanded {
-                Some(ExpandedFiles::Loading { number }) if *number == pr.number => {
+                Some(ExpandedFiles::Loading { id }) if matches(id) => {
                     lines.push(loading_line(area.width));
                 }
-                Some(ExpandedFiles::Ready { number, files }) if *number == pr.number => {
+                Some(ExpandedFiles::Ready { id, files }) if matches(id) => {
                     let total = files.len();
                     for (fi, f) in files.iter().enumerate() {
                         let last = fi + 1 == total;
                         lines.push(file_line(f, last, area.width));
                     }
                 }
-                Some(ExpandedFiles::Error { number, message }) if *number == pr.number => {
+                Some(ExpandedFiles::Error { id, message }) if matches(id) => {
                     lines.push(error_line(message, area.width));
                 }
                 _ => {}
@@ -193,8 +232,8 @@ fn render_footer(f: &mut Frame, area: Rect, st: &PrListState) {
         // keep the spinner visible so background work is never silent.
         let label = st
             .loading_stage
-            .map(|s| s.label())
-            .unwrap_or("refreshing");
+            .map(|s| st.stage_label(s))
+            .unwrap_or_else(|| "refreshing".into());
         f.render_widget(
             Paragraph::new(format!("  {} {label}…", spinner::glyph()))
                 .style(Style::default().fg(OVERLAY1)),
@@ -203,7 +242,7 @@ fn render_footer(f: &mut Frame, area: Rect, st: &PrListState) {
     } else if let Some(stage) = st.loading_stage {
         // Rows are visible but a pipeline stage is still running.
         f.render_widget(
-            Paragraph::new(format!("  {} {}…", spinner::glyph(), stage.label()))
+            Paragraph::new(format!("  {} {}…", spinner::glyph(), st.stage_label(stage)))
                 .style(Style::default().fg(OVERLAY1)),
             chunks[1],
         );
@@ -231,7 +270,13 @@ fn divider(w: usize) -> Line<'static> {
     ))
 }
 
-fn row_for(pr: &Pr, selected: bool, now: DateTime<Utc>, area_width: u16) -> Line<'static> {
+fn row_for(
+    pr: &Pr,
+    selected: bool,
+    now: DateTime<Utc>,
+    area_width: u16,
+    repo_col: usize,
+) -> Line<'static> {
     let row_bg = if selected {
         Style::default().bg(SURFACE0)
     } else {
@@ -268,6 +313,12 @@ fn row_for(pr: &Pr, selected: bool, now: DateTime<Utc>, area_width: u16) -> Line
         Span::styled(" ", Style::default())
     };
 
+    // Repo column (projects mode only): padded to the widest visible name.
+    let repo_str = if repo_col > 0 {
+        format!(" {}", truncate(&pr.repo, repo_col))
+    } else {
+        String::new()
+    };
     let pr_num = format!(" #{} ", pr.number);
     let label_str = pr
         .labels
@@ -293,7 +344,7 @@ fn row_for(pr: &Pr, selected: bool, now: DateTime<Utc>, area_width: u16) -> Line
     // glyphs and the variable-width right side, so a wide terminal shows
     // long titles in full and a narrow terminal truncates with "…".
     // Fixed left = 9 cells: rail, state, ci, review, conflict + 4 gap spaces.
-    let left_cols = 9 + pr_num.chars().count();
+    let left_cols = 9 + repo_str.chars().count() + pr_num.chars().count();
     let right_cols = label_str.chars().count()
         + draft_str.chars().count()
         + author_str.chars().count()
@@ -313,6 +364,7 @@ fn row_for(pr: &Pr, selected: bool, now: DateTime<Utc>, area_width: u16) -> Line
         review_glyph,
         Span::styled(" ", row_bg),
         conflict_glyph,
+        Span::styled(repo_str, row_bg.fg(COMMIT_PALETTE[2])),
         Span::styled(pr_num, row_bg.fg(COMMIT_PALETTE[1])),
         Span::styled(truncate(&pr.title, title_budget), row_bg.fg(TEXT)),
         Span::styled(label_str, row_bg.fg(COMMIT_PALETTE[4])),
@@ -427,12 +479,22 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
+    fn pid(n: u32) -> PrId {
+        PrId::new("repo", n)
+    }
+
     fn fixture_state() -> PrListState {
         let json = include_str!("../../tests/fixtures/pr_list.json");
-        let prs: Vec<Pr> = serde_json::from_str(json).unwrap();
+        let mut prs: Vec<Pr> = serde_json::from_str(json).unwrap();
+        for p in &mut prs {
+            p.repo = "repo".into();
+        }
         PrListState {
             repo_name: "prpr".into(),
             branch: "main".into(),
+            projects: false,
+            repo_count: 1,
+            loading_progress: (0, 0),
             prs,
             selected: 0,
             search: None,
@@ -580,12 +642,12 @@ mod tests {
 
     #[test]
     fn expanded_files_number_accessor_works_for_all_variants() {
-        let l = ExpandedFiles::Loading { number: 7 };
-        let r = ExpandedFiles::Ready { number: 8, files: vec![] };
-        let e = ExpandedFiles::Error { number: 9, message: "x".into() };
-        assert_eq!(l.number(), 7);
-        assert_eq!(r.number(), 8);
-        assert_eq!(e.number(), 9);
+        let l = ExpandedFiles::Loading { id: pid(7) };
+        let r = ExpandedFiles::Ready { id: pid(8), files: vec![] };
+        let e = ExpandedFiles::Error { id: pid(9), message: "x".into() };
+        assert_eq!(*l.id(), pid(7));
+        assert_eq!(*r.id(), pid(8));
+        assert_eq!(*e.id(), pid(9));
     }
 
     #[test]
@@ -610,7 +672,7 @@ mod tests {
         st.selected = 0;
         let sel_number = st.visible_prs()[0].number;
         st.expanded = Some(ExpandedFiles::Ready {
-            number: sel_number,
+            id: pid(sel_number),
             files: vec![
                 FileMeta { path: "src/foo.rs".into(), additions: 12, deletions: 3 },
                 FileMeta { path: "tests/bar.rs".into(), additions: 4, deletions: 0 },
@@ -636,7 +698,7 @@ mod tests {
         let mut st = fixture_state();
         st.selected = 0;
         let sel_number = st.visible_prs()[0].number;
-        st.expanded = Some(ExpandedFiles::Loading { number: sel_number });
+        st.expanded = Some(ExpandedFiles::Loading { id: pid(sel_number) });
         let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
         let now: DateTime<Utc> = "2026-05-06T00:00:00Z".parse().unwrap();
         term.draw(|f| { let area = f.area(); render(f, area, &st, now); }).unwrap();
@@ -654,7 +716,7 @@ mod tests {
         let mut st = fixture_state();
         st.selected = 0;
         st.expanded = Some(ExpandedFiles::Ready {
-            number: 999_999,
+            id: pid(999_999),
             files: vec![FileMeta { path: "stale.rs".into(), additions: 1, deletions: 0 }],
         });
         let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
@@ -674,7 +736,7 @@ mod tests {
         st.selected = 0;
         let sel_number = st.visible_prs()[0].number;
         st.expanded = Some(ExpandedFiles::Error {
-            number: sel_number,
+            id: pid(sel_number),
             message: "ref missing locally".into(),
         });
         let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
@@ -699,7 +761,7 @@ mod tests {
         let st = PrListState {
             repo_name: "prpr".into(),
             branch: "main".into(),
-            prs: (0..20).map(|i| Pr {
+            prs: (0..20).map(|i| Pr { repo: "repo".into(),
                 number: 100 + i, title: format!("p{i}"), is_draft: false, state: PrState::Open,
                 author: Author { login: "a".into() }, created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
                 updated_at: "2026-01-01T00:00:00Z".parse().unwrap(),
@@ -709,7 +771,7 @@ mod tests {
             }).collect(),
             selected: 19,
             expanded: Some(ExpandedFiles::Ready {
-                number: 119,
+                id: pid(119),
                 files: (0..20).map(|i| FileMeta {
                     path: format!("file{i}.rs"), additions: 1, deletions: 0,
                 }).collect(),
@@ -772,7 +834,7 @@ mod tests {
     #[test]
     fn draft_pr_shows_draft_badge() {
         let now: DateTime<Utc> = "2026-05-06T00:00:00Z".parse().unwrap();
-        let mk = |is_draft: bool| Pr {
+        let mk = |is_draft: bool| Pr { repo: "repo".into(),
             number: 1, title: "t".into(), is_draft, state: PrState::Open,
             author: crate::data::pr::Author { login: "a".into() },
             created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
@@ -783,19 +845,19 @@ mod tests {
         };
         let has_badge = |line: &Line| line.spans.iter().any(|s| s.content == "draft  ");
 
-        let draft = row_for(&mk(true), false, now, 80);
+        let draft = row_for(&mk(true), false, now, 80, 0);
         assert!(has_badge(&draft), "draft PR should show the 'draft' badge");
         let badge = draft.spans.iter().find(|s| s.content == "draft  ").unwrap();
         assert_eq!(badge.style.fg, Some(DRAFT_ACCENT), "draft word must use DRAFT_ACCENT");
 
-        let not_draft = row_for(&mk(false), false, now, 80);
+        let not_draft = row_for(&mk(false), false, now, 80, 0);
         assert!(!has_badge(&not_draft), "non-draft rows must not show the badge");
     }
 
     #[test]
     fn draft_row_shows_peach_rail() {
         let now: DateTime<Utc> = "2026-05-06T00:00:00Z".parse().unwrap();
-        let mk = |is_draft: bool| Pr {
+        let mk = |is_draft: bool| Pr { repo: "repo".into(),
             number: 1, title: "t".into(), is_draft, state: PrState::Open,
             author: crate::data::pr::Author { login: "a".into() },
             created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
@@ -805,11 +867,11 @@ mod tests {
             review_decision: None, mergeable: None,
         };
         // Draft row leads with the rail glyph, painted in the draft accent.
-        let draft = row_for(&mk(true), false, now, 80);
+        let draft = row_for(&mk(true), false, now, 80, 0);
         assert_eq!(draft.spans[0].content, "▎", "draft row must lead with the rail glyph");
         assert_eq!(draft.spans[0].style.fg, Some(DRAFT_ACCENT), "rail must use DRAFT_ACCENT");
         // Ready row does not.
-        let ready = row_for(&mk(false), false, now, 80);
+        let ready = row_for(&mk(false), false, now, 80, 0);
         assert_ne!(ready.spans[0].content, "▎", "ready row must not show the rail");
         // Lead is 2 cells before the state glyph: ▎+space (draft) or two spaces.
         assert_eq!(draft.spans[1].content, " ");
@@ -820,7 +882,7 @@ mod tests {
     #[test]
     fn draft_state_glyph_is_peach() {
         let now: DateTime<Utc> = "2026-05-06T00:00:00Z".parse().unwrap();
-        let draft = Pr {
+        let draft = Pr { repo: "repo".into(),
             number: 1, title: "t".into(), is_draft: true, state: PrState::Open,
             author: crate::data::pr::Author { login: "a".into() },
             created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
@@ -829,7 +891,7 @@ mod tests {
             labels: vec![], status_check_rollup: vec![],
             review_decision: None, mergeable: None,
         };
-        let line = row_for(&draft, false, now, 80);
+        let line = row_for(&draft, false, now, 80, 0);
         let circle = line.spans.iter().find(|s| s.content == "○").expect("draft shows ○");
         assert_eq!(circle.style.fg, Some(DRAFT_ACCENT), "draft ○ must use DRAFT_ACCENT");
     }
@@ -837,7 +899,7 @@ mod tests {
     #[test]
     fn unknown_mergeable_open_pr_shows_checking_marker() {
         let now: DateTime<Utc> = "2026-05-06T00:00:00Z".parse().unwrap();
-        let mk = |m: &str| Pr {
+        let mk = |m: &str| Pr { repo: "repo".into(),
             number: 1, title: "t".into(), is_draft: false, state: PrState::Open,
             author: crate::data::pr::Author { login: "a".into() },
             created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
@@ -848,15 +910,75 @@ mod tests {
         };
         let has = |line: &Line, glyph: &str| line.spans.iter().any(|s| s.content == glyph);
 
-        let unknown = row_for(&mk("UNKNOWN"), false, now, 80);
+        let unknown = row_for(&mk("UNKNOWN"), false, now, 80, 0);
         assert!(has(&unknown, "?"), "UNKNOWN row should show '?'");
         assert!(!has(&unknown, "⚠"), "UNKNOWN row must not show '⚠'");
 
-        let conflicting = row_for(&mk("CONFLICTING"), false, now, 80);
+        let conflicting = row_for(&mk("CONFLICTING"), false, now, 80, 0);
         assert!(has(&conflicting, "⚠"), "CONFLICTING row should show '⚠'");
 
-        let mergeable = row_for(&mk("MERGEABLE"), false, now, 80);
+        let mergeable = row_for(&mk("MERGEABLE"), false, now, 80, 0);
         assert!(!has(&mergeable, "?"), "MERGEABLE row must not show '?'");
         assert!(!has(&mergeable, "⚠"), "MERGEABLE row must not show '⚠'");
+    }
+
+    // ---- projects mode rendering ----
+
+    fn projects_state() -> PrListState {
+        let mut st = fixture_state();
+        st.projects = true;
+        st.repo_count = 2;
+        let n = st.prs.len();
+        for (i, p) in st.prs.iter_mut().enumerate() {
+            p.repo = if i < n / 2 { "alpha".into() } else { "beta-very-long-repo-name".into() };
+        }
+        st
+    }
+
+    fn draw_all(st: &PrListState) -> String {
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let now: DateTime<Utc> = "2026-05-06T00:00:00Z".parse().unwrap();
+        term.draw(|f| { let area = f.area(); render(f, area, st, now); }).unwrap();
+        let buf = term.backend().buffer();
+        (0..buf.area.height).map(|y| buffer_line(buf, y)).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn projects_mode_header_counts_repos_and_rows_show_repo_column() {
+        let st = projects_state();
+        let all = draw_all(&st);
+        assert!(all.contains("prpr · prpr · 2 repos ·"), "header in:\n{all}");
+        assert!(!all.contains("· main ·"), "branch must not show across projects:\n{all}");
+        assert!(all.contains(" alpha "), "repo column in:\n{all}");
+        // Long names are cut to the column width with an ellipsis.
+        assert!(all.contains("beta-very-long-…"), "truncated repo in:\n{all}");
+        assert!(!all.contains("beta-very-long-repo-name"), "full long name leaked:\n{all}");
+    }
+
+    #[test]
+    fn single_repo_mode_has_no_repo_column() {
+        let st = fixture_state();
+        let all = draw_all(&st);
+        assert!(all.contains("· main ·"), "branch in header:\n{all}");
+        assert!(!all.contains(" repo "), "repo column must be hidden:\n{all}");
+    }
+
+    #[test]
+    fn search_matches_repo_name() {
+        let mut st = projects_state();
+        let n_alpha = st.prs.iter().filter(|p| p.repo == "alpha").count();
+        st.search = Some("ALPHA".into());
+        let visible = st.visible_prs();
+        assert_eq!(visible.len(), n_alpha);
+        assert!(visible.iter().all(|p| p.repo == "alpha"));
+    }
+
+    #[test]
+    fn stage_label_counts_clones_only_when_several() {
+        let mut st = projects_state();
+        st.loading_progress = (3, 7);
+        assert_eq!(st.stage_label(ListStage::FetchingList), "fetching PR list (gh) 3/7 repos");
+        st.loading_progress = (0, 1);
+        assert_eq!(st.stage_label(ListStage::FetchingRefs), "fetching branches (git)");
     }
 }
