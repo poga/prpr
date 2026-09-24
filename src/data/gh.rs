@@ -99,7 +99,8 @@ impl GhClient for GhCli {
 pub(crate) mod fakes {
     use super::*;
     use crate::data::pr::PrEnrichment;
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, HashSet, VecDeque};
+    use std::path::PathBuf;
     use std::sync::Mutex;
 
     /// In-memory fake. Tests load JSON fixtures and stuff them into this.
@@ -113,6 +114,18 @@ pub(crate) mod fakes {
         pub calls: Mutex<Vec<String>>,
         /// When set, `set_pr_draft` fails instead of recording.
         pub fail_set_draft: Mutex<bool>,
+        /// Per-clone rows; a root not listed here falls back to `prs_fast`.
+        pub prs_by_root: Mutex<HashMap<PathBuf, Vec<Pr>>>,
+        /// Per-clone enrichments; falls back to `enrichments`.
+        pub enrichments_by_root: HashMap<PathBuf, Vec<PrEnrichment>>,
+        /// Roots whose `list_prs_fast` fails.
+        pub fail_fast_roots: Mutex<HashSet<PathBuf>>,
+        /// Roots whose `list_prs_enriched` fails.
+        pub fail_enriched_roots: Mutex<HashSet<PathBuf>>,
+        /// Roots passed to every list call, in order.
+        pub list_roots: Mutex<Vec<PathBuf>>,
+        /// Roots passed to mutating calls, in order.
+        pub action_roots: Mutex<Vec<PathBuf>>,
     }
 
     impl FakeGh {
@@ -125,6 +138,12 @@ pub(crate) mod fakes {
                 set_drafts: Mutex::new(vec![]),
                 calls: Mutex::new(vec![]),
                 fail_set_draft: Mutex::new(false),
+                prs_by_root: Mutex::new(HashMap::new()),
+                enrichments_by_root: HashMap::new(),
+                fail_fast_roots: Mutex::new(HashSet::new()),
+                fail_enriched_roots: Mutex::new(HashSet::new()),
+                list_roots: Mutex::new(vec![]),
+                action_roots: Mutex::new(vec![]),
             }
         }
         /// Queue successive enriched payloads; each call pops the next one.
@@ -134,26 +153,39 @@ pub(crate) mod fakes {
     }
 
     impl GhClient for FakeGh {
-        fn list_prs_fast(&self, _root: &std::path::Path) -> Result<Vec<Pr>> {
-            Ok(self
-                .prs_fast
+        fn list_prs_fast(&self, root: &std::path::Path) -> Result<Vec<Pr>> {
+            self.list_roots.lock().unwrap().push(root.to_path_buf());
+            if self.fail_fast_roots.lock().unwrap().contains(root) {
+                return Err(anyhow!("gh failed in {}", root.display()));
+            }
+            let by_root = self.prs_by_root.lock().unwrap();
+            let rows = by_root.get(root).unwrap_or(&self.prs_fast);
+            Ok(rows
                 .clone()
                 .into_iter()
                 .filter(|p| p.state == crate::data::pr::PrState::Open)
                 .collect())
         }
-        fn list_prs_enriched(&self, _root: &std::path::Path) -> Result<Vec<PrEnrichment>> {
+        fn list_prs_enriched(&self, root: &std::path::Path) -> Result<Vec<PrEnrichment>> {
+            if self.fail_enriched_roots.lock().unwrap().contains(root) {
+                return Err(anyhow!("gh failed in {}", root.display()));
+            }
+            if let Some(rows) = self.enrichments_by_root.get(root) {
+                return Ok(rows.clone());
+            }
             if let Some(next) = self.enrichment_sequence.lock().unwrap().pop_front() {
                 return Ok(next);
             }
             Ok(self.enrichments.clone())
         }
-        fn merge_pr(&self, _root: &std::path::Path, n: u32, m: &str) -> Result<()> {
+        fn merge_pr(&self, root: &std::path::Path, n: u32, m: &str) -> Result<()> {
+            self.action_roots.lock().unwrap().push(root.to_path_buf());
             self.merges.lock().unwrap().push((n, m.to_string()));
             self.calls.lock().unwrap().push(format!("merge {n} {m}"));
             Ok(())
         }
-        fn set_pr_draft(&self, _root: &std::path::Path, n: u32, draft: bool) -> Result<()> {
+        fn set_pr_draft(&self, root: &std::path::Path, n: u32, draft: bool) -> Result<()> {
+            self.action_roots.lock().unwrap().push(root.to_path_buf());
             if *self.fail_set_draft.lock().unwrap() {
                 return Err(anyhow!("set draft failed"));
             }
@@ -185,6 +217,7 @@ mod tests {
         let mut fake = FakeGh::new();
         fake.prs_fast = vec![Pr {
             number: 7,
+            repo: "repo".into(),
             title: "t".into(),
             is_draft: false,
             state: PrState::Open,
@@ -200,6 +233,7 @@ mod tests {
         }];
         fake.enrichments = vec![PrEnrichment {
             number: 7,
+            repo: "repo".into(),
             status_check_rollup: vec![StatusCheck {
                 status: Some("COMPLETED".into()),
                 conclusion: Some("SUCCESS".into()),
@@ -222,14 +256,14 @@ mod tests {
         use crate::data::pr::{Author, Pr, PrState};
         let mut g = FakeGh::new();
         g.prs_fast = vec![
-            Pr { number: 1, title: "open".into(), is_draft: false, state: PrState::Open,
+            Pr { number: 1, repo: "repo".into(), title: "open".into(), is_draft: false, state: PrState::Open,
                  author: Author { login: "a".into() },
                  created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
                  updated_at: "2026-01-01T00:00:00Z".parse().unwrap(),
                  base_ref_name: "main".into(), head_ref_name: "f".into(),
                  labels: vec![], status_check_rollup: vec![],
                  review_decision: None, mergeable: None },
-            Pr { number: 2, title: "merged".into(), is_draft: false, state: PrState::Merged,
+            Pr { number: 2, repo: "repo".into(), title: "merged".into(), is_draft: false, state: PrState::Merged,
                  author: Author { login: "a".into() },
                  created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
                  updated_at: "2026-01-01T00:00:00Z".parse().unwrap(),

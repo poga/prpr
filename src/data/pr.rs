@@ -14,9 +14,27 @@ fn deser_review_decision<'de, D: Deserializer<'de>>(
     }
 }
 
+/// Identity of a PR across every clone prpr is watching. `repo` is the
+/// clone's folder name; numbers alone collide once two repos are listed.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PrId {
+    pub repo: String,
+    pub number: u32,
+}
+
+impl PrId {
+    pub fn new(repo: impl Into<String>, number: u32) -> Self {
+        Self { repo: repo.into(), number }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Pr {
     pub number: u32,
+    /// Folder name of the clone this row came from; set by the worker,
+    /// never by `gh`.
+    #[serde(skip)]
+    pub repo: String,
     pub title: String,
     #[serde(rename = "isDraft")]
     pub is_draft: bool,
@@ -83,6 +101,10 @@ pub enum ReviewDecision {
 }
 
 impl Pr {
+    pub fn id(&self) -> PrId {
+        PrId { repo: self.repo.clone(), number: self.number }
+    }
+
     /// Tri-state mergeability from the raw wire value. `None` = not yet
     /// fetched; `Unknown` = GitHub is still computing.
     pub fn merge_state(&self) -> Option<MergeState> {
@@ -167,6 +189,9 @@ pub enum CiState {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct PrEnrichment {
     pub number: u32,
+    /// Folder name of the clone; set by the worker, never by `gh`.
+    #[serde(skip)]
+    pub repo: String,
     #[serde(rename = "statusCheckRollup", default)]
     pub status_check_rollup: Vec<StatusCheck>,
     #[serde(
@@ -249,6 +274,7 @@ mod tests {
     fn ci_state_none_when_empty() {
         let pr = Pr {
             number: 1,
+            repo: "repo".into(),
             title: "t".into(),
             is_draft: false,
             state: PrState::Open,
@@ -347,6 +373,7 @@ mod tests {
     fn apply_enrichment_overwrites_heavy_fields_only() {
         let mut p = Pr {
             number: 7,
+            repo: "repo".into(),
             title: "t".into(),
             is_draft: false,
             state: PrState::Open,
@@ -362,6 +389,7 @@ mod tests {
         };
         let e = PrEnrichment {
             number: 7,
+            repo: "repo".into(),
             status_check_rollup: vec![StatusCheck {
                 status: Some("COMPLETED".into()),
                 conclusion: Some("SUCCESS".into()),
@@ -382,7 +410,7 @@ mod tests {
     #[test]
     fn enrichment_never_downgrades_resolved_mergeable_to_unknown() {
         let mut p = Pr {
-            number: 7, title: "t".into(), is_draft: false, state: PrState::Open,
+            number: 7, repo: "repo".into(), title: "t".into(), is_draft: false, state: PrState::Open,
             author: Author { login: "a".into() },
             created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
             updated_at: "2026-01-01T00:00:00Z".parse().unwrap(),
@@ -392,6 +420,7 @@ mod tests {
         };
         let enr = |m: Option<&str>| PrEnrichment {
             number: 7,
+            repo: "repo".into(),
             status_check_rollup: vec![],
             review_decision: None,
             mergeable: m.map(str::to_string),
@@ -411,7 +440,7 @@ mod tests {
     #[test]
     fn merge_state_maps_wire_values() {
         let pr_with = |m: Option<&str>| Pr {
-            number: 1, title: "t".into(), is_draft: false, state: PrState::Open,
+            number: 1, repo: "repo".into(), title: "t".into(), is_draft: false, state: PrState::Open,
             author: Author { login: "a".into() },
             created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
             updated_at: "2026-01-01T00:00:00Z".parse().unwrap(),
